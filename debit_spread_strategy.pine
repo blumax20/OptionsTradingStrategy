@@ -1,0 +1,62 @@
+//@version=6
+strategy("Bollinger–StochRSI–MFI–MACD Debit Spread", overlay=true, margin_long=100, margin_short=100)
+
+// ——— Constant declarations
+// Use ALL_CAPS SNAKE_CASE for constants as recommended in the Pine Script style guide.
+const K_OVERSOLD    = 30
+const K_OVERBOUGHT  = 70
+const MFI_OVERSOLD  = 40
+const MFI_OVERBOUGHT= 60
+const EXIT_BARS     = 5
+
+// ——— User inputs for indicator lengths and Bollinger settings
+stochLength  = input.int(14,  "Stochastic RSI length")
+stochSmooth  = input.int(3,   "Stochastic smoothing")
+mfiLength    = input.int(14,  "MFI length")
+bbLength     = input.int(20,  "Bollinger length")
+bbStdDev     = input.float(2.0, "Bollinger std dev")
+macdFast     = input.int(12,  "MACD fast length")
+macdSlow     = input.int(26,  "MACD slow length")
+macdSignal   = input.int(9,   "MACD signal length")
+
+// ——— Bollinger Bands calculation
+basis  = ta.sma(close, bbLength)
+upper  = basis + bbStdDev * ta.stdev(close, bbLength)
+lower  = basis - bbStdDev * ta.stdev(close, bbLength)
+
+// ——— Stochastic RSI (%K and %D)
+rsi     = ta.rsi(close, stochLength)
+k       = ta.sma(ta.stoch(rsi, rsi, rsi, stochLength), stochSmooth)
+d       = ta.sma(k, stochSmooth)
+
+// ——— Money Flow Index
+mfi     = ta.mfi(high, low, close, volume, mfiLength)
+
+// ——— MACD calculation
+macdLine, signalLine, _ = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+// ——— Entry conditions
+bullCondition = ((k < K_OVERSOLD) or (mfi < MFI_OVERSOLD)) and (macdLine > signalLine)
+bearCondition = ((k > K_OVERBOUGHT) or (mfi > MFI_OVERBOUGHT)) and (macdLine < signalLine)
+
+// ——— Place trades when conditions are met
+if bullCondition
+    // Enter a long position to approximate a bullish call debit spread
+    strategy.entry("LongCallSpread", strategy.long)
+if bearCondition
+    // Enter a short position to approximate a bearish put debit spread
+    strategy.entry("LongPutSpread", strategy.short)
+
+// ——— Exit trades after a fixed number of bars
+strategy.exit("ExitCall", from_entry="LongCallSpread", bars=EXIT_BARS)
+strategy.exit("ExitPut", from_entry="LongPutSpread", bars=EXIT_BARS)
+
+// ——— Optional plots for analysis
+plot(basis, color=color.gray, linewidth=1, title="Bollinger Basis")
+plot(upper, color=color.orange, linewidth=1, title="Bollinger Upper")
+plot(lower, color=color.orange, linewidth=1, title="Bollinger Lower")
+plot(k, title="%K", color=color.blue)
+plot(d, title="%D", color=color.purple)
+plot(mfi, title="MFI", color=color.green)
+plot(macdLine - signalLine, title="MACD Histogram", color=color.red, style=plot.style_columns)
+
