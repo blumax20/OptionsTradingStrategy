@@ -1,15 +1,14 @@
 //@version=6
-strategy("Bollinger–StochRSI–MFI–MACD Debit Spread", overlay=true, margin_long=100, margin_short=100)
+strategy("Debit Spread POMDP‑Inspired Strategy", overlay=true, margin_long=100, margin_short=100)
 
-// ——— Constant declarations
-// Use ALL_CAPS SNAKE_CASE for constants as recommended in the Pine Script style guide.
-const K_OVERSOLD    = 30
-const K_OVERBOUGHT  = 70
-const MFI_OVERSOLD  = 40
-const MFI_OVERBOUGHT= 60
-const EXIT_BARS     = 5
+// ——— Constants
+const int K_OVERSOLD      = 30
+const int K_OVERBOUGHT    = 70
+const int MFI_OVERSOLD    = 40
+const int MFI_OVERBOUGHT  = 60
+const int EXIT_BARS       = 5
 
-// ——— User inputs for indicator lengths and Bollinger settings
+// ——— User inputs
 stochLength  = input.int(14,  "Stochastic RSI length")
 stochSmooth  = input.int(3,   "Stochastic smoothing")
 mfiLength    = input.int(14,  "MFI length")
@@ -19,44 +18,62 @@ macdFast     = input.int(12,  "MACD fast length")
 macdSlow     = input.int(26,  "MACD slow length")
 macdSignal   = input.int(9,   "MACD signal length")
 
-// ——— Bollinger Bands calculation
-basis  = ta.sma(close, bbLength)
-upper  = basis + bbStdDev * ta.stdev(close, bbLength)
-lower  = basis - bbStdDev * ta.stdev(close, bbLength)
+// ——— Bar index tracking for exits
+var int callEntryBar = na
+var int putEntryBar = na
 
-// ——— Stochastic RSI (%K and %D)
-rsi     = ta.rsi(close, stochLength)
-k       = ta.sma(ta.stoch(rsi, rsi, rsi, stochLength), stochSmooth)
-d       = ta.sma(k, stochSmooth)
+// ——— Bollinger Bands
+basis   = ta.sma(close, bbLength)
+upper   = basis + bbStdDev * ta.stdev(close, bbLength)
+lower   = basis - bbStdDev * ta.stdev(close, bbLength)
 
-// ——— Money Flow Index
-mfi     = ta.mfi(high, low, close, volume, mfiLength)
+// ——— Stochastic RSI
+rsi      = ta.rsi(close, stochLength)
+k        = ta.sma(ta.stoch(rsi, rsi, rsi, stochLength), stochSmooth)
+d        = ta.sma(k, stochSmooth)
 
-// ——— MACD calculation
-macdLine, signalLine, _ = ta.macd(close, macdFast, macdSlow, macdSignal)
+// ——— Manual MFI calculation (FIXED: using math.sum)
+tp        = (high + low + close) / 3.0
+rawMF     = tp * volume
+posFlow   = (tp > tp[1] ? rawMF : 0.0)
+negFlow   = (tp < tp[1] ? rawMF : 0.0)
+posMF     = math.sum(posFlow, mfiLength)  // FIXED: math.sum instead of ta.sum
+negMF     = math.sum(negFlow, mfiLength)  // FIXED: math.sum instead of ta.sum
+moneyRatio = negMF != 0 ? posMF / negMF : 0.0
+mfi       = negMF != 0 ? 100 - 100 / (1 + moneyRatio) : 0.0
 
-// ——— Entry conditions
+// ——— Manual MACD calculation
+fastMA     = ta.ema(close, macdFast)
+slowMA     = ta.ema(close, macdSlow)
+macdLine   = fastMA - slowMA
+signalLine = ta.ema(macdLine, macdSignal)
+
+// ——— POMDP‑inspired decision rules
 bullCondition = ((k < K_OVERSOLD) or (mfi < MFI_OVERSOLD)) and (macdLine > signalLine)
 bearCondition = ((k > K_OVERBOUGHT) or (mfi > MFI_OVERBOUGHT)) and (macdLine < signalLine)
 
-// ——— Place trades when conditions are met
 if bullCondition
-    // Enter a long position to approximate a bullish call debit spread
-    strategy.entry("LongCallSpread", strategy.long)
+    strategy.entry("CallDebit", strategy.long)
+    callEntryBar := bar_index  // Track entry bar
+
 if bearCondition
-    // Enter a short position to approximate a bearish put debit spread
-    strategy.entry("LongPutSpread", strategy.short)
+    strategy.entry("PutDebit", strategy.short)
+    putEntryBar := bar_index   // Track entry bar
 
-// ——— Exit trades after a fixed number of bars
-strategy.exit("ExitCall", from_entry="LongCallSpread", bars=EXIT_BARS)
-strategy.exit("ExitPut", from_entry="LongPutSpread", bars=EXIT_BARS)
+// FIXED: Manual time-based exits using bar_index
+if not na(callEntryBar) and bar_index >= callEntryBar + EXIT_BARS
+    strategy.close("CallDebit")
+    callEntryBar := na
 
-// ——— Optional plots for analysis
-plot(basis, color=color.gray, linewidth=1, title="Bollinger Basis")
-plot(upper, color=color.orange, linewidth=1, title="Bollinger Upper")
-plot(lower, color=color.orange, linewidth=1, title="Bollinger Lower")
+if not na(putEntryBar) and bar_index >= putEntryBar + EXIT_BARS
+    strategy.close("PutDebit")
+    putEntryBar := na
+
+// ——— Plots
+plot(basis, color=color.gray, linewidth=1, title="BB Basis")
+plot(upper, color=color.orange, linewidth=1, title="BB Upper")
+plot(lower, color=color.orange, linewidth=1, title="BB Lower")
 plot(k, title="%K", color=color.blue)
 plot(d, title="%D", color=color.purple)
 plot(mfi, title="MFI", color=color.green)
 plot(macdLine - signalLine, title="MACD Histogram", color=color.red, style=plot.style_columns)
-
