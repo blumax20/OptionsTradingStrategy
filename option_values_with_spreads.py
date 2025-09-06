@@ -49,6 +49,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+from scipy.stats import t as student_t
 
 
 def black_scholes_price(
@@ -192,6 +193,40 @@ def compute_debit_spreads(
             row[f'Put_Spread_{inc}'] = put_spread
         spread_rows.append(row)
     return pd.DataFrame(spread_rows)
+
+# === Scenario pricers and helpers for non-Gaussian models ===
+
+def simulate_student_t_paths(S0: float, mu: float, sigma: float, df: float, T: float, steps: int, n: int) -> np.ndarray:
+    """Simulate price paths using a Student-t distribution with given degrees of freedom."""
+    dt = T / steps
+    # draw Student‑t shocks and standardize them to unit variance
+    z = student_t.rvs(df, size=(n, steps))
+    z = z / np.sqrt(df / (df - 2))
+    shocks = (mu - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * z
+    paths = S0 * np.exp(np.cumsum(shocks, axis=1))
+    return paths
+
+def price_spread_student_t(call_spread, S0: float, r: float, sigma: float, df: float = 6, T: float = 30/365, steps: int = 30, n: int = 10000) -> float:
+    """Price a multi‑leg call/put spread using Student‑t Monte Carlo simulation."""
+    paths = simulate_student_t_paths(S0, r, sigma, df, T, steps, n)
+    ST = paths[:, -1]
+    payoff = 0.0
+    for K, qty, is_call in call_spread:
+        if is_call:
+            payoff += qty * np.maximum(ST - K, 0.0)
+        else:
+            payoff += qty * np.maximum(K - ST, 0.0)
+    return float(np.exp(-r * T) * np.mean(payoff))
+
+def iv_surface_lookup(S: float, K: float, T: float, surface) -> float:
+    """Retrieve implied volatility from a user-supplied surface interpolator."""
+    return surface((K, T))
+
+def apply_costs_to_spread(value: float, legs, price: float, atr: float, base_bps: float = 5.0, vol_k: float = 0.15) -> float:
+    """Apply transaction costs to a spread value based on price and volatility."""
+    half_spread = price * (base_bps / 1e4) + vol_k * (atr / max(1e-9, price))
+    cost = sum(abs(qty) for (_, qty, _) in legs) * half_spread
+    return float(value - cost)
 
 
 def main() -> None:
