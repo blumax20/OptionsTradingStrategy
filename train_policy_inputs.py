@@ -148,6 +148,35 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         # Fallback: use absolute close differences when no high/low available
         df['atr'] = df['close'].diff().abs().rolling(atr_length, min_periods=1).mean().fillna(0.0)
         df['adx'] = 0.0
+    # Derived volatility-based features
+    # Compute log returns for IV rank and skew proxies
+    px_values = df['close'].values
+    if len(px_values) > 0:
+        log_ret = np.diff(np.log(px_values), prepend=np.log(px_values[0]))
+    else:
+        log_ret = np.array([])
+    # Use existing ATR if available; else compute fallback
+    if 'atr' in df.columns:
+        atr_series = df['atr']
+    else:
+        atr_series = df['close'].diff().abs().rolling(14, min_periods=1).mean().fillna(0.0)
+    # IV rank proxy: realized vol over 20 days vs 252-day window
+    if len(log_ret) > 0:
+        iv_roll = pd.Series(log_ret).rolling(20).std().mul(np.sqrt(252))
+        iv_min = iv_roll.rolling(252).min()
+        iv_max = iv_roll.rolling(252).max()
+        iv_rank = (iv_roll - iv_min) / (iv_max - iv_min).replace(0, 1e-9)
+        df['iv_rank_20_252'] = np.nan_to_num(iv_rank.values, nan=0.0)
+        # Skew proxy: ratio of downside vs upside semi-variance
+        down = np.clip(log_ret, None, 0)
+        up = np.clip(log_ret, 0, None)
+        skew_proxy_val = (down.std() + 1e-9) / (up.std() + 1e-9)
+        df['skew_proxy'] = skew_proxy_val
+    else:
+        df['iv_rank_20_252'] = 0.0
+        df['skew_proxy'] = 0.0
+    # Volatility clustering flag (binary)
+    df['vol_cluster'] = ((atr_series > atr_series.rolling(14).mean()) & (atr_series.diff().rolling(5).mean() > 0)).astype(int)
     return df
 
 # Evaluation of one parameter combination

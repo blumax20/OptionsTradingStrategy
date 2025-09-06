@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import List
 
 import pandas as pd
+from dataclasses import dataclass
 
 try:
     import backtrader as bt  # type: ignore
@@ -42,6 +43,30 @@ except ImportError as e:  # pragma: no cover
         "Backtrader is required to run this script. Install it with `pip install backtrader`."
     )
 
+# === Execution & Microstructure Helpers (Almgren & Chriss; Cont & Kukanov) ===
+@dataclass
+class ExecutionParams:
+    """Parameters controlling execution costs."""
+    use_limit: bool = True  # toggle limit vs market execution
+    base_spread_bps: float = 5.0  # baseline half-spread in basis points
+    vol_slippage_k: float = 0.15  # scales with intraday volatility
+    size_impact_k: float = 0.0001  # square-root impact coefficient
+
+def est_half_spread(price: float, atr: float, vol_slippage_k: float, base_spread_bps: float) -> float:
+    """Estimate half-spread as a function of price and volatility."""
+    return price * (base_spread_bps / 1e4) + vol_slippage_k * (atr / max(1e-9, price))
+
+def exec_price(side: int, px_mid: float, half_spread: float, size: float, size_impact_k: float, use_limit: bool) -> float:
+    """
+    Compute an execution-adjusted price.
+    For market orders, cross the spread and add square-root size impact; for limit orders, assume a mid-price fill capturing 20% of the spread.
+    """
+    if not use_limit:
+        cross = half_spread
+        impact = size_impact_k * (abs(size) ** 0.5) * px_mid
+        return px_mid + (cross + impact) * (1 if side > 0 else -1)
+    else:
+        return px_mid + (0.20 * half_spread) * (1 if side > 0 else -1)
 
 class HuggingStrategy(bt.Strategy):
     """Adaptive hugging debit spread strategy implemented for Backtrader.
@@ -132,6 +157,13 @@ class HuggingStrategy(bt.Strategy):
         self.hug_lower_count = 0
         self.hug_upper_count = 0
 
+        # Execution policy controls
+        # dynamic_use_limit toggles limit vs market orders based on ATR%, exec_params holds microstructure cost parameters
+        self.dynamic_use_limit = True
+        self.exec_params = ExecutionParams()
+        # Target trade size (computed in next())
+        self._target_size = 1
+
         # Tracking trade outcomes for performance statistics
         # trade_profits will collect per-trade profit or loss (in currency units)
         # total_trades counts all closed trades; profitable_trades counts trades with positive PnL
@@ -184,6 +216,27 @@ class HuggingStrategy(bt.Strategy):
         trend_bear = (self.fastMA[0] <= self.slowMA[0]) or (self.adx[0] < self.p.adxThreshold)
         bull_condition = (bull_score >= self.p.MIN_SCORE) and trend_bull
         bear_condition = (bear_score >= self.p.MIN_SCORE) and trend_bear
+
+        # --- Position sizing (risk budget) & execution policy ---
+        # Determine trade size so that each trade risks a fixed fraction of account value.
+        risk_budget_bps = 50  # risk 50 bps (0.50%) of equity per trade
+        acct_val = float(self.broker.getvalue())
+        per_share_risk = max(1e-6, float(self.atr[0]))
+        target_shares = max(1, int((acct_val * (risk_budget_bps / 1e4)) / per_share_risk))
+        self._target_size = target_shares
+
+        # Toggle limit-order execution when ATR% is high (avoid crossing wide spreads)
+        if self.dynamic_use_limit:
+            atr_pct = (float(self.atr[0]) / max(1e-9, float(self.data.close[0]))) * 100.0
+            self.exec_params.use_limit = atr_pct >= 0.8
+
+        # Volatility clustering guard: skip new entries when ATR is consecutively increasing and trend is strong
+        vol_cluster = False
+        if len(self) >= 3:
+            vol_cluster = (self.atr[0] > self.atr[-1]) and (self.atr[-1] > self.atr[-2])
+        if vol_cluster and self.adx[0] > 35:
+            bull_condition = False
+            bear_condition = False
         # Current bar index
         current_bar = len(self)
         # Manage open long (call) position
@@ -193,10 +246,18 @@ class HuggingStrategy(bt.Strategy):
                 # Close existing long
                 self.close()
                 self.call_entry_bar = None
-                # Enter short
-                self.sell()
+                # Enter short with microstructure-adjusted fill price
+                px_mid = float(self.data.close[0])
+                half_spread = est_half_spread(px_mid, float(self.atr[0]),
+                                              self.exec_params.vol_slippage_k,
+                                              self.exec_params.base_spread_bps)
+                fill_px = exec_price(side=-1, px_mid=px_mid, half_spread=half_spread,
+                                     size=abs(self._target_size),
+                                     size_impact_k=self.exec_params.size_impact_k,
+                                     use_limit=self.exec_params.use_limit)
+                self.sell(size=self._target_size)
                 self.put_entry_bar = current_bar
-                self.put_entry_price = self.data.close[0]
+                self.put_entry_price = fill_px
                 self.put_take_profit = self.data.close[0] - self.p.profitFactor * self.atr[0]
                 self.put_stop_loss = self.data.close[0] + self.p.stopFactor * self.atr[0]
                 # Reset hugging counters
@@ -233,10 +294,18 @@ class HuggingStrategy(bt.Strategy):
             if (self.hug_upper_count >= self.p.hugBars) and (self.fastMA[0] > self.slowMA[0]):
                 self.close()
                 self.put_entry_bar = None
-                # Enter long
-                self.buy()
+                # Enter long with microstructure-adjusted fill price
+                px_mid = float(self.data.close[0])
+                half_spread = est_half_spread(px_mid, float(self.atr[0]),
+                                              self.exec_params.vol_slippage_k,
+                                              self.exec_params.base_spread_bps)
+                fill_px = exec_price(side=+1, px_mid=px_mid, half_spread=half_spread,
+                                     size=abs(self._target_size),
+                                     size_impact_k=self.exec_params.size_impact_k,
+                                     use_limit=self.exec_params.use_limit)
+                self.buy(size=self._target_size)
                 self.call_entry_bar = current_bar
-                self.call_entry_price = self.data.close[0]
+                self.call_entry_price = fill_px
                 self.call_take_profit = self.data.close[0] + self.p.profitFactor * self.atr[0]
                 self.call_stop_loss = self.data.close[0] - self.p.stopFactor * self.atr[0]
                 self.hug_lower_count = 0
@@ -270,17 +339,35 @@ class HuggingStrategy(bt.Strategy):
         # No open position: evaluate entry conditions
         else:
             if bull_condition:
-                self.buy()
+                # New long entry with microstructure-adjusted fill price
+                px_mid = float(self.data.close[0])
+                half_spread = est_half_spread(px_mid, float(self.atr[0]),
+                                              self.exec_params.vol_slippage_k,
+                                              self.exec_params.base_spread_bps)
+                fill_px = exec_price(side=+1, px_mid=px_mid, half_spread=half_spread,
+                                     size=abs(self._target_size),
+                                     size_impact_k=self.exec_params.size_impact_k,
+                                     use_limit=self.exec_params.use_limit)
+                self.buy(size=self._target_size)
                 self.call_entry_bar = current_bar
-                self.call_entry_price = self.data.close[0]
+                self.call_entry_price = fill_px
                 self.call_take_profit = self.data.close[0] + self.p.profitFactor * self.atr[0]
                 self.call_stop_loss = self.data.close[0] - self.p.stopFactor * self.atr[0]
                 self.hug_lower_count = 0
                 self.hug_upper_count = 0
             elif bear_condition:
-                self.sell()
+                # New short entry with microstructure-adjusted fill price
+                px_mid = float(self.data.close[0])
+                half_spread = est_half_spread(px_mid, float(self.atr[0]),
+                                              self.exec_params.vol_slippage_k,
+                                              self.exec_params.base_spread_bps)
+                fill_px = exec_price(side=-1, px_mid=px_mid, half_spread=half_spread,
+                                     size=abs(self._target_size),
+                                     size_impact_k=self.exec_params.size_impact_k,
+                                     use_limit=self.exec_params.use_limit)
+                self.sell(size=self._target_size)
                 self.put_entry_bar = current_bar
-                self.put_entry_price = self.data.close[0]
+                self.put_entry_price = fill_px
                 self.put_take_profit = self.data.close[0] - self.p.profitFactor * self.atr[0]
                 self.put_stop_loss = self.data.close[0] + self.p.stopFactor * self.atr[0]
                 self.hug_lower_count = 0

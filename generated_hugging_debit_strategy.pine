@@ -5,6 +5,12 @@
 strategy("Adaptive Hugging Combined Debit Spread Strategy",
      overlay=true, margin_long=100, margin_short=100,
      process_orders_on_close=false)
+// Additional inputs for double-entry & partial exit & IV gating
+double_entry     = input.bool(true,  "Allow Second Contract on Add Signal")
+partial_exit_pct = input.float(0.5,  "Partial Exit Size (of current)", minval=0.1, maxval=1.0, step=0.1)
+weak_exit_signal = input.string("stoch_rsi_cross_down", "Weak Exit Rule", options=["stoch_rsi_cross_down","bb_mid_cross"])
+iv_rank_ceiling  = input.float(0.50, "Max IV Rank for CALL Debit", minval=0.0, maxval=1.0)
+iv_rank_floor    = input.float(0.20, "Min IV Rank for PUT Debit",  minval=0.0, maxval=1.0)
 
 // Tuned defaults exposed as inputs
 K_OVERSOLD    = input.int(20, title="%K oversold", minval=1, maxval=99)
@@ -44,6 +50,8 @@ var float callTakeProfit = na
 var float callStopLoss   = na
 var float putTakeProfit  = na
 var float putStopLoss    = na
+// Track number of open contracts for double-entry logic
+var int position_units   = 0
 
 // Pending flip flags (fail‑safe in case the same‑bar reverse entry is deferred)
 var bool pendingFlipToCall = false
@@ -61,6 +69,15 @@ lower    = basis - bbStdDev * deviation
 bbWidth  = (upper - lower) / (basis != 0 ? basis : 1)
 bbWidthMA= ta.sma(bbWidth, 20)
 highVol  = bbWidth > bbWidthMA
+// --- IV Rank Proxy & Volatility Clustering Guards ---
+// Proxy for implied volatility rank using realized volatility
+iv_proxy  = ta.stdev(math.log(close), 20) * math.sqrt(252)
+iv_min    = ta.lowest(iv_proxy, 252)
+iv_max    = ta.highest(iv_proxy, 252)
+iv_rank   = (iv_proxy - iv_min) / math.max(1e-9, (iv_max - iv_min))
+// Volatility cluster detection
+atrValueP = atrValue
+vol_cluster = (atrValueP > ta.sma(atrValueP, 14)) and (ta.rma(ta.change(atrValueP), 5) > 0)
 
 // Define hugging zones relative to Bollinger bands
 hugLower = lower + (upper - lower) * hugPct
@@ -115,31 +132,50 @@ trendBull = (fastMA >= slowMA) or (adxValue < adxThreshold)
 trendBear = (fastMA <= slowMA) or (adxValue < adxThreshold)
 bullCondition = (scoreBull >= MIN_SCORE) and trendBull
 bearCondition = (scoreBear >= MIN_SCORE) and trendBear
+// Gate entries based on IV rank and volatility clustering
+bullCondition := bullCondition and (iv_rank <= iv_rank_ceiling) and not vol_cluster
+bearCondition := bearCondition and (iv_rank >= iv_rank_floor)  and not vol_cluster
 
 // Entry logic
-if bullCondition and na(callEntryBar) and na(putEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
-    strategy.entry("CallDebit", strategy.long)
-    callEntryBar   := bar_index
-    callEntryPrice := close
-    callTakeProfit := close + profitFactor * atrValue
-    callStopLoss   := close - stopFactor * atrValue
-    // force reset on any new long entry
-    hugLowerCount  := 0
-    hugUpperCount  := 0
-    // Diagnostic: mark fresh call entry
-    label.new(bar_index, high, "FRESH CALL", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+// Entry logic (long) with double-entry
+enter_long = bullCondition and na(callEntryBar) and na(putEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
+if enter_long
+    if position_units == 0
+        strategy.entry("CALL1", strategy.long)
+        callEntryBar   := bar_index
+        callEntryPrice := close
+        callTakeProfit := close + profitFactor * atrValue
+        callStopLoss   := close - stopFactor * atrValue
+        position_units := 1
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        label.new(bar_index, high, "FRESH CALL1", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+    else if double_entry and position_units == 1
+        strategy.entry("CALL2", strategy.long)
+        callTakeProfit := close + profitFactor * atrValue
+        callStopLoss   := close - stopFactor * atrValue
+        position_units := 2
+        label.new(bar_index, high, "ADD CALL2", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
 
-if bearCondition and na(putEntryBar) and na(callEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
-    strategy.entry("PutDebit", strategy.short)
-    putEntryBar    := bar_index
-    putEntryPrice  := close
-    putTakeProfit  := close - profitFactor * atrValue
-    putStopLoss    := close + stopFactor * atrValue
-    // force reset on any new long entry
-    hugLowerCount  := 0
-    hugUpperCount  := 0
-    // Diagnostic: mark fresh put entry
-    label.new(bar_index, low, "FRESH PUT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+// Entry logic (short) with double-entry
+enter_short = bearCondition and na(putEntryBar) and na(callEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
+if enter_short
+    if position_units == 0
+        strategy.entry("PUT1", strategy.short)
+        putEntryBar    := bar_index
+        putEntryPrice  := close
+        putTakeProfit  := close - profitFactor * atrValue
+        putStopLoss    := close + stopFactor * atrValue
+        position_units := 1
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        label.new(bar_index, low, "FRESH PUT1", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+    else if double_entry and position_units == 1
+        strategy.entry("PUT2", strategy.short)
+        putTakeProfit  := close - profitFactor * atrValue
+        putStopLoss    := close + stopFactor * atrValue
+        position_units := 2
+        label.new(bar_index, low, "ADD PUT2", style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white)
 
 // Holding periods
 maxBars = EXIT_BARS * 2
@@ -202,11 +238,18 @@ if not na(callEntryBar)
         extendedLimit  = bar_index >= callEntryBar + EXIT_BARS*2
         shouldExitDueTime = timeExceeded and ((fastMA < slowMA and adxValue >= adxThreshold) or extendedLimit)
         if (close >= callTakeProfit) or (close <= callStopLoss) or oppositeCall or shouldExitDueTime
-            strategy.close("CallDebit")
+            // Partial or full exit logic for multi-unit calls
+            weak_sell = (weak_exit_signal == "stoch_rsi_cross_down" ? ta.crossunder(k, 50) : close < basis)
+            if weak_sell and position_units == 2
+                strategy.close("CALL2")
+                position_units := 1
+            // Strong exit triggers closing of all call positions
+            strategy.close("CALL1")
             callEntryBar   := na
             callEntryPrice := na
             callTakeProfit := na
             callStopLoss   := na
+            position_units := 0
             hugLowerCount  := 0
             hugUpperCount  := 0
 
@@ -238,11 +281,16 @@ if not na(putEntryBar)
         extendedLimit = bar_index >= putEntryBar + EXIT_BARS*2
         shouldExitDueTime = timeExceeded and ((fastMA > slowMA and adxValue >= adxThreshold) or extendedLimit)
         if (close <= putTakeProfit) or (close >= putStopLoss) or oppositePut or shouldExitDueTime
-            strategy.close("PutDebit")
+            weak_sell = (weak_exit_signal == "stoch_rsi_cross_down" ? ta.crossover(k, 50) : close > basis)
+            if weak_sell and position_units == 2
+                strategy.close("PUT2")
+                position_units := 1
+            strategy.close("PUT1")
             putEntryBar    := na
             putEntryPrice  := na
             putTakeProfit  := na
             putStopLoss    := na
+            position_units := 0
             hugLowerCount  := 0
             hugUpperCount  := 0
 
