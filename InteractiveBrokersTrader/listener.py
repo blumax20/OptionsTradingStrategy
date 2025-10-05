@@ -16,6 +16,25 @@ from zoneinfo import ZoneInfo
 import math
 from typing import Dict
 import re
+import os
+import platform
+from pathlib import Path
+
+def _default_output_base() -> Path:
+    # 1) Allow env var override on any machine
+    env = os.getenv("OUTPUT_BASE")
+    if env and env.strip():
+        return Path(env).expanduser()
+
+    # 2) OS-specific sensible defaults
+    if os.name == "nt":  # Windows (VPS)
+        return Path(r"C:\OptionsHistory")
+    else:                # macOS / Linux
+        # use your existing Mac path; change if you prefer ~/OptionsHistory
+        return Path("/Users/maximilian-alexanderneidhardt/Desktop/Investments/Stocks & Bonds/Stock History and Backtesting Data")
+
+OUTPUT_BASE = _default_output_base()
+OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -108,8 +127,6 @@ def _parse_signal_fields(message: str | None) -> Dict[str, object]:
             result["signal_type"] = "PUT_OPEN"
     return result
 
-# === Per-symbol dated CSV output helpers ===
-OUTPUT_BASE = Path("/Users/maximilian-alexanderneidhardt/Desktop/Investments/Stocks & Bonds/Stock History and Backtesting Data")
 
 def _dated_dir() -> Path:
     try:

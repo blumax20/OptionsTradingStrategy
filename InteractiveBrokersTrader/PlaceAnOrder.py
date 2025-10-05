@@ -6,6 +6,42 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import math
 import argparse
+import os
+from pathlib import Path
+from datetime import datetime
+
+def _default_output_base() -> Path:
+    env = os.getenv("OUTPUT_BASE")
+    if env and env.strip():
+        return Path(env).expanduser()
+    if os.name == "nt":
+        return Path(r"C:\OptionsHistory")
+    return Path("/Users/maximilian-alexanderneidhardt/Desktop/Investments/Stocks & Bonds/Stock History and Backtesting Data")
+
+OUTPUT_BASE = _default_output_base()
+
+def _dated_dir(date: datetime | None = None) -> Path:
+    d = (date or datetime.now()).strftime("%y_%m_%d")
+    p = OUTPUT_BASE / d
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def combined_csv_for(date: datetime | None = None) -> Path:
+    return _dated_dir(date) / "combined_listener_spreads.csv"
+
+def find_latest_combined_csv() -> Path | None:
+    if not OUTPUT_BASE.exists():
+        return None
+    candidates = []
+    for child in OUTPUT_BASE.iterdir():
+        if child.is_dir() and child.name.count("_") == 2:
+            f = child / "combined_listener_spreads.csv"
+            if f.exists():
+                candidates.append((f.stat().st_mtime, f))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -15,7 +51,6 @@ def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
 
-BASE_DIR = "/Users/maximilian-alexanderneidhardt/Desktop/Investments/Stocks & Bonds/Stock History and Backtesting Data"
 
 def parse_args():
     p = argparse.ArgumentParser(description="Place debit spread orders from combined CSV")
@@ -50,8 +85,8 @@ def today_folder_yy_mm_dd(override: str | None = None) -> str:
         today_ny = datetime.now()
     return today_ny.strftime("%y_%m_%d")
 
-def combined_csv_path_for_today(date_override: str | None = None) -> str:
-    return f"{BASE_DIR}/{today_folder_yy_mm_dd(date_override)}/combined_listener_spreads.csv"
+def combined_csv_path_for_today(date_override: str | None = None) -> Path:
+    return OUTPUT_BASE / today_folder_yy_mm_dd(date_override) / "combined_listener_spreads.csv"
 
 def best_theoretical_limit(row: pd.Series, right: str) -> float | None:
     """
