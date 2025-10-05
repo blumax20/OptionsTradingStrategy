@@ -48,8 +48,11 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
-from scipy.stats import t as student_t
+
+# Local replacements to avoid SciPy dependency
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF using error function (no SciPy required)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def black_scholes_price(
@@ -89,9 +92,9 @@ def black_scholes_price(
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
     if option_type.lower() == "call":
-        return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
     else:
-        return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
 
 
 def parse_market_data(csv_path: str) -> Dict[str, float]:
@@ -199,8 +202,8 @@ def compute_debit_spreads(
 def simulate_student_t_paths(S0: float, mu: float, sigma: float, df: float, T: float, steps: int, n: int) -> np.ndarray:
     """Simulate price paths using a Student-t distribution with given degrees of freedom."""
     dt = T / steps
-    # draw Student‑t shocks and standardize them to unit variance
-    z = student_t.rvs(df, size=(n, steps))
+    # draw Student‑t shocks (NumPy) and standardize to unit variance
+    z = np.random.standard_t(df, size=(n, steps))
     z = z / np.sqrt(df / (df - 2))
     shocks = (mu - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * z
     paths = S0 * np.exp(np.cumsum(shocks, axis=1))

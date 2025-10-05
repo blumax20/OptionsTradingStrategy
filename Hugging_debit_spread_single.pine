@@ -1,0 +1,256 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MNeidhardt
+//@version=6
+// Process orders on next bar (next day on 1D)
+strategy("Adaptive Hugging Combined Debit Spread Strategy",
+     overlay=true, margin_long=100, margin_short=100,
+     process_orders_on_close=false)
+
+// Tuned defaults exposed as inputs
+K_OVERSOLD    = input.int(28, title="%K oversold", minval=1, maxval=99)
+K_OVERBOUGHT  = input.int(76, title="%K overbought", minval=1, maxval=99)
+MFI_OVERSOLD  = input.int(25, title="MFI oversold", minval=1, maxval=99)
+MFI_OVERBOUGHT= input.int(87, title="MFI overbought", minval=1, maxval=99)
+EXIT_BARS     = input.int(13, title="Exit bars", minval=1, maxval=15)
+MIN_SCORE     = input.int(1, title="Minimum score for entry", minval=1, maxval=4)
+profitFactor  = input.float(1.17, title="ATR multiplier for take‑profit", step=0.1)
+stopFactor    = input.float(2.88, title="ATR multiplier for stop‑loss", step=0.1)
+
+// Additional inputs for hugging logic
+// Number of consecutive bars price must hug a Bollinger band before flipping the trade
+hugBars     = input.int(5, title="Hugging bars to flip", minval=1, maxval=50)
+// Percentage of Bollinger band width used to define the hugging zone (e.g. 0.05 = 5% of width)
+hugPct      = input.float(0.72, title="Band hugging threshold", step=0.01)
+
+// Indicator lengths
+stochLength  = input.int(11,  "Stochastic RSI length")
+stochSmooth  = input.int(9,   "Stochastic smoothing")
+mfiLength    = input.int(23,  "MFI length")
+bbLength     = input.int(17,  "Bollinger length")
+bbStdDev     = input.float(1.51, "Bollinger std dev")
+macdFast     = input.int(17,  "MACD fast length")
+macdSlow     = input.int(23,  "MACD slow length")
+macdSignal   = input.int(6,   "MACD signal length")
+atrLength    = input.int(11,  "ATR length for targets")
+adxLength    = input.int(26,  "ADX length")
+adxThreshold = input.float(30.0, "Trend filter ADX threshold")
+
+// Persistent variables for call and put spreads
+var int callEntryBar     = na
+var int putEntryBar      = na
+var float callEntryPrice = na
+var float putEntryPrice  = na
+var float callTakeProfit = na
+var float callStopLoss   = na
+var float putTakeProfit  = na
+var float putStopLoss    = na
+
+// Pending flip flags (fail‑safe in case the same‑bar reverse entry is deferred)
+var bool pendingFlipToCall = false
+var bool pendingFlipToPut  = false
+
+// Counters for detecting prolonged hugging of Bollinger bands
+var int hugLowerCount = 0
+var int hugUpperCount = 0
+
+// Bollinger Bands and volatility
+basis    = ta.sma(close, bbLength)
+deviation= ta.stdev(close, bbLength)
+upper    = basis + bbStdDev * deviation
+lower    = basis - bbStdDev * deviation
+bbWidth  = (upper - lower) / (basis != 0 ? basis : 1)
+bbWidthMA= ta.sma(bbWidth, 20)
+highVol  = bbWidth > bbWidthMA
+
+// Define hugging zones relative to Bollinger bands
+hugLower = lower + (upper - lower) * hugPct
+hugUpper = upper - (upper - lower) * hugPct
+
+// Flags indicating if price is hugging the lower or upper band on this bar
+isHugLower = close <= hugLower
+isHugUpper = close >= hugUpper
+
+// Update hugging counters
+hugLowerCount := isHugLower ? hugLowerCount + 1 : 0
+hugUpperCount := isHugUpper ? hugUpperCount + 1 : 0
+
+// Stochastic RSI
+rsi   = ta.rsi(close, stochLength)
+k_raw = ta.stoch(rsi, rsi, rsi, stochLength)
+k    = ta.sma(k_raw, stochSmooth)
+d    = ta.sma(k, stochSmooth)
+
+// Money Flow Index
+tp       = (high + low + close) / 3.0
+rawMF    = tp * volume
+posFlow  = tp > tp[1] ? rawMF : 0.0
+negFlow  = tp < tp[1] ? rawMF : 0.0
+posMF    = math.sum(posFlow, mfiLength)
+negMF    = math.sum(negFlow, mfiLength)
+moneyRatio = negMF != 0 ? posMF / negMF : 0.0
+mfi      = negMF != 0 ? 100 - 100 / (1 + moneyRatio) : 0.0
+
+// MACD
+fastMA     = ta.ema(close, macdFast)
+slowMA     = ta.ema(close, macdSlow)
+macdLine   = fastMA - slowMA
+signalLine = ta.ema(macdLine, macdSignal)
+
+// ADX and ATR
+// Compute ADX using DMI components; high/low/close are implied in Pine v6
+// ADX and ATR
+[_, _, adxValue] = ta.dmi(adxLength, adxLength)
+atrValue = ta.atr(atrLength)
+
+// Adaptive thresholds
+dynKLow    = highVol ? math.max(5, K_OVERSOLD - 10) : K_OVERSOLD
+dynKHigh   = highVol ? math.min(100, K_OVERBOUGHT + 10) : K_OVERBOUGHT
+dynMFILow  = highVol ? math.max(5, MFI_OVERSOLD - 10) : MFI_OVERSOLD
+dynMFIHigh = highVol ? math.min(100, MFI_OVERBOUGHT + 10) : MFI_OVERBOUGHT
+
+// Scores and trend filters
+scoreBull = (k < dynKLow  ? 1 : 0) + (mfi < dynMFILow  ? 1 : 0) + (close <= lower ? 1 : 0) + (macdLine > signalLine ? 1 : 0)
+scoreBear = (k > dynKHigh ? 1 : 0) + (mfi > dynMFIHigh ? 1 : 0) + (close >= upper ? 1 : 0) + (macdLine < signalLine ? 1 : 0)
+trendBull = (fastMA >= slowMA) or (adxValue < adxThreshold)
+trendBear = (fastMA <= slowMA) or (adxValue < adxThreshold)
+bullCondition = (scoreBull >= MIN_SCORE) and trendBull
+bearCondition = (scoreBear >= MIN_SCORE) and trendBear
+
+// Entry logic
+if bullCondition and na(callEntryBar) and na(putEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
+    strategy.entry("CallDebit", strategy.long)
+    callEntryBar   := bar_index
+    callEntryPrice := close
+    callTakeProfit := close + profitFactor * atrValue
+    callStopLoss   := close - stopFactor * atrValue
+    // force reset on any new long entry
+    hugLowerCount  := 0
+    hugUpperCount  := 0
+    // Diagnostic: mark fresh call entry
+    label.new(bar_index, high, "FRESH CALL", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+
+if bearCondition and na(putEntryBar) and na(callEntryBar) and not (pendingFlipToCall or pendingFlipToPut)
+    strategy.entry("PutDebit", strategy.short)
+    putEntryBar    := bar_index
+    putEntryPrice  := close
+    putTakeProfit  := close - profitFactor * atrValue
+    putStopLoss    := close + stopFactor * atrValue
+    // force reset on any new long entry
+    hugLowerCount  := 0
+    hugUpperCount  := 0
+    // Diagnostic: mark fresh put entry
+    label.new(bar_index, low, "FRESH PUT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+// Holding periods
+maxBars = EXIT_BARS * 2
+
+// ---- Pending flip executor (runs after entries, before exits) ----
+// If a pending flip is set and we are flat, open the opposite position now.
+if strategy.position_size == 0
+    if pendingFlipToCall
+        strategy.entry("CallDebit", strategy.long)
+        callEntryBar   := bar_index
+        callEntryPrice := close
+        callTakeProfit := close + profitFactor * atrValue
+        callStopLoss   := close - stopFactor * atrValue
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        pendingFlipToCall := false
+        // Diagnostic: pending flip executed → call
+        label.new(bar_index, high, "PENDING FLIP EXECUTED → CALL", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+    if pendingFlipToPut
+        strategy.entry("PutDebit", strategy.short)
+        putEntryBar    := bar_index
+        putEntryPrice  := close
+        putTakeProfit  := close - profitFactor * atrValue
+        putStopLoss    := close + stopFactor * atrValue
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        pendingFlipToPut := false
+        // Diagnostic: pending flip executed → put
+        label.new(bar_index, low, "PENDING FLIP EXECUTED → PUT", style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white)
+// If a position is open, clear any stale pending flags (successful reverse already active)
+if strategy.position_size != 0
+    pendingFlipToCall := false
+    pendingFlipToPut  := false
+
+// Exit logic for calls
+if not na(callEntryBar)
+    // If a bullish trade is active but price continues to hug the lower Bollinger band and remains below the moving average,
+    // flip into a bearish trade to capitalize on an extended downtrend.  We check that the fast EMA is below the slow EMA
+    // (bearish trend) and that the hugging duration meets the user‑defined threshold.
+    if (hugLowerCount >= hugBars) and (fastMA < slowMA)
+        // Close the existing call debit spread
+        strategy.close("CallDebit")
+        callEntryBar   := na
+        callEntryPrice := na
+        callTakeProfit := na
+        callStopLoss   := na
+        // Attempt immediate reverse; also set pending flag as a fail‑safe
+        strategy.entry("PutDebit", strategy.short)
+        pendingFlipToPut := true
+        // Reset hugging counters to avoid repeated flips
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        // Diagnostic: hugging flip → put
+        label.new(bar_index, low, "FLIP → PUT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+    else
+        exitDynKHigh   = highVol ? math.min(100, K_OVERBOUGHT + 10) : K_OVERBOUGHT
+        exitDynMFIHigh = highVol ? math.min(100, MFI_OVERBOUGHT + 10) : MFI_OVERBOUGHT
+        oppositeCall   = ((k > exitDynKHigh) or (mfi > exitDynMFIHigh)) and (macdLine < signalLine)
+        timeExceeded   = bar_index >= callEntryBar + EXIT_BARS
+        extendedLimit  = bar_index >= callEntryBar + maxBars
+        shouldExitDueTime = timeExceeded and ((fastMA < slowMA and adxValue >= adxThreshold) or extendedLimit)
+        if (close >= callTakeProfit) or (close <= callStopLoss) or oppositeCall or shouldExitDueTime
+            strategy.close("CallDebit")
+            callEntryBar   := na
+            callEntryPrice := na
+            callTakeProfit := na
+            callStopLoss   := na
+            hugLowerCount  := 0
+            hugUpperCount  := 0
+
+// Exit logic for puts
+if not na(putEntryBar)
+    // If a bearish trade is active but price continues to hug the upper Bollinger band and remains above the moving average,
+    // flip into a bullish trade to capitalize on an extended uptrend.  We check that the fast EMA is above the slow EMA
+    // (bullish trend) and that the hugging duration meets the threshold.
+    if (hugUpperCount >= hugBars) and (fastMA > slowMA)
+        // Close the existing put debit spread
+        strategy.close("PutDebit")
+        putEntryBar    := na
+        putEntryPrice  := na
+        putTakeProfit  := na
+        putStopLoss    := na
+        // Attempt immediate reverse; also set pending flag as a fail‑safe
+        strategy.entry("CallDebit", strategy.long)
+        pendingFlipToCall := true
+        // Reset hugging counters
+        hugLowerCount  := 0
+        hugUpperCount  := 0
+        // Diagnostic: hugging flip → call
+        label.new(bar_index, high, "FLIP → CALL", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+    else
+        exitDynKLow   = highVol ? math.max(5, K_OVERSOLD - 10) : K_OVERSOLD
+        exitDynMFILow = highVol ? math.max(5, MFI_OVERSOLD - 10) : MFI_OVERSOLD
+        oppositePut   = ((k < exitDynKLow) or (mfi < exitDynMFILow)) and (macdLine > signalLine)
+        timeExceeded  = bar_index >= putEntryBar + EXIT_BARS
+        extendedLimit = bar_index >= putEntryBar + maxBars
+        shouldExitDueTime = timeExceeded and ((fastMA > slowMA and adxValue >= adxThreshold) or extendedLimit)
+        if (close <= putTakeProfit) or (close >= putStopLoss) or oppositePut or shouldExitDueTime
+            strategy.close("PutDebit")
+            putEntryBar    := na
+            putEntryPrice  := na
+            putTakeProfit  := na
+            putStopLoss    := na
+            hugLowerCount  := 0
+            hugUpperCount  := 0
+
+// Plots
+plot(basis, color=color.gray, linewidth=1, title="BB Basis")
+plot(upper, color=color.orange, linewidth=1, title="BB Upper")
+plot(lower, color=color.orange, linewidth=1, title="BB Lower")
+//plot(k, title="%K", color=color.blue)
+//plot(d, title="%D", color=color.purple)
+//plot(mfi, title="MFI", color=color.green)
+//plot(macdLine - signalLine, title="MACD Histogram", color=color.red, style=plot.style_columns)
