@@ -122,6 +122,41 @@ import os
 import platform
 from pathlib import Path
 
+# --- IB connection helper (robust connect + market data type) ---
+_IB_CLIENT_BASE_ID = 42
+_IB_MAX_RETRIES = 4
+def _ensure_ib_connected(ib: IB, mkt_type: int = 4) -> None:
+    """
+    Ensure a stable connection to IB. If clientId is in-use or socket dropped,
+    try a few nearby clientIds before giving up. Also sets the requested
+    market data type (1=live, 2=frozen, 3=delayed, 4=delayed-frozen).
+    """
+    if ib.isConnected():
+        try:
+            ib.reqMarketDataType(int(mkt_type))
+        except Exception:
+            pass
+        return
+    last_exc: Exception | None = None
+    for i in range(_IB_MAX_RETRIES):
+        cid = _IB_CLIENT_BASE_ID + i
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=cid)
+            try:
+                ib.reqMarketDataType(int(mkt_type))
+            except Exception:
+                pass
+            return
+        except Exception as exc:
+            last_exc = exc
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            util.sleep(0.25)
+    if last_exc:
+        raise last_exc
+
 def _default_output_base() -> Path:
     # 1) Allow env var override on any machine
     env = os.getenv("OUTPUT_BASE")
