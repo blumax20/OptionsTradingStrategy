@@ -3,6 +3,21 @@ from ib_insync.contract import ComboLeg, Contract
 import logging
 import pandas as pd
 from datetime import datetime
+
+# --- Normalize symbols (strip exchange prefixes/timeframes/trailing punctuation) ---
+def _clean_symbol(raw: str | None) -> str | None:
+    if not raw or not isinstance(raw, str):
+        return raw
+    s = raw.strip().upper()
+    if ',' in s:
+        s = s.split(',', 1)[0].strip()
+    if ':' in s:
+        s = s.split(':', 1)[1].strip()
+    if ' ' in s:
+        s = s.split()[0].strip()
+    while s and s[-1] in '.:;,/':
+        s = s[:-1]
+    return s
 from zoneinfo import ZoneInfo
 import math
 import argparse
@@ -221,16 +236,19 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, at
 
     # Inspect current positions to ensure we actually hold the legs
     pos = ib.positions()
+    logger.debug(f"[{symbol}] Inspecting positions for CLOSE {right}: long@{atm_strike} short@{oth_strike} exp {expiration}")
     qty_long = qty_short = 0.0
     for p in pos:
         if getattr(p.contract, 'conId', None) == longC.conId:
             qty_long += float(p.position)
         if getattr(p.contract, 'conId', None) == shortC.conId:
             qty_short += float(p.position)
+        logger.debug(f"[{symbol}]   pos leg: conId={getattr(p.contract,'conId',None)} strike={getattr(p.contract,'strike',None)} right={getattr(p.contract,'right',None)} exp={getattr(p.contract,'lastTradeDateOrContractMonth',None)} qty={p.position}")
 
     # For a long debit spread we expect +N on long leg, -N on short leg
     n = min(abs(int(qty_long)), abs(int(qty_short)), max_qty)
     if n <= 0:
+        logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
         return False
 
     # SELL the combo to close
@@ -291,6 +309,8 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
 
 def run_from_csv():
     args = parse_args()
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
     only = None
     if args.symbols:
         only = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
@@ -315,12 +335,24 @@ def run_from_csv():
     if only:
         df = df[df["symbol"].str.upper().isin(only)]
 
+    # Quick stats for CLOSE signals (for debugging)
+    if "signal_type" in df.columns:
+        close_mask = df["signal_type"].astype(str).str.upper().isin(["CLOSE","CALL_CLOSE","PUT_CLOSE"])
+        logger.info(f"Found {close_mask.sum()} CLOSE rows in CSV (of {len(df)} total).")
+
     # Connect once
     ib = IB()
     try:
         ib.connect('127.0.0.1', 7497, clientId=101)  # Paper trading by default
         # Market data type not required for order placement; keep delayed-frozen
         ib.reqMarketDataType(4)
+        ib.reqPositions()
+        ib.sleep(0.5)
+        try:
+            ps = ib.positions()
+            logger.info(f"Positions loaded: {len(ps)} entries")
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Failed to connect to IB: {e}")
         return
@@ -328,7 +360,7 @@ def run_from_csv():
     placed = 0
     for idx, row in df.iterrows():
         try:
-            symbol = str(row.get("symbol")).upper()
+            symbol = _clean_symbol(str(row.get("symbol")))
             expiration = str(row.get("expiration"))  # YYYYMMDD from CSV
             atm = row.get("atm_strike")
             k_call = row.get("otm_strike_call")
@@ -393,6 +425,7 @@ def run_from_csv():
                     # Close call spread if present
                     call_close_limit = enforce_min_limit(best_close_limit(row, 'C'))
                     if not pd.isna(k_call) and call_close_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                             closed_any = True  # simulate success in dry-run
@@ -403,6 +436,7 @@ def run_from_csv():
                     # Close put spread if present
                     put_close_limit = enforce_min_limit(best_close_limit(row, 'P'))
                     if not pd.isna(k_put) and put_close_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                             closed_any = True  # simulate success in dry-run
@@ -413,6 +447,7 @@ def run_from_csv():
                     if not closed_any:
                         # try approximate match within tolerance
                         if not pd.isna(k_call):
+                            vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL(approx) around atm={atm}, other_hint={k_call} tol={args.close_tol} @ {call_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C',
                                                                                       float(atm), float(k_call), tol=args.close_tol, max_qty=args.quantity)
                             if qty > 0 and call_close_limit is not None:
@@ -425,6 +460,7 @@ def run_from_csv():
                                         logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
                                         closed_any = True
                         if not closed_any and not pd.isna(k_put):
+                            vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {put_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
                                                                                       float(atm), float(k_put), tol=args.close_tol, max_qty=args.quantity)
                             if qty > 0 and put_close_limit is not None:
@@ -461,6 +497,7 @@ def run_from_csv():
                             # exact then approx
                             done = False
                             if not pd.isna(k_call):
+                                vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {limit}")
                                 if args.dry_run:
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {limit} x{args.quantity}")
                                     done = True
@@ -469,6 +506,7 @@ def run_from_csv():
                                     if done:
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE CALL {atm}/{k_call} exp {expiration} @ {limit}")
                             if not done:
+                                vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL(approx) around atm={atm}, other_hint={k_call} tol={args.close_tol} @ {limit}")
                                 a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C',
                                                                                 float(atm) if not pd.isna(atm) else None,
                                                                                 float(k_call) if not pd.isna(k_call) else None,
@@ -486,6 +524,7 @@ def run_from_csv():
                         else:
                             done = False
                             if not pd.isna(k_put):
+                                vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {limit}")
                                 if args.dry_run:
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {limit} x{args.quantity}")
                                     done = True
@@ -494,6 +533,7 @@ def run_from_csv():
                                     if done:
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE PUT {atm}/{k_put} exp {expiration} @ {limit}")
                             if not done:
+                                vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {limit}")
                                 a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
                                                                                 float(atm) if not pd.isna(atm) else None,
                                                                                 float(k_put) if not pd.isna(k_put) else None,
@@ -511,6 +551,7 @@ def run_from_csv():
                 raw_call_limit = best_theoretical_limit(row, 'C')
                 call_limit = enforce_min_limit(raw_call_limit)
                 if call_limit is not None and not pd.isna(k_call):
+                    vprint(args.verbose, f"[{symbol}] Attempt CALL OPEN {atm}/{k_call} exp {expiration} @ {call_limit}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] CALL OPEN {symbol} {atm}/{k_call} exp {expiration} @ {call_limit} x{args.quantity}")
                     else:
@@ -523,6 +564,7 @@ def run_from_csv():
                 raw_put_limit = best_theoretical_limit(row, 'P')
                 put_limit = enforce_min_limit(raw_put_limit)
                 if put_limit is not None and not pd.isna(k_put):
+                    vprint(args.verbose, f"[{symbol}] Attempt PUT OPEN {atm}/{k_put} exp {expiration} @ {put_limit}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] PUT OPEN {symbol} {atm}/{k_put} exp {expiration} @ {put_limit} x{args.quantity}")
                     else:
