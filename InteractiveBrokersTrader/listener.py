@@ -12,6 +12,35 @@ from typing import Optional, Tuple, List
 import asyncio
 import csv
 from pathlib import Path
+
+# --- Normalize incoming symbols (strip exchange prefixes, timeframes, trailing punctuation) ---
+def _clean_symbol(raw: str | None) -> str | None:
+    """
+    Examples:
+      'BATS:EQH, 1D' -> 'EQH'
+      'NYSE:OXY'     -> 'OXY'
+      'NWSA.'        -> 'NWSA'
+    Keeps letters, numbers, dots and hyphens (for tickers like BRK.B), trims junk.
+    """
+    if not raw or not isinstance(raw, str):
+        return raw
+    s = raw.strip().upper()
+    # Cut at comma (drop timeframe like ", 1D")
+    if ',' in s:
+        s = s.split(',', 1)[0].strip()
+    # Keep part after a colon (drop exchange prefix like 'BATS:')
+    if ':' in s:
+        s = s.split(':', 1)[1].strip()
+    # Trim whitespace tokens like '1D' if present
+    if ' ' in s:
+        s = s.split()[0].strip()
+    # Remove trailing punctuation like '.' or ':' or ';'
+    while s and s[-1] in '.:;,/':
+        s = s[:-1]
+    # Final allowlist (A-Z 0-9 . -)
+    import re as _re
+    m = _re.match(r'^[A-Z0-9][A-Z0-9\.\-]*$', s)
+    return s if m else s
 from zoneinfo import ZoneInfo
 import math
 from typing import Dict
@@ -273,6 +302,8 @@ def _fail(stage: str, msg: str, status: int = 500):
     return jsonify({"error": msg, "stage": stage}), status
 
 def get_option_data(symbol: str, width: int = 5):
+    # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
+    symbol = _clean_symbol(symbol)
     ib = IB_SHARED
     stage = "connect"
     try:
@@ -536,6 +567,7 @@ def get_option_data(symbol: str, width: int = 5):
 def webhook():
     data = request.get_json(silent=True) or {}
     symbol = data.get('ticker')
+    symbol = _clean_symbol(symbol)
     if not symbol:
         return _fail("payload", "ticker missing from payload", 400)
     # Attempt to capture alert text for signal parsing
@@ -567,10 +599,10 @@ def webhook_batch():
     for item in symbols:
         # item can be 'SYM' or {'ticker':'SYM','message':'...'}
         if isinstance(item, str):
-            tick = item.strip().upper()
+            tick = _clean_symbol(item)
             msg = None
         elif isinstance(item, dict):
-            tick = str(item.get('ticker') or item.get('symbol') or '').strip().upper()
+            tick = _clean_symbol(str(item.get('ticker') or item.get('symbol') or ''))
             msg = item.get('message') or item.get('alert_message') or item.get('alert') or item.get('text')
         else:
             continue
@@ -591,6 +623,18 @@ def webhook_batch():
                 })
             results.append(res)
     return jsonify({"results": results})
+@app.route('/mdtest', methods=['GET'])
+def mdtest():
+    sym = _clean_symbol(request.args.get('symbol', 'AAPL'))
+    try:
+        if not IB_SHARED.isConnected():
+            IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
+        t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
+        IB_SHARED.sleep(1.0)
+        delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
+        return jsonify({"symbol": sym, "delayed": delayed, "last": getattr(t, 'last', None), "close": getattr(t, 'close', None)})
+    except Exception as e:
+        return jsonify({"symbol": sym, "error": str(e)}), 500
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -624,7 +668,7 @@ if __name__ == '__main__':
         if not IB_SHARED.isConnected():
             IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
         # Use delayed-frozen by default; switch to 1 for live when subscriptions are present
-        IB_SHARED.reqMarketDataType(4)
+        IB_SHARED.reqMarketDataType(1)
     except Exception as exc:
         logger.exception(f"Initial IB connect failed: {exc}")
     logger.info(f"Listener version: {VERSION}")
