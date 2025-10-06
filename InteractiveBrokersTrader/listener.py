@@ -12,6 +12,28 @@ from typing import Optional, Tuple, List
 import asyncio
 import csv
 from pathlib import Path
+# --- MD type selection (env override) and strike fallbacks ---
+def _preferred_md_type() -> int:
+    """Read preferred market data type from env (MARKET_DATA_TYPE), default to 1 (live)."""
+    try:
+        return int(os.getenv("MARKET_DATA_TYPE", "1"))
+    except Exception:
+        return 1
+
+def _nearest_valid_strike(strikes_all: list[float], target: float, prefer: str = "above") -> float | None:
+    """Pick nearest available strike to target. prefer 'above' or 'below' when tie/choice."""
+    if not strikes_all:
+        return None
+    above = [s for s in strikes_all if s >= target]
+    below = [s for s in strikes_all if s <= target]
+    if prefer == "above":
+        if above:
+            return above[0]
+        return below[-1] if below else None
+    else:
+        if below:
+            return below[-1]
+        return above[0] if above else None
 
 # --- SecDef & strike helpers to force "odd if available" ---
 from typing import Iterable
@@ -421,10 +443,9 @@ def get_option_data(symbol: str, width: int = 5):
         logger.exception("IB connect failed")
         return {"_error": True, "stage": stage, "detail": f"Could not connect to IB API: {exc}"}
 
-    # Use LIVE market data by default (user has streaming bundles)
     stage = "market_data_type"
     try:
-        ib.reqMarketDataType(1)  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
+        ib.reqMarketDataType(_preferred_md_type())  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
     except Exception as exc:
         logger.warning(f"Could not set market data type: {exc}")
 
@@ -513,14 +534,29 @@ def get_option_data(symbol: str, width: int = 5):
         atm_strike = _closest_existing(strikes_all, current_price)
         otm_strike = _next_higher_existing(strikes_all, atm_strike)
 
-    # Qualify and request option mkt data for both legs
+    # Qualify and request option mkt data for both call legs (ATM long, OTM short)
     stage = "qualify_options"
     legs_info = []
-    for strike in (atm_strike, otm_strike):
+    call_strikes = [atm_strike, otm_strike]
+    for idx, strike in enumerate(call_strikes):
         try:
             option = _qualify_with_fallback(ib, symbol, expiry_str, strike, 'C', preferred_tc, multiplier)
         except Exception as exc:
-            return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc}"}
+            # Fallback: pick nearest listed strike above, then below
+            fallback = _nearest_valid_strike(strikes_all, strike, prefer="above")
+            if fallback is None or abs(fallback - strike) < 1e-9:
+                fallback = _nearest_valid_strike(strikes_all, strike, prefer="below")
+            if fallback is None:
+                return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc}"}
+            try:
+                option = _qualify_with_fallback(ib, symbol, expiry_str, fallback, 'C', preferred_tc, multiplier)
+                strike = fallback  # use the valid strike
+                if idx == 1:
+                    otm_strike = strike
+                else:
+                    atm_strike = strike
+            except Exception as exc2:
+                return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc2}"}
 
         # Request option market data incl. generic ticks for OI (101) and IV30 (106)
         stage = "option_mktdata"
@@ -528,14 +564,16 @@ def get_option_data(symbol: str, width: int = 5):
             t = ib.reqMktData(option, '101,106', False, False)
             ib.sleep(1.0)
         except Exception as exc:
-            return {"_error": True, "stage": stage, "detail": f"reqMktData failed for option {strike}: {exc}"}
+            # If market data not subscribed (354), continue with no quotes; we will still compute theo later
+            logger.warning(f"[option_mktdata] reqMktData failed for {symbol} {strike}C {expiry_str}: {exc}")
+            t = None
 
         legs_info.append({
             "strike": strike,
-            "bid": getattr(t, 'bid', None),
-            "ask": getattr(t, 'ask', None),
-            "impliedVolatility": getattr(t, 'impliedVolatility', None),
-            "callOpenInterest": getattr(t, 'callOpenInterest', None)
+            "bid": getattr(t, 'bid', None) if t else None,
+            "ask": getattr(t, 'ask', None) if t else None,
+            "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
+            "callOpenInterest": getattr(t, 'callOpenInterest', None) if t else None
         })
 
     # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
@@ -554,13 +592,14 @@ def get_option_data(symbol: str, width: int = 5):
             t = ib.reqMktData(option, '101,106', False, False)
             ib.sleep(1.0)
         except Exception as exc:
-            return {"_error": True, "stage": stage, "detail": f"reqMktData failed for PUT option {strike}: {exc}"}
+            logger.warning(f"[option_put_mktdata] reqMktData failed for {symbol} {strike}P {expiry_str}: {exc}")
+            t = None
         put_legs_info.append({
             "strike": strike,
-            "bid": getattr(t, 'bid', None),
-            "ask": getattr(t, 'ask', None),
-            "impliedVolatility": getattr(t, 'impliedVolatility', None),
-            "putOpenInterest": getattr(t, 'putOpenInterest', None)
+            "bid": getattr(t, 'bid', None) if t else None,
+            "ask": getattr(t, 'ask', None) if t else None,
+            "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
+            "putOpenInterest": getattr(t, 'putOpenInterest', None) if t else None
         })
 
     # Compute net debit limits from quotes
@@ -732,17 +771,50 @@ def mdtest():
             IB_SHARED.reqMarketDataType(int(mdtype))
         except Exception:
             pass
-        # Request a fresh quote
+
+        # Request a fresh quote and patiently poll for fields
+        timeout_ms = int(request.args.get('timeout_ms', '2500'))  # default ~2.5s
+        poll_ms = 200
+        waited = 0
         t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
-        IB_SHARED.sleep(1.0)
+        bid = ask = last = close = None
         delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
+        while waited <= timeout_ms:
+            # collect what we have so far
+            bid   = getattr(t, 'bid',   bid)
+            ask   = getattr(t, 'ask',   ask)
+            last  = getattr(t, 'last',  last)
+            close = getattr(t, 'close', close)
+            # if we have at least bid/ask or last/close, we can stop early
+            if (bid is not None and ask is not None) or (last is not None or close is not None):
+                break
+            IB_SHARED.sleep(poll_ms/1000.0)
+            waited += poll_ms
+            delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', delayed)
+
+        # compute mid if possible
+        mid = None
+        try:
+            if bid is not None and ask is not None:
+                mid = (float(bid) + float(ask)) / 2.0
+        except Exception:
+            mid = None
+
         out = {
             "symbol": sym,
             "mdtype": int(mdtype),
+            "timeout_ms": timeout_ms,
+            "waited_ms": waited,
             "delayed": delayed,
-            "last": getattr(t, 'last', None),
-            "close": getattr(t, 'close', None)
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "last": last,
+            "close": close
         }
+        # If nothing came in, say so explicitly
+        if all(v is None for v in (bid, ask, last, close)):
+            out["note"] = "No ticks received within timeout; try mdtype=4 (delayed-frozen) or verify live/delayed permissions in TWS/Gateway."
         return jsonify(out)
     except Exception as e:
         import traceback
