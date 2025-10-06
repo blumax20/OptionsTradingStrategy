@@ -680,15 +680,44 @@ def webhook_batch():
 @app.route('/mdtest', methods=['GET'])
 def mdtest():
     sym = _clean_symbol(request.args.get('symbol', 'AAPL'))
+    mdtype = request.args.get('mdtype', '1')  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
     try:
-        if not IB_SHARED.isConnected():
-            IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
+        # Ensure IB is connected; prefer helper if present
+        try:
+            _ensure_ib_connected(IB_SHARED, mkt_type=int(mdtype))
+        except NameError:
+            if not IB_SHARED.isConnected():
+                IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
+            try:
+                IB_SHARED.reqMarketDataType(int(mdtype))
+            except Exception:
+                pass
+        # Explicitly set market data type to requested mode
+        try:
+            IB_SHARED.reqMarketDataType(int(mdtype))
+        except Exception:
+            pass
+        # Request a fresh quote
         t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
         IB_SHARED.sleep(1.0)
         delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
-        return jsonify({"symbol": sym, "delayed": delayed, "last": getattr(t, 'last', None), "close": getattr(t, 'close', None)})
+        out = {
+            "symbol": sym,
+            "mdtype": int(mdtype),
+            "delayed": delayed,
+            "last": getattr(t, 'last', None),
+            "close": getattr(t, 'close', None)
+        }
+        return jsonify(out)
     except Exception as e:
-        return jsonify({"symbol": sym, "error": str(e)}), 500
+        import traceback
+        return jsonify({
+            "symbol": sym,
+            "mdtype": mdtype,
+            "error_type": e.__class__.__name__,
+            "error": repr(e),
+            "trace": traceback.format_exc()
+        }), 500
 
 
 @app.route("/", methods=["GET", "POST"])
