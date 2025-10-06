@@ -13,6 +13,79 @@ import asyncio
 import csv
 from pathlib import Path
 
+# --- SecDef & strike helpers to force "odd if available" ---
+from typing import Iterable
+_EXCHANGE_TRY_ORDER: tuple[str, ...] = ('SMART','BOX','CBOE','ISE','NASDAQOM','PHLX','BATS','AMEX')
+
+def _collect_secdef(ib: IB, symbol: str, con_id: int) -> tuple[list[str], list[float], list[str], list[str]]:
+    """
+    Returns (expirations, strikes, tradingClasses, multipliers) from reqSecDefOptParams.
+    """
+    params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
+    ib.sleep(0.25)
+    expirations: list[str] = []
+    strikes_all: list[float] = []
+    trading_classes: list[str] = []
+    multipliers: list[str] = []
+    for p in params:
+        if getattr(p, 'expirations', None):
+            expirations.extend(p.expirations)
+        if getattr(p, 'strikes', None):
+            strikes_all.extend([float(s) for s in p.strikes if s])
+        tc = getattr(p, 'tradingClass', None)
+        if tc:
+            trading_classes.append(tc)
+        mul = getattr(p, 'multiplier', None)
+        if mul:
+            multipliers.append(str(mul))
+    expirations = sorted(set(expirations))
+    strikes_all = sorted({s for s in strikes_all if s > 0})
+    trading_classes = sorted(set([t for t in trading_classes if t]))
+    multipliers = sorted(set([m for m in multipliers if m]))
+    return expirations, list(strikes_all), trading_classes, multipliers
+
+def _pick_preferred_tc(symbol: str, tcs: Iterable[str]) -> str | None:
+    for tc in tcs:
+        if tc.upper() == symbol.upper():
+            return tc
+    return next(iter(tcs), None)
+
+def _closest_existing(strikes_all: list[float], target: float) -> float:
+    if not strikes_all:
+        return target
+    return min(strikes_all, key=lambda s: abs(s - target))
+
+def _next_higher_existing(strikes_all: list[float], k: float) -> float:
+    higher = [s for s in strikes_all if s > k]
+    return higher[0] if higher else k
+
+def _next_lower_existing(strikes_all: list[float], k: float) -> float:
+    lower = [s for s in strikes_all if s < k]
+    return lower[-1] if lower else k
+
+def _qualify_with_fallback(ib: IB, symbol: str, expiry: str, strike: float, right: str, tradingClass: str | None, multiplier: str | None):
+    """
+    Try SMART first then common option exchanges; include tradingClass/multiplier when available.
+    """
+    last_exc: Exception | None = None
+    for ex in _EXCHANGE_TRY_ORDER:
+        opt = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry, strike=float(strike),
+                     right=right, exchange=ex, currency='USD')
+        if tradingClass:
+            opt.tradingClass = tradingClass
+        if multiplier:
+            opt.multiplier = multiplier
+        try:
+            q = ib.qualifyContracts(opt)
+            if q:
+                return q[0]
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Could not qualify {symbol} {right} {strike} {expiry}")
+
 # --- Normalize incoming symbols (strip exchange prefixes, timeframes, trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     """
@@ -313,10 +386,10 @@ def get_option_data(symbol: str, width: int = 5):
         logger.exception("IB connect failed")
         return {"_error": True, "stage": stage, "detail": f"Could not connect to IB API: {exc}"}
 
-    # Prefer delayed-frozen if you don't have live subscriptions; change to 1 for live
+    # Use LIVE market data by default (user has streaming bundles)
     stage = "market_data_type"
     try:
-        ib.reqMarketDataType(4)  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
+        ib.reqMarketDataType(1)  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
     except Exception as exc:
         logger.warning(f"Could not set market data type: {exc}")
 
@@ -360,26 +433,11 @@ def get_option_data(symbol: str, width: int = 5):
 
     con_id = details[0].contract.conId
 
-    # Get expirations & strikes from SecDef params
+    # Get expirations, strikes, tradingClass & multiplier from SecDef (enables odd strikes if listed)
     stage = "secdef"
-    sec_def_params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
-    ib.sleep(0.5)
-
-    expirations: List[str] = []
-    strikes_all: List[float] = []
-    for param in sec_def_params:
-        if getattr(param, 'expirations', None):
-            expirations.extend(param.expirations)
-        if getattr(param, 'strikes', None):
-            strikes_all.extend([float(s) for s in param.strikes])
-
-    expirations = sorted(set(expirations))
-    strikes_all = sorted(set([s for s in strikes_all if s > 0]))
-
-    def _closest_strike(target: float) -> float:
-        if not strikes_all:
-            return target
-        return min(strikes_all, key=lambda s: abs(s - target))
+    expirations, strikes_all, trading_classes, multipliers = _collect_secdef(ib, symbol, con_id)
+    preferred_tc = _pick_preferred_tc(symbol, trading_classes)
+    multiplier = multipliers[0] if multipliers else None
 
     if not expirations:
         return {"_error": True, "stage": stage, "detail": "No expirations available"}
@@ -413,26 +471,19 @@ def get_option_data(symbol: str, width: int = 5):
     # Choose ATM strike from available strikes (closest to current_price)
     stage = "pick_strikes"
     if not strikes_all:
-        # fall back to rounded if strikes list missing
-        atm_strike = int(round(current_price))
+        atm_strike = round(current_price)
         otm_strike = atm_strike + width
     else:
-        atm_strike = min(strikes_all, key=lambda s: abs(s - current_price))
-        # choose next available higher strike for the short leg
-        higher_strikes = [s for s in strikes_all if s >= atm_strike]
-        if len(higher_strikes) >= 2:
-            otm_strike = higher_strikes[1]  # next increment
-        else:
-            otm_strike = atm_strike + width
+        # Force "odd if available": always pick from existing strikes list
+        atm_strike = _closest_existing(strikes_all, current_price)
+        otm_strike = _next_higher_existing(strikes_all, atm_strike)
 
     # Qualify and request option mkt data for both legs
     stage = "qualify_options"
     legs_info = []
     for strike in (atm_strike, otm_strike):
-        option = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str,
-                        strike=strike, right='C', exchange='SMART', currency='USD')
         try:
-            option = ib.qualifyContracts(option)[0]
+            option = _qualify_with_fallback(ib, symbol, expiry_str, strike, 'C', preferred_tc, multiplier)
         except Exception as exc:
             return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc}"}
 
@@ -455,13 +506,12 @@ def get_option_data(symbol: str, width: int = 5):
     # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
     stage = "qualify_put_options"
     put_width = abs(otm_strike - atm_strike)
-    put_otm_strike = max(atm_strike - put_width, 0.01)
+    # Force "odd if available": pick nearest existing lower strike, not invented
+    put_otm_strike = _next_lower_existing(strikes_all, atm_strike)
     put_legs_info = []
     for strike, right in ((atm_strike, 'P'), (put_otm_strike, 'P')):
-        option = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str,
-                        strike=strike, right=right, exchange='SMART', currency='USD')
         try:
-            option = ib.qualifyContracts(option)[0]
+            option = _qualify_with_fallback(ib, symbol, expiry_str, strike, right, preferred_tc, multiplier)
         except Exception as exc:
             return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for PUT {symbol} {strike} {expiry_str}: {exc}"}
         stage = "option_put_mktdata"
@@ -504,11 +554,13 @@ def get_option_data(symbol: str, width: int = 5):
     call_debit_limit_2_5 = put_debit_limit_2_5 = None
     call_debit_limit_5 = put_debit_limit_5 = None
     for W in (1.0, 2.5, 5.0):
-        # Calls: long ATM C, short C at ATM+W (closest strike)
+        # Calls: long ATM C, short C at ATM+W (pick from listed strikes)
         try:
-            c_long = ib.qualifyContracts(Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str, strike=atm_strike, right='C', exchange='SMART', currency='USD'))[0]
-            c_shortK = _closest_strike(atm_strike + W)
-            c_short = ib.qualifyContracts(Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str, strike=c_shortK, right='C', exchange='SMART', currency='USD'))[0]
+            c_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'C', preferred_tc, multiplier)
+            target_c = atm_strike + W
+            c_candidates = [s for s in strikes_all if s >= target_c]
+            c_shortK = c_candidates[0] if c_candidates else _next_higher_existing(strikes_all, atm_strike)
+            c_short = _qualify_with_fallback(ib, symbol, expiry_str, c_shortK, 'C', preferred_tc, multiplier)
             tcL = ib.reqMktData(c_long, '', False, False); ib.sleep(0.4)
             tcS = ib.reqMktData(c_short, '', False, False); ib.sleep(0.4)
             val = None
@@ -522,11 +574,13 @@ def get_option_data(symbol: str, width: int = 5):
                 call_debit_limit_5 = val
         except Exception as e:
             logger.warning(f"[LIMIT] call W={W}: {e}")
-        # Puts: long ATM P, short P at ATM-W (closest strike)
+        # Puts: long ATM P, short P at ATM-W (pick from listed strikes)
         try:
-            p_long = ib.qualifyContracts(Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str, strike=atm_strike, right='P', exchange='SMART', currency='USD'))[0]
-            p_shortK = _closest_strike(max(atm_strike - W, 0.01))
-            p_short = ib.qualifyContracts(Option(symbol=symbol, lastTradeDateOrContractMonth=expiry_str, strike=p_shortK, right='P', exchange='SMART', currency='USD'))[0]
+            p_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'P', preferred_tc, multiplier)
+            target_p = max(atm_strike - W, 0.01)
+            p_candidates = [s for s in strikes_all if s <= target_p]
+            p_shortK = p_candidates[-1] if p_candidates else _next_lower_existing(strikes_all, atm_strike)
+            p_short = _qualify_with_fallback(ib, symbol, expiry_str, p_shortK, 'P', preferred_tc, multiplier)
             tpL = ib.reqMktData(p_long, '', False, False); ib.sleep(0.4)
             tpS = ib.reqMktData(p_short, '', False, False); ib.sleep(0.4)
             val = None
@@ -667,7 +721,7 @@ if __name__ == '__main__':
     try:
         if not IB_SHARED.isConnected():
             IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
-        # Use delayed-frozen by default; switch to 1 for live when subscriptions are present
+        # Use LIVE by default (user has streaming bundles)
         IB_SHARED.reqMarketDataType(1)
     except Exception as exc:
         logger.exception(f"Initial IB connect failed: {exc}")
