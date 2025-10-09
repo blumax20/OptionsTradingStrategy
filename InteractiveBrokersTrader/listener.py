@@ -691,15 +691,82 @@ def get_option_data(symbol: str, width: int = 5):
         "put_debit_limit_5":  put_debit_limit_5,
     }
 
+# --- Extract a ticker from free‑form alert text (very permissive but biased to ALLCAPS tickers) ---
+_TICKER_RE = re.compile(r"\b([A-Z]{1,5})(?:\.[A-Z])?\b")
+
+def _extract_ticker_from_text(text: str | None) -> str | None:
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip().upper()
+    # common patterns: "on PAYX", "ticker PAYX", "symbol PAYX"
+    for pat in (r"\bon\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
+                r"\bticker\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
+                r"\bsymbol\s+([A-Z]{1,5})(?:\.[A-Z])?\b"):
+        m = re.search(pat, s)
+        if m:
+            return _clean_symbol(m.group(1))
+    # fallback: first ALLCAPS token that passes _clean_symbol
+    for m in _TICKER_RE.finditer(s):
+        tick = _clean_symbol(m.group(1))
+        if tick:
+            return tick
+    return None
+
+
+# --- Signal endpoints accepting text or flexible JSON payloads ---
+@app.route('/signal/text', methods=['POST'])
+def signal_text():
+    data = request.get_json(silent=True) or {}
+    raw_text = data.get('text') or data.get('message') or data.get('alert')
+    # allow explicit ticker override via ticker/symbol
+    symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
+    if not symbol:
+        return _fail("payload", "ticker missing and could not extract from text", 400)
+    sig = _parse_signal_fields(raw_text)
+    result = get_option_data(symbol)
+    if not result or result.get("_error"):
+        return _fail(result.get("stage","unknown"), result.get("detail","unable to retrieve option data"), 502)
+    _append_listener_result_to_csv(result, sig)
+    if sig:
+        result.update({
+            "signal_side": sig.get("signal_side"),
+            "signal_type": sig.get("signal_type"),
+            "strategy_position": sig.get("strategy_position"),
+            "raw_message": sig.get("raw_message"),
+        })
+    return jsonify(result)
+
+@app.route('/signal', methods=['POST'])
+def signal_generic():
+    """A flexible alias that accepts either {"ticker": "PAYX", ...} or {"text": "... PAYX ..."}."""
+    data = request.get_json(silent=True) or {}
+    raw_text = data.get('text') or data.get('message') or data.get('alert') or data.get('alert_message')
+    symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
+    if not symbol:
+        return _fail("payload", "ticker missing (and text did not contain an extractable ticker)", 400)
+    sig = _parse_signal_fields(raw_text)
+    result = get_option_data(symbol)
+    if not result or result.get("_error"):
+        return _fail(result.get("stage","unknown"), result.get("detail","unable to retrieve option data"), 502)
+    _append_listener_result_to_csv(result, sig)
+    if sig:
+        result.update({
+            "signal_side": sig.get("signal_side"),
+            "signal_type": sig.get("signal_type"),
+            "strategy_position": sig.get("strategy_position"),
+            "raw_message": sig.get("raw_message"),
+        })
+    return jsonify(result)
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(silent=True) or {}
-    symbol = data.get('ticker')
-    symbol = _clean_symbol(symbol)
-    if not symbol:
-        return _fail("payload", "ticker missing from payload", 400)
-    # Attempt to capture alert text for signal parsing
+    # Accept both ticker and symbol, or extract from free‑form message/text
     msg = data.get('message') or data.get('alert_message') or data.get('alert') or data.get('text')
+    symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(msg))
+    if not symbol:
+        return _fail("payload", "ticker missing from payload and not found in text", 400)
     sig = _parse_signal_fields(msg)
     result = get_option_data(symbol)
     if not result or result.get("_error"):
@@ -812,6 +879,24 @@ def mdtest():
             "last": last,
             "close": close
         }
+        # If nothing came in and user did not already request 4, auto retry once with mdtype=4
+        if all(v is None for v in (bid, ask, last, close)) and int(mdtype) != 4:
+            try:
+                IB_SHARED.reqMarketDataType(4)
+            except Exception:
+                pass
+            # quick retry with shorter budget
+            waited = 0
+            for _ in range(5):
+                IB_SHARED.sleep(0.2)
+                bid   = getattr(t, 'bid',   bid)
+                ask   = getattr(t, 'ask',   ask)
+                last  = getattr(t, 'last',  last)
+                close = getattr(t, 'close', close)
+                if (bid is not None and ask is not None) or (last is not None or close is not None):
+                    break
+                waited += 200
+            out.update({"mdtype": 4, "waited_ms": out.get("waited_ms", 0) + waited, "bid": bid, "ask": ask, "last": last, "close": close})
         # If nothing came in, say so explicitly
         if all(v is None for v in (bid, ask, last, close)):
             out["note"] = "No ticks received within timeout; try mdtype=4 (delayed-frozen) or verify live/delayed permissions in TWS/Gateway."
@@ -838,9 +923,12 @@ def index():
         "version": VERSION,
         "combined_csv_path": str(_combined_csv()),
         "endpoints": {
-            "single": "POST /webhook",
+            "single_webhook": "POST /webhook",
             "batch": "POST /webhook_batch",
-            "health": "GET /health"
+            "signal": "POST /signal  (json: {ticker|symbol|text})",
+            "signal_text": "POST /signal/text  (json: {text})",
+            "health": "GET /health",
+            "mdtest": "GET /mdtest?symbol=PAYX&mdtype=4&timeout_ms=1500"
         }
     })
 

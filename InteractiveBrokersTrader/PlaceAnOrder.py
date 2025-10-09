@@ -1,4 +1,4 @@
-from ib_insync import IB, Option, LimitOrder, MarketOrder
+from ib_insync import IB, Option, LimitOrder
 from ib_insync.contract import ComboLeg, Contract
 import logging
 import pandas as pd
@@ -18,15 +18,6 @@ def _clean_symbol(raw: str | None) -> str | None:
     while s and s[-1] in '.:;,/':
         s = s[:-1]
     return s
-
-# --- Trading-day policy helpers ---
-def _is_after_noon_ny() -> bool:
-    try:
-        now_ny = datetime.now(ZoneInfo("America/New_York"))
-    except Exception:
-        now_ny = datetime.now()
-    return now_ny.hour >= 12
-
 from zoneinfo import ZoneInfo
 import math
 import argparse
@@ -160,6 +151,7 @@ def best_close_limit(row: pd.Series, right: str) -> float | None:
                     pass
     return None
 
+
 def qualify_option(ib: IB, symbol: str, expiration: str, strike: float, right: str) -> Option | None:
     try:
         c = Option(symbol=symbol, lastTradeDateOrContractMonth=expiration,
@@ -168,7 +160,65 @@ def qualify_option(ib: IB, symbol: str, expiration: str, strike: float, right: s
     except Exception:
         return None
 
-def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str, limit_price: float | None, quantity: int = 1, action: str = 'BUY', use_market: bool = False):
+# --- De-duplication helpers for opens (idempotency per run) ---
+OPEN_SEEN_KEYS: set[str] = set()
+
+def _combo_key(symbol: str, right: str, exp: str, longK: float, shortK: float) -> str:
+    return f"{symbol.upper()}|{right.upper()}|{exp}|{float(longK):.4f}|{float(shortK):.4f}"
+
+def has_working_open_order(ib: IB, symbol: str, exp: str, right: str, longK: float, shortK: float) -> bool:
+    """
+    True if there is an existing BUY BAG order for the same two legs in a working state.
+    """
+    longC = qualify_option(ib, symbol, exp, longK, right)
+    shortC = qualify_option(ib, symbol, exp, shortK, right)
+    if not longC or not shortC:
+        return False
+    target_ids = {longC.conId, shortC.conId}
+    try:
+        ib.reqOpenOrders(); ib.sleep(0.25)
+    except Exception:
+        pass
+    for tr in ib.trades():
+        try:
+            if getattr(tr.contract, 'secType', '') != 'BAG':
+                continue
+            if getattr(tr.contract, 'symbol', '').upper() != symbol.upper():
+                continue
+            if getattr(tr.order, 'action', '').upper() != 'BUY':
+                continue
+            st = getattr(tr.orderStatus, 'status', '')
+            # common working/pre-working states
+            if st not in ('PreSubmitted','Submitted','PendingSubmit','ApiPending','Inactive'):
+                continue
+            legs = getattr(tr.contract, 'comboLegs', []) or []
+            ids = {getattr(leg, 'conId', None) for leg in legs}
+            if target_ids == ids:
+                return True
+        except Exception:
+            continue
+    return False
+
+def has_open_position_for_spread(ib: IB, symbol: str, exp: str, right: str, longK: float, shortK: float) -> bool:
+    """
+    True if account already holds +N on longK and -N on shortK for given symbol/right/expiry.
+    """
+    longC = qualify_option(ib, symbol, exp, longK, right)
+    shortC = qualify_option(ib, symbol, exp, shortK, right)
+    if not longC or not shortC:
+        return False
+    qty_long = qty_short = 0.0
+    for p in ib.positions():
+        c = getattr(p, 'contract', None)
+        if not c:
+            continue
+        if getattr(c, 'conId', None) == longC.conId:
+            qty_long += float(p.position)
+        if getattr(c, 'conId', None) == shortC.conId:
+            qty_short += float(p.position)
+    return (qty_long > 0) and (qty_short < 0)
+
+def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str, limit_price: float, quantity: int = 1, action: str = 'BUY'):
     """
     Place a debit spread (vertical) with two option legs as a combo (BAG) order.
     right: 'C' for call spread, 'P' for put spread.
@@ -221,37 +271,58 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
 
     combo.comboLegs = [leg_long, leg_short]
 
-    # Place order
+    # Place limit order
     try:
-        if use_market:
-            order = MarketOrder(action.upper(), quantity)
-            px_note = "MKT"
-        else:
-            order = LimitOrder(action.upper(), quantity, float(limit_price))
-            px_note = f"{float(limit_price):.2f}"
+        order = LimitOrder(action.upper(), quantity, float(limit_price))
         trade = ib.placeOrder(combo, order)
-        logger.info(f"[{symbol}] Placed {right} {'SELL' if action.upper()=='SELL' else 'BUY'} spread {long_strike}/{short_strike} exp {expiration} @ {px_note} (qty={quantity})")
+        logger.info(f"[{symbol}] Placed {right} debit spread {long_strike}/{short_strike} exp {expiration} @ {limit_price:.2f} (qty={quantity})")
         return trade
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
         return
 
-# --- Helper to quote vertical debit spread price ---
-def _quote_vertical_debit(ib: IB, longC: Option, shortC: Option) -> float | None:
+ # --- Cancel any pending/working OPEN (BUY) combo orders for a symbol ---
+def cancel_open_orders_for_symbol(ib: IB, symbol: str) -> int:
+    """
+    Cancel all pending/working BUY combo (BAG) orders for the given ticker.
+    Returns number of orders cancelled.
+    """
     try:
-        tL = ib.reqMktData(longC, '', False, False); ib.sleep(0.3)
-        tS = ib.reqMktData(shortC, '', False, False); ib.sleep(0.3)
-        if getattr(tL, 'ask', None) is not None and getattr(tS, 'bid', None) is not None:
-            return max(0.01, round(float(tL.ask) - float(tS.bid), 2))
+        # Refresh local view of open orders/trades
+        ib.reqOpenOrders()
+        ib.sleep(0.25)
     except Exception:
         pass
-    return None
+    n_cancel = 0
+    for tr in ib.trades():
+        try:
+            c = getattr(tr.contract, 'secType', '')
+            sym = getattr(tr.contract, 'symbol', '')
+            if c != 'BAG' or sym.upper() != symbol.upper():
+                continue
+            ord_obj = tr.order
+            stat = tr.orderStatus
+            act = getattr(ord_obj, 'action', '').upper()
+            status = getattr(stat, 'status', '')
+            # Consider common "working" states
+            if act == 'BUY' and status in ('PreSubmitted','Submitted','PendingSubmit','ApiPending','ApiCancelled','Inactive'):
+                try:
+                    ib.cancelOrder(ord_obj)
+                    n_cancel += 1
+                    logger.info(f"[{symbol}] Cancelled pending OPEN order (id={ord_obj.orderId}, status={status})")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to cancel order {getattr(ord_obj,'orderId',None)}: {e}")
+        except Exception:
+            continue
+    return n_cancel
 
-def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, limit_price: float | None, max_qty: int = 1, use_market: bool = False):
+def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, limit_price: float, max_qty: int = 1):
     """
     Attempt to close an existing long debit spread by SELLing the combo if we find +1 long @ ATM and -1 short @ OTM (for calls),
     or +1 long put @ ATM and -1 short put @ lower strike (for puts). Returns True if an order was sent.
     """
+    if limit_price is None:
+        return False
     longC = qualify_option(ib, symbol, expiration, atm_strike, right)
     shortC = qualify_option(ib, symbol, expiration, oth_strike, right)
     if not longC or not shortC:
@@ -274,15 +345,8 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, at
         logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
         return False
 
-    # Determine price policy
-    px = limit_price
-    if px is None and not use_market:
-        px = _quote_vertical_debit(ib, longC, shortC)
-        if px is None:
-            logger.info(f"[{symbol}] Could not derive limit for CLOSE {right} {atm_strike}/{oth_strike} exp {expiration}; skipping")
-            return False
     # SELL the combo to close
-    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, px, quantity=n, action='SELL', use_market=use_market)
+    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, limit_price, quantity=n, action='SELL')
     return trade is not None
 
 # --- Approximate spread finder for closing ---
@@ -337,53 +401,6 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
                     best = (s_long, s_short, qty, d)
     return (best[0], best[1], best[2]) if best[2] > 0 else (None, None, 0)
 
-# --- Close all vertical debit spreads for a symbol ---
-def close_all_spreads_for_symbol(ib: IB, symbol: str, row: pd.Series, tol: float, use_market: bool, max_qty: int = 10):
-    """
-    Close ALL vertical debit spreads (both calls and puts, all expirations) for the given symbol by matching +long/-short legs.
-    Uses CSV row for theoretical close limits when available; otherwise quotes mid-like debit.
-    """
-    pos = ib.positions()
-    by_key = {}
-    for p in pos:
-        c = getattr(p, 'contract', None)
-        if not c or getattr(c, 'symbol', '').upper() != symbol.upper():
-            continue
-        if getattr(c, 'secType', '') != 'OPT':
-            continue
-        right = getattr(c, 'right', '').upper()
-        exp = getattr(c, 'lastTradeDateOrContractMonth', '')
-        strike = float(getattr(c, 'strike', 0.0))
-        qty = float(getattr(p, 'position', 0.0))
-        key = (right, exp)
-        by_key.setdefault(key, {"longs": {}, "shorts": {}})
-        if qty > 0:
-            by_key[key]["longs"][strike] = by_key[key]["longs"].get(strike, 0.0) + qty
-        elif qty < 0:
-            by_key[key]["shorts"][strike] = by_key[key]["shorts"].get(strike, 0.0) + abs(qty)
-    total_closed = 0
-    for (right, exp), legs in by_key.items():
-        longs = dict(sorted(legs["longs"].items()))
-        shorts = dict(sorted(legs["shorts"].items()))
-        for sL, qL in list(longs.items()):
-            for sS, qS in list(shorts.items()):
-                qty = int(min(qL, qS, max_qty))
-                if qty <= 0:
-                    continue
-                # Preferred limit from CSV theo (side-specific), else quote
-                px = None if use_market else best_close_limit(row, 'C' if right == 'C' else 'P')
-                if not use_market and px is None:
-                    longC = qualify_option(ib, symbol, exp, sL, right)
-                    shortC = qualify_option(ib, symbol, exp, sS, right)
-                    if longC and shortC:
-                        px = _quote_vertical_debit(ib, longC, shortC)
-                ok = close_spread_if_present(ib, symbol, exp, right, sL, sS, px, max_qty=qty, use_market=use_market)
-                if ok:
-                    total_closed += qty
-                    longs[sL] -= qty
-                    shorts[sS] -= qty
-    return total_closed
-
 def run_from_csv():
     args = parse_args()
     if args.verbose:
@@ -412,13 +429,6 @@ def run_from_csv():
     if only:
         df = df[df["symbol"].str.upper().isin(only)]
 
-    # Pre-pass: any tickers with CLOSE-like signals are close-priority and should not open new positions this run
-    close_set = set()
-    if "signal_type" in df.columns:
-        tmp = df["signal_type"].astype(str).str.upper()
-        close_set = set(df.loc[tmp.isin(["CLOSE","CALL_CLOSE","PUT_CLOSE"]), "symbol"].astype(str).map(_clean_symbol))
-        logger.info(f"CLOSE-priority tickers this run: {sorted([s for s in close_set if s])}")
-
     # Quick stats for CLOSE signals (for debugging)
     if "signal_type" in df.columns:
         close_mask = df["signal_type"].astype(str).str.upper().isin(["CLOSE","CALL_CLOSE","PUT_CLOSE"])
@@ -437,9 +447,39 @@ def run_from_csv():
             logger.info(f"Positions loaded: {len(ps)} entries")
         except Exception:
             pass
+        # Reset per-run open de-dup set
+        try:
+            OPEN_SEEN_KEYS.clear()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Failed to connect to IB: {e}")
         return
+
+    # If this batch contains CLOSE signals, proactively cancel any pending BUY combo orders for those tickers
+    if 'close_set' in locals() or 'close_mask' in locals():
+        # Defensive: try to find the set of tickers flagged for CLOSE
+        if 'close_set' in locals():
+            close_syms = close_set
+        elif 'close_mask' in locals() and 'df' in locals():
+            close_syms = set(df[close_mask]["symbol"].astype(str).map(_clean_symbol))
+        else:
+            close_syms = set()
+    else:
+        close_syms = set()
+    if 'close_mask' in locals() and 'df' in locals():
+        close_set = set(df[close_mask]["symbol"].astype(str).map(_clean_symbol))
+    # Use close_set if defined
+    if 'close_set' in locals():
+        _close_set = close_set
+    else:
+        _close_set = close_syms
+    if _close_set:
+        total_cxl = 0
+        for sym in sorted([s for s in _close_set if s]):
+            total_cxl += cancel_open_orders_for_symbol(ib, sym)
+        if total_cxl > 0:
+            logger.info(f"Cancelled {total_cxl} pending OPEN combo order(s) across CLOSE-priority tickers")
 
     placed = 0
     for idx, row in df.iterrows():
@@ -504,13 +544,64 @@ def run_from_csv():
                 elif stype == "PUT_OPEN":
                     allow_put = True
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
-                    # Determine order type policy: after 12:00pm NY -> market, else limit at theoretical/quoted
-                    use_market = _is_after_noon_ny()
-                    qty_closed = close_all_spreads_for_symbol(ib, symbol, row, tol=args.close_tol, use_market=use_market, max_qty=args.quantity)
-                    if qty_closed > 0:
-                        logger.info(f"[{symbol}] CLOSE-all completed: {qty_closed} combo(s) {'MKT' if use_market else 'LMT'}")
-                    else:
-                        logger.info(f"[{symbol}] CLOSE requested but no matching positions found; no orders sent")
+                    # Cancel any pending OPENs for this ticker before closing
+                    cxl = cancel_open_orders_for_symbol(ib, symbol)
+                    if cxl > 0:
+                        logger.info(f"[{symbol}] Cancelled {cxl} pending OPEN combo order(s) prior to CLOSE")
+                    # Attempt to close whichever spread we hold (call and/or put) by inspecting positions
+                    closed_any = False
+                    # Close call spread if present
+                    call_close_limit = enforce_min_limit(best_close_limit(row, 'C'))
+                    if not pd.isna(k_call) and call_close_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {call_close_limit}")
+                            closed_any = True  # simulate success in dry-run
+                        else:
+                            if close_spread_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), call_close_limit, max_qty=args.quantity):
+                                logger.info(f"[{symbol}] Submitted CLOSE for CALL spread {atm}/{k_call} exp {expiration} @ {call_close_limit}")
+                                closed_any = True
+                    # Close put spread if present
+                    put_close_limit = enforce_min_limit(best_close_limit(row, 'P'))
+                    if not pd.isna(k_put) and put_close_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {put_close_limit}")
+                            closed_any = True  # simulate success in dry-run
+                        else:
+                            if close_spread_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), put_close_limit, max_qty=args.quantity):
+                                logger.info(f"[{symbol}] Submitted CLOSE for PUT spread {atm}/{k_put} exp {expiration} @ {put_close_limit}")
+                                closed_any = True
+                    if not closed_any:
+                        # try approximate match within tolerance
+                        if not pd.isna(k_call):
+                            vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL(approx) around atm={atm}, other_hint={k_call} tol={args.close_tol} @ {call_close_limit}")
+                            approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C',
+                                                                                      float(atm), float(k_call), tol=args.close_tol, max_qty=args.quantity)
+                            if qty > 0 and call_close_limit is not None:
+                                if args.dry_run:
+                                    vprint(args.verbose, f"[DRY-RUN] CLOSE CALL(approx) {symbol} {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit} x{qty}")
+                                    closed_any = True
+                                else:
+                                    if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'C',
+                                                          call_close_limit, quantity=qty, action='SELL'):
+                                        logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
+                                        closed_any = True
+                        if not closed_any and not pd.isna(k_put):
+                            vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {put_close_limit}")
+                            approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
+                                                                                      float(atm), float(k_put), tol=args.close_tol, max_qty=args.quantity)
+                            if qty > 0 and put_close_limit is not None:
+                                if args.dry_run:
+                                    vprint(args.verbose, f"[DRY-RUN] CLOSE PUT(approx) {symbol} {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit} x{qty}")
+                                    closed_any = True
+                                else:
+                                    if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'P',
+                                                          put_close_limit, quantity=qty, action='SELL'):
+                                        logger.info(f"[{symbol}] Submitted CLOSE PUT(approx) {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit}")
+                                        closed_any = True
+                    if not closed_any:
+                        vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
                     continue
                 else:
                     vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
@@ -539,7 +630,7 @@ def run_from_csv():
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {limit} x{args.quantity}")
                                     done = True
                                 else:
-                                    done = close_spread_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), limit, max_qty=args.quantity, use_market=_is_after_noon_ny())
+                                    done = close_spread_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), limit, max_qty=args.quantity)
                                     if done:
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE CALL {atm}/{k_call} exp {expiration} @ {limit}")
                             if not done:
@@ -552,7 +643,7 @@ def run_from_csv():
                                     if args.dry_run:
                                         vprint(args.verbose, f"[DRY-RUN] CLOSE CALL(approx) {symbol} {a_atm}/{a_oth} exp {expiration} @ {limit} x{qty}")
                                     else:
-                                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'C', limit, quantity=qty, action='SELL', use_market=_is_after_noon_ny())
+                                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'C', limit, quantity=qty, action='SELL')
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE CALL(approx) {a_atm}/{a_oth} exp {expiration} @ {limit}")
                     else:
                         limit = enforce_min_limit(best_close_limit(row, 'P'))
@@ -566,7 +657,7 @@ def run_from_csv():
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {limit} x{args.quantity}")
                                     done = True
                                 else:
-                                    done = close_spread_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), limit, max_qty=args.quantity, use_market=_is_after_noon_ny())
+                                    done = close_spread_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), limit, max_qty=args.quantity)
                                     if done:
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE PUT {atm}/{k_put} exp {expiration} @ {limit}")
                             if not done:
@@ -579,25 +670,30 @@ def run_from_csv():
                                     if args.dry_run:
                                         vprint(args.verbose, f"[DRY-RUN] CLOSE PUT(approx) {symbol} {a_atm}/{a_oth} exp {expiration} @ {limit} x{qty}")
                                     else:
-                                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', limit, quantity=qty, action='SELL', use_market=_is_after_noon_ny())
+                                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', limit, quantity=qty, action='SELL')
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {limit}")
                 continue
 
-            # If any row for this ticker is a CLOSE, do not open new positions for it in this run
-            if symbol in close_set:
-                vprint(args.verbose, f"[{symbol}] Skipping OPEN because ticker is flagged for CLOSE in this batch")
-                continue
             # --- CALL debit spread (ATM long / OTM short) ---
             if allow_call:
                 raw_call_limit = best_theoretical_limit(row, 'C')
                 call_limit = enforce_min_limit(raw_call_limit)
                 if call_limit is not None and not pd.isna(k_call):
-                    vprint(args.verbose, f"[{symbol}] Attempt CALL OPEN {atm}/{k_call} exp {expiration} @ {call_limit}")
-                    if args.dry_run:
-                        vprint(args.verbose, f"[DRY-RUN] CALL OPEN {symbol} {atm}/{k_call} exp {expiration} @ {call_limit} x{args.quantity}")
+                    key = _combo_key(symbol, 'C', expiration, float(atm), float(k_call))
+                    if key in OPEN_SEEN_KEYS:
+                        vprint(args.verbose, f"[{symbol}] Skipping duplicate CALL OPEN (already attempted this run) {atm}/{k_call} exp {expiration}")
+                    elif has_working_open_order(ib, symbol, expiration, 'C', float(atm), float(k_call)):
+                        vprint(args.verbose, f"[{symbol}] Skipping CALL OPEN; working BUY order exists for {atm}/{k_call} exp {expiration}")
+                    elif has_open_position_for_spread(ib, symbol, expiration, 'C', float(atm), float(k_call)):
+                        vprint(args.verbose, f"[{symbol}] Skipping CALL OPEN; position already held for {atm}/{k_call} exp {expiration}")
                     else:
-                        place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', call_limit, quantity=args.quantity)
-                        placed += 1
+                        vprint(args.verbose, f"[{symbol}] Attempt CALL OPEN {atm}/{k_call} exp {expiration} @ {call_limit}")
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] CALL OPEN {symbol} {atm}/{k_call} exp {expiration} @ {call_limit} x{args.quantity}")
+                        else:
+                            place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', call_limit, quantity=args.quantity)
+                            OPEN_SEEN_KEYS.add(key)
+                            placed += 1
                 else:
                     vprint(args.verbose, f"[{symbol}] Call skipped; limit={call_limit}, k_call={k_call}")
             # --- PUT debit spread (ATM long / lower strike short) ---
@@ -605,12 +701,21 @@ def run_from_csv():
                 raw_put_limit = best_theoretical_limit(row, 'P')
                 put_limit = enforce_min_limit(raw_put_limit)
                 if put_limit is not None and not pd.isna(k_put):
-                    vprint(args.verbose, f"[{symbol}] Attempt PUT OPEN {atm}/{k_put} exp {expiration} @ {put_limit}")
-                    if args.dry_run:
-                        vprint(args.verbose, f"[DRY-RUN] PUT OPEN {symbol} {atm}/{k_put} exp {expiration} @ {put_limit} x{args.quantity}")
+                    key = _combo_key(symbol, 'P', expiration, float(atm), float(k_put))
+                    if key in OPEN_SEEN_KEYS:
+                        vprint(args.verbose, f"[{symbol}] Skipping duplicate PUT OPEN (already attempted this run) {atm}/{k_put} exp {expiration}")
+                    elif has_working_open_order(ib, symbol, expiration, 'P', float(atm), float(k_put)):
+                        vprint(args.verbose, f"[{symbol}] Skipping PUT OPEN; working BUY order exists for {atm}/{k_put} exp {expiration}")
+                    elif has_open_position_for_spread(ib, symbol, expiration, 'P', float(atm), float(k_put)):
+                        vprint(args.verbose, f"[{symbol}] Skipping PUT OPEN; position already held for {atm}/{k_put} exp {expiration}")
                     else:
-                        place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', put_limit, quantity=args.quantity)
-                        placed += 1
+                        vprint(args.verbose, f"[{symbol}] Attempt PUT OPEN {atm}/{k_put} exp {expiration} @ {put_limit}")
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] PUT OPEN {symbol} {atm}/{k_put} exp {expiration} @ {put_limit} x{args.quantity}")
+                        else:
+                            place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', put_limit, quantity=args.quantity)
+                            OPEN_SEEN_KEYS.add(key)
+                            placed += 1
                 else:
                     vprint(args.verbose, f"[{symbol}] Put skipped; limit={put_limit}, k_put={k_put}")
 
