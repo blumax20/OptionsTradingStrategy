@@ -14,6 +14,7 @@ import csv
 from pathlib import Path
 # Ensure os is imported before _preferred_md_type
 import os
+import sys
 # --- MD type selection (env override) and strike fallbacks ---
 def _preferred_md_type() -> int:
     """Read preferred market data type from env (MARKET_DATA_TYPE), default to 1 (live)."""
@@ -942,6 +943,8 @@ def health():
     payload = {
         "version": VERSION,
         "combined_csv_path": str(_combined_csv()),
+        "source_file": __file__,
+        "python": sys.version.split()[0],
     }
     try:
         # Make a best-effort connection to gather positions
