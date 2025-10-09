@@ -12,6 +12,8 @@ from typing import Optional, Tuple, List
 import asyncio
 import csv
 from pathlib import Path
+# Ensure os is imported before _preferred_md_type
+import os
 # --- MD type selection (env override) and strike fallbacks ---
 def _preferred_md_type() -> int:
     """Read preferred market data type from env (MARKET_DATA_TYPE), default to 1 (live)."""
@@ -140,7 +142,6 @@ from zoneinfo import ZoneInfo
 import math
 from typing import Dict
 import re
-import os
 import platform
 from pathlib import Path
 
@@ -200,7 +201,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 
-VERSION = "listener-2025-09-12c"
+VERSION = "listener-2025-09-12d"
 
 # Expiration selection preferences
 TARGET_DTE = 30     # target days to expiration
@@ -935,9 +936,42 @@ def index():
 @app.route('/health', methods=['GET'])
 def health():
     """
-    Health endpoint. Returns version and CSV path.
+    Health endpoint. Returns version, CSV path, and a lightweight positions summary (paper).
+    Does not fail the endpoint if the API is not reachable; it will just omit positions.
     """
-    return jsonify({"version": VERSION, "combined_csv_path": str(_combined_csv())})
+    payload = {
+        "version": VERSION,
+        "combined_csv_path": str(_combined_csv()),
+    }
+    try:
+        # Make a best-effort connection to gather positions
+        _ensure_ib_connected(IB_SHARED, mkt_type=_preferred_md_type())
+        # small sleep to let account data stream in
+        try:
+            IB_SHARED.sleep(0.1)
+        except Exception:
+            pass
+        ps = list(IB_SHARED.positions())
+        payload["positions_count"] = len(ps)
+        # sample up to first 25 positions with compact fields
+        sample = []
+        for p in ps[:25]:
+            c = p.contract
+            sample.append({
+                "symbol": getattr(c, "symbol", ""),
+                "secType": getattr(c, "secType", ""),
+                "exp": getattr(c, "lastTradeDateOrContractMonth", ""),
+                "right": getattr(c, "right", ""),
+                "strike": getattr(c, "strike", ""),
+                "qty": p.position,
+                "avgCost": p.avgCost,
+            })
+        if sample:
+            payload["positions_sample"] = sample
+    except Exception as exc:
+        # Do not fail health on positions error
+        payload["positions_error"] = repr(exc)
+    return jsonify(payload)
 
 if __name__ == '__main__':
     import os
