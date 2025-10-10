@@ -18,12 +18,98 @@ def _clean_symbol(raw: str | None) -> str | None:
     while s and s[-1] in '.:;,/':
         s = s[:-1]
     return s
+
+# --- Parse listener NY timestamp ("YYYY-MM-DD HH:MM:SS") ---
+def _parse_ts_ny(val):
+    try:
+        if isinstance(val, str) and val.strip():
+            return datetime.strptime(val.strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return None
 from zoneinfo import ZoneInfo
 import math
 import argparse
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+ # --- Enforce weekly closures from CSV for the last N days (default 7) ---
+def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
+    if df is None or df.empty:
+        return
+    if "timestamp_ny" not in df.columns:
+        return
+    try:
+        now_ny = datetime.now(ZoneInfo("America/New_York")) if ZoneInfo else datetime.now()
+    except Exception:
+        now_ny = datetime.now()
+    cutoff = now_ny - timedelta(days=days)
+
+    # Filter CLOSE signals in the last N days
+    mask_close = (df.get("signal_type", pd.Series(dtype=str)).astype(str).str.upper().isin(["CLOSE","CALL_CLOSE","PUT_CLOSE"]))
+    df_close = df.loc[mask_close].copy()
+    if df_close.empty:
+        return
+    df_close["_ts"] = df_close["timestamp_ny"].apply(_parse_ts_ny)
+    df_close = df_close[df_close["_ts"].notna() & (df_close["_ts"] >= cutoff)]
+    if df_close.empty:
+        return
+
+    # Keep the most recent close row per symbol
+    df_close = df_close.sort_values(["symbol","_ts"]).groupby(df_close["symbol"].str.upper(), as_index=False, group_keys=False).tail(1)
+
+    for _, row in df_close.iterrows():
+        try:
+            symbol = _clean_symbol(str(row.get("symbol")))
+            if not symbol:
+                continue
+            expiration = str(row.get("expiration"))
+            atm = row.get("atm_strike")
+            k_call = row.get("otm_strike_call")
+            k_put  = row.get("otm_strike_put")
+            # Choose reasonable close limits
+            call_close_limit = best_close_limit(row, 'C')
+            put_close_limit  = best_close_limit(row, 'P')
+            # Enforce min limit
+            def _enforce_min(x):
+                if x is None or (isinstance(x, float) and (math.isnan(x) or x in (float('inf'), float('-inf')))):
+                    return None
+                try:
+                    v = float(x)
+                except Exception:
+                    return None
+                if v < args.min_limit:
+                    return args.min_limit if args.bump_to_min else None
+                return v
+            call_close_limit = _enforce_min(call_close_limit)
+            put_close_limit  = _enforce_min(put_close_limit)
+
+            # Try exact call close first
+            closed_any = False
+            if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
+                if close_spread_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), call_close_limit, max_qty=args.quantity):
+                    logger.info(f"[{symbol}] Weekly-enforce CLOSE CALL {atm}/{k_call} exp {expiration} @ {call_close_limit}")
+                    closed_any = True
+            # Try exact put close
+            if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
+                if close_spread_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), put_close_limit, max_qty=args.quantity):
+                    logger.info(f"[{symbol}] Weekly-enforce CLOSE PUT {atm}/{k_put} exp {expiration} @ {put_close_limit}")
+                    closed_any = True
+            # Approximate if needed
+            if not closed_any:
+                if call_close_limit is not None:
+                    a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C', float(atm) if not pd.isna(atm) else None, float(k_call) if not pd.isna(k_call) else None, tol=args.close_tol, max_qty=args.quantity)
+                    if qty > 0:
+                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'C', call_close_limit, quantity=qty, action='SELL')
+                        logger.info(f"[{symbol}] Weekly-enforce CLOSE CALL(approx) {a_atm}/{a_oth} exp {expiration} @ {call_close_limit}")
+                        closed_any = True
+                if not closed_any and put_close_limit is not None:
+                    a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P', float(atm) if not pd.isna(atm) else None, float(k_put) if not pd.isna(k_put) else None, tol=args.close_tol, max_qty=args.quantity)
+                    if qty > 0:
+                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', put_close_limit, quantity=qty, action='SELL')
+                        logger.info(f"[{symbol}] Weekly-enforce CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {put_close_limit}")
+        except Exception as e:
+            logger.warning(f"[weekly-close] {symbol if 'symbol' in locals() else ''}: {e}")
 
 def _default_output_base() -> Path:
     env = os.getenv("OUTPUT_BASE")
@@ -419,6 +505,15 @@ def run_from_csv():
         logger.error(f"Failed to read CSV: {e}")
         return
 
+    # Keep only the latest row per symbol (based on listener's timestamp_ny) to avoid multiple signals for same ticker
+    if "timestamp_ny" in df.columns:
+        try:
+            df["_ts"] = df["timestamp_ny"].apply(_parse_ts_ny)
+            df = df.sort_values(["symbol","_ts"]).groupby(df["symbol"].str.upper(), as_index=False, group_keys=False).tail(1)
+        except Exception:
+            # If parsing fails, fall back to keeping the CSV as-is
+            pass
+
     # Validate minimal columns
     required_cols = ["symbol", "expiration", "atm_strike", "otm_strike_call", "otm_strike_put"]
     missing = [c for c in required_cols if c not in df.columns]
@@ -452,6 +547,11 @@ def run_from_csv():
             OPEN_SEEN_KEYS.clear()
         except Exception:
             pass
+        # Enforce that recent CLOSE signals (last 7 days) have been acted on before opening new risk
+        try:
+            enforce_weekly_closures(ib, df.copy(), args, days=7)
+        except Exception as _e:
+            logger.warning(f"Weekly closure enforcement skipped due to error: {_e}")
     except Exception as e:
         logger.error(f"Failed to connect to IB: {e}")
         return
