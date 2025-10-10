@@ -9,6 +9,13 @@ NY = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
 
+# Optional “pre-close” sweep to convert stubborn CLOSE limits to market
+PRE_CLOSE_SWEEP = time(15, 0)       # 3:00 pm ET
+PRE_CLOSE_SWEEP_END = time(15, 30)  # safety window
+
+# Optional “after-hours placement” time
+AFTER_HOURS_PLACEMENT = time(17, 0) # 5:00 pm ET
+
 # Idempotency windows to prevent double-running cycles
 DAILY_ANALYSIS_COOLDOWN_HOURS = 2      # don't re-run daily analysis inside this window
 WEEKLY_MAINTENANCE_DAY = 6             # Sunday
@@ -37,11 +44,17 @@ class DailyCycleManagementMixin:
       - reoptimize_all_sectors() -> None
       - remove_high_iv_candidates() -> None
       - rebalance_sector_exposure() -> None
+      - convert_unfilled_close_limits_to_market(cutoff: time = PRE_CLOSE_SWEEP) -> None
+      - place_end_of_day_signals() -> None
+      - enforce_recent_closures(days: int = 7) -> None
 
     Optional hooks:
       - pre_daily_analysis() / post_daily_analysis()
       - pre_market_open() / post_market_open()
       - pre_weekly_maintenance() / post_weekly_maintenance()
+      - (optional) convert_unfilled_close_limits_to_market(cutoff=PRE_CLOSE_SWEEP)
+      - (optional) place_end_of_day_signals()
+      - (optional) enforce_recent_closures(days=7)
     """
 
     # simple in-memory run guards; replace with persistent store if running in multiple processes
@@ -72,6 +85,21 @@ class DailyCycleManagementMixin:
             return True
         return dt.time() >= MARKET_CLOSE
 
+    def _is_between(self, t: time, start: time, end: time) -> bool:
+        """Return True if time t is within [start, end)."""
+        return (t >= start) and (t < end)
+
+    def is_pre_close_window(self, when: datetime | None = None) -> bool:
+        dt = when or self._now_ny()
+        if not self._is_trading_day(dt):
+            return False
+        return self._is_between(dt.time(), PRE_CLOSE_SWEEP, min(PRE_CLOSE_SWEEP_END, MARKET_CLOSE))
+
+    def is_after_hours_placement(self, when: datetime | None = None) -> bool:
+        dt = when or self._now_ny()
+        # Allow after-hours placement on any day post close
+        return dt.time() >= AFTER_HOURS_PLACEMENT
+
     # ---------- Idempotency Guards ----------
     def _can_run_daily_analysis(self) -> bool:
         now = self._now_ny()
@@ -95,61 +123,122 @@ class DailyCycleManagementMixin:
     def _mark_weekly_maintenance(self) -> None:
         self._last_weekly_maintenance_at = self._now_ny()
 
+    # ---------- Mid/End-of-day Helpers (safe, optional) ----------
+    def _pre_close_market_conversion(self) -> None:
+        """
+        Convert any stubborn CLOSE limit orders to market in the pre-close window.
+        Host may implement convert_unfilled_close_limits_to_market(cutoff=...), otherwise we no-op.
+        """
+        if hasattr(self, "convert_unfilled_close_limits_to_market"):
+            LOG.info("Pre-close sweep: converting unfilled CLOSE limits to market...")
+            try:
+                self.convert_unfilled_close_limits_to_market(cutoff=PRE_CLOSE_SWEEP)
+                LOG.info("Pre-close sweep completed.")
+            except Exception as e:
+                LOG.exception("Pre-close sweep failed: %s", e)
+        else:
+            LOG.info("Pre-close sweep skipped (host method convert_unfilled_close_limits_to_market not implemented).")
+
+    def _after_hours_batch_placement(self) -> None:
+        """
+        Place end-of-day signals (e.g., from listener CSV or batch JSON) after-hours.
+        Host may implement place_end_of_day_signals(), otherwise we no-op.
+        """
+        if hasattr(self, "place_end_of_day_signals"):
+            LOG.info("After-hours batch placement starting...")
+            try:
+                self.place_end_of_day_signals()
+                LOG.info("After-hours batch placement completed.")
+            except Exception as e:
+                LOG.exception("After-hours batch placement failed: %s", e)
+        else:
+            LOG.info("After-hours batch placement skipped (host method place_end_of_day_signals not implemented).")
+
+    def _enforce_recent_closes(self, days: int = 7) -> None:
+        """
+        Ensure any CLOSE signals from the last `days` are enforced (no lingering exposure).
+        Host may implement enforce_recent_closures(days=...), otherwise we no-op.
+        """
+        if hasattr(self, "enforce_recent_closures"):
+            LOG.info("Enforcing recent CLOSE signals (last %d days)...", days)
+            try:
+                self.enforce_recent_closures(days=days)
+                LOG.info("Recent CLOSE enforcement completed.")
+            except Exception as e:
+                LOG.exception("Recent CLOSE enforcement failed: %s", e)
+        else:
+            LOG.info("Recent CLOSE enforcement skipped (host method enforce_recent_closures not implemented).")
+
     # ---------- Orchestration ----------
     def daily_trading_cycle(self) -> None:
         """Execute daily trading cycle with guards and logging."""
         now = self._now_ny()
 
-        # Cycle 0: After market close analysis
+        # Cycle A: Pre-close sweep (convert lingering CLOSE limits to market)
+        if self.is_pre_close_window(now):
+            LOG.info("Pre-close window detected (%s); running market-conversion sweep.", now)
+            self._pre_close_market_conversion()
+            return
+
+        # Cycle B: After market close analysis
         if self.is_after_market_close(now):
             if not self._can_run_daily_analysis():
                 LOG.info("Daily analysis recently executed; skipping to respect cooldown.")
-                return
+                # Still allow after-hours placement window later
+            else:
+                LOG.info("Starting daily analysis cycle...")
+                try:
+                    # Optional hook
+                    if hasattr(self, "pre_daily_analysis"):
+                        self.pre_daily_analysis()
 
-            LOG.info("Starting daily analysis cycle...")
-            try:
-                # Optional hook
-                if hasattr(self, "pre_daily_analysis"):
-                    self.pre_daily_analysis()
+                    # 1. Scan for new candidates
+                    sectors = ['TECH', 'FINANCE', 'HEALTHCARE', 'ENERGY', 'CONSUMER']
+                    self.scan_sector_candidates(sectors)
 
-                # 1. Scan for new candidates
-                sectors = ['TECH', 'FINANCE', 'HEALTHCARE', 'ENERGY', 'CONSUMER']
-                self.scan_sector_candidates(sectors)
+                    # 2. Filter by liquidity and IV
+                    filtered_candidates = self.filter_candidates_by_criteria()
+                    LOG.info("Filtered candidates: %s", len(filtered_candidates) if filtered_candidates else 0)
 
-                # 2. Filter by liquidity and IV
-                filtered_candidates = self.filter_candidates_by_criteria()
-                LOG.info("Filtered candidates: %s", len(filtered_candidates) if filtered_candidates else 0)
+                    # 3. Collect and organize historical data
+                    self.update_historical_data(filtered_candidates)
+                    sector_data = self.organize_sector_data()
 
-                # 3. Collect and organize historical data
-                self.update_historical_data(filtered_candidates)
-                sector_data = self.organize_sector_data()
+                    # 4. Optimize strategies per sector
+                    optimized_params = self.optimize_sector_strategy(sector_data)
+                    _ = optimized_params  # keep for future use/logging
 
-                # 4. Optimize strategies per sector
-                optimized_params = self.optimize_sector_strategy(sector_data)
-                _ = optimized_params  # keep for future use/logging
+                    # 5. Select top 5 performers per sector
+                    top_candidates = self.select_top_performers(sector_data, 5)
 
-                # 5. Select top 5 performers per sector
-                top_candidates = self.select_top_performers(sector_data, 5)
+                    # 6. Generate signals
+                    signals = self.generate_trade_signals(top_candidates)
 
-                # 6. Generate signals
-                signals = self.generate_trade_signals(top_candidates)
+                    # 7. Prepare orders for next day
+                    self.prepare_next_day_orders(signals)
 
-                # 7. Prepare orders for next day
-                self.prepare_next_day_orders(signals)
+                    # Optional hook
+                    if hasattr(self, "post_daily_analysis"):
+                        self.post_daily_analysis(signals=signals, top_candidates=top_candidates)
 
-                # Optional hook
-                if hasattr(self, "post_daily_analysis"):
-                    self.post_daily_analysis(signals=signals, top_candidates=top_candidates)
+                    self._mark_daily_analysis()
+                    LOG.info("Daily analysis cycle completed.")
+                except Exception as e:
+                    LOG.exception("Daily analysis cycle failed: %s", e)
+                    # Decide: alert, retry, or mark degraded state
+                    return
 
-                self._mark_daily_analysis()
-                LOG.info("Daily analysis cycle completed.")
-            except Exception as e:
-                LOG.exception("Daily analysis cycle failed: %s", e)
-                # Decide: alert, retry, or mark degraded state
-                return
+            # Optional: After-hours batch placement + recent closes enforcement
+            if self.is_after_hours_placement(now):
+                LOG.info("After-hours placement window (%s).", now)
+                self._enforce_recent_closes(days=7)
+                self._after_hours_batch_placement()
+            else:
+                LOG.info("Not yet in after-hours placement window at %s; skipping placement.", now)
+            return
 
-        # Cycle 1: Market open execution
-        elif self.is_market_open(now):
+        # Cycle C: Market open execution
+        if self.is_market_open(now):
             LOG.info("Market open cycle starting...")
             try:
                 if hasattr(self, "pre_market_open"):
