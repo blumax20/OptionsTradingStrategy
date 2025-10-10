@@ -469,14 +469,23 @@ def get_option_data(symbol: str, width: int = 5):
             current_price = float(ticker_stock.close)
 
     if current_price is None:
-        # fallback to 1-day historical bar close
+        # fallback to 1-day historical bar close (after-hours friendly)
         try:
             bars = ib.reqHistoricalData(
                 stock, endDateTime='', durationStr='1 D', barSizeSetting='1 day',
-                whatToShow='TRADES', useRTH=True, formatDate=1
+                whatToShow='TRADES', useRTH=False, formatDate=1
             )
+            if (not bars) or (hasattr(bars[-1], "close") and str(bars[-1].close) == "nan"):
+                # second try with BID_ASK in case TRADES is unavailable
+                bars = ib.reqHistoricalData(
+                    stock, endDateTime='', durationStr='1 D', barSizeSetting='1 day',
+                    whatToShow='BID_ASK', useRTH=False, formatDate=1
+                )
             if bars:
-                current_price = float(bars[-1].close)
+                try:
+                    current_price = float(bars[-1].close)
+                except Exception:
+                    current_price = None
         except Exception as exc:
             logger.warning(f"Historical data fallback failed: {exc}")
 
@@ -727,7 +736,11 @@ def signal_text():
     sig = _parse_signal_fields(raw_text)
     result = get_option_data(symbol)
     if not result or result.get("_error"):
-        return _fail(result.get("stage","unknown"), result.get("detail","unable to retrieve option data"), 502)
+        return jsonify({
+            "_error": True,
+            "stage": (result or {}).get("stage","unknown"),
+            "detail": (result or {}).get("detail","unable to retrieve option data")
+        }), 200
     _append_listener_result_to_csv(result, sig)
     if sig:
         result.update({
@@ -749,7 +762,11 @@ def signal_generic():
     sig = _parse_signal_fields(raw_text)
     result = get_option_data(symbol)
     if not result or result.get("_error"):
-        return _fail(result.get("stage","unknown"), result.get("detail","unable to retrieve option data"), 502)
+        return jsonify({
+            "_error": True,
+            "stage": (result or {}).get("stage","unknown"),
+            "detail": (result or {}).get("detail","unable to retrieve option data")
+        }), 200
     _append_listener_result_to_csv(result, sig)
     if sig:
         result.update({
@@ -772,10 +789,14 @@ def webhook():
     sig = _parse_signal_fields(msg)
     result = get_option_data(symbol)
     if not result or result.get("_error"):
-        # bubble up stage & detail if available
+        # bubble up stage & detail if available, but do not fail the HTTP call
         msg = (result or {}).get("detail", "unable to retrieve option data")
         stage = (result or {}).get("stage", "unknown")
-        return _fail(stage, msg, 502)
+        return jsonify({
+            "_error": True,
+            "stage": stage,
+            "detail": msg
+        }), 200
     _append_listener_result_to_csv(result, sig)
     if sig:
         result.update({
