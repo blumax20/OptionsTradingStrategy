@@ -274,7 +274,7 @@ def _parse_signal_fields(message: str | None) -> Dict[str, object]:
     if m_side:
         result["signal_side"] = m_side.group(1)
     # position number, tolerating spaces like "- 1"
-    m_pos = re.search(r'new\s+strategy\s+position\s+is\s*([+-]?)\s*(\d+)', low)
+    m_pos = re.search(r'(?:^|[\.!\s])\s*new\s+strategy\s+position\s+is\s*([+-]?)\s*(\d+)', low)
     if m_pos:
         sign = -1 if m_pos.group(1) == '-' else 1
         num = int(m_pos.group(2))
@@ -301,6 +301,31 @@ def _dated_dir() -> Path:
 
 def _combined_csv() -> Path:
     return _dated_dir() / "combined_listener_spreads.csv"
+
+def _webhook_jsonl() -> Path:
+    """
+    Returns the dated JSON Lines file under the same OUTPUT_BASE date folder, e.g.
+    C:\\OptionsHistory\\YY_MM_DD\\webhooks.jsonl
+    """
+    return _dated_dir() / "webhooks.jsonl"
+
+def _append_webhook_event(payload: dict, route: str) -> None:
+    """
+    Persist the raw inbound webhook payload (plus route & timestamp) as JSONL.
+    Never throws; logs on failure.
+    """
+    try:
+        from json import dumps as _dumps
+        try:
+            ts = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        rec = {"ts": ts, "route": route, "payload": payload}
+        out = _webhook_jsonl()
+        with out.open("a", encoding="utf-8") as f:
+            f.write(_dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"[WEBHOOK_JSONL] failed to append: {e}")
 
 def _append_csv_row(row: dict):
     """
@@ -709,6 +734,12 @@ def _extract_ticker_from_text(text: str | None) -> str | None:
     if not text or not isinstance(text, str):
         return None
     s = text.strip().upper()
+        # fast-path: "... filled on TICKER. New strategy position is -1"
+    m_on = re.search(r"\bFILLED\s+ON\s+([A-Z]{1,5})(?:\.[A-Z])?\b", s)
+    if m_on:
+        tick = _clean_symbol(m_on.group(1))
+        if tick:
+            return tick
     # common patterns: "on PAYX", "ticker PAYX", "symbol PAYX"
     for pat in (r"\bon\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
                 r"\bticker\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
@@ -728,6 +759,7 @@ def _extract_ticker_from_text(text: str | None) -> str | None:
 @app.route('/signal/text', methods=['POST'])
 def signal_text():
     data = request.get_json(silent=True) or {}
+    _append_webhook_event(data, route="/signal/text")
     raw_text = data.get('text') or data.get('message') or data.get('alert')
     # allow explicit ticker override via ticker/symbol
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
@@ -755,6 +787,7 @@ def signal_text():
 def signal_generic():
     """A flexible alias that accepts either {"ticker": "PAYX", ...} or {"text": "... PAYX ..."}."""
     data = request.get_json(silent=True) or {}
+    _append_webhook_event(data, route="/signal")
     raw_text = data.get('text') or data.get('message') or data.get('alert') or data.get('alert_message')
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
     if not symbol:
@@ -781,6 +814,7 @@ def signal_generic():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(silent=True) or {}
+    _append_webhook_event(data, route="/webhook")
     # Accept both ticker and symbol, or extract from free‑form message/text
     msg = data.get('message') or data.get('alert_message') or data.get('alert') or data.get('text')
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(msg))
@@ -809,21 +843,41 @@ def webhook():
 
 @app.route('/webhook_batch', methods=['POST'])
 def webhook_batch():
-    data = request.get_json(silent=True) or {}
-    symbols = data.get('tickers') or data.get('symbols')
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    try:
+        _append_webhook_event(data if isinstance(data, (dict, list)) else {"raw": str(data)}, route="/webhook_batch")
+    except Exception:
+        pass
+
+    symbols = None
+    if isinstance(data, dict):
+        symbols = data.get('tickers') or data.get('symbols')
+        if symbols is None:
+            for alt in ('data', 'payload', 'items'):
+                v = data.get(alt)
+                if isinstance(v, list):
+                    symbols = v
+                    break
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(',') if s.strip()]
+    if symbols is None and isinstance(data, list):
+        symbols = data
+
     if not symbols or not isinstance(symbols, list):
-        return _fail("payload", "tickers (list) missing from payload", 400)
+        return _fail("payload", "Expected a list of tickers. Accepted shapes: {\"tickers\":[...]}, {\"symbols\":[...]}, {\"data\":[...]}, top-level JSON array, or comma-separated string.", 400)
     results = []
     for item in symbols:
-        # item can be 'SYM' or {'ticker':'SYM','message':'...'}
+        tick = None
+        msg  = None
         if isinstance(item, str):
             tick = _clean_symbol(item)
-            msg = None
         elif isinstance(item, dict):
-            tick = _clean_symbol(str(item.get('ticker') or item.get('symbol') or ''))
-            msg = item.get('message') or item.get('alert_message') or item.get('alert') or item.get('text')
-        else:
-            continue
+            msg = item.get("message") or item.get("alert_message") or item.get("alert") or item.get("text")
+            tick = _clean_symbol(str(item.get("ticker") or item.get("symbol") or "")) or _extract_ticker_from_text(msg)
+        elif item is not None:
+            tick = _clean_symbol(str(item))
         if not tick:
             continue
         sig = _parse_signal_fields(msg)
