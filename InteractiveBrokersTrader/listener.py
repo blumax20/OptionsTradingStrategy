@@ -1128,14 +1128,12 @@ if __name__ == '__main__':
     try:
         if not IB_SHARED.isConnected():
             IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
-        # Use LIVE by default (user has streaming bundles)
-        IB_SHARED.reqMarketDataType(1)
+        try:
+            IB_SHARED.reqMarketDataType(1)
+        except Exception:
+            pass
     except Exception as exc:
         logger.exception(f"Initial IB connect failed: {exc}")
     logger.info(f"Listener version: {VERSION}")
-    if _USE_WAITRESS:
-        logger.info(f"Starting listener on 0.0.0.0:{port} with waitress")
-        _serve(app, host='0.0.0.0', port=port)
-    else:
-        logger.info(f"Starting listener on 0.0.0.0:{port} with Flask (threaded=False, reloader=False)")
-        app.run(host='0.0.0.0', port=port, threaded=False, use_reloader=False)
+    logger.info(f"Starting listener on 0.0.0.0:{port} (threaded=False)")
+    app.run(host='0.0.0.0', port=port, threaded=False, use_reloader=False)
