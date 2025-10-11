@@ -32,6 +32,14 @@ def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
         return True
     except Exception:
         return False
+    
+# --- refuse to run under system Python (enforce venv/service) ---
+try:
+    if r"\Program Files\Python312\python.exe".lower() in sys.executable.lower():
+        print("listener: system-python detected; exiting (use IB_Listener service / venv).", flush=True)
+        sys.exit(0)
+except Exception:
+    pass
 # --- prefer venv instance over system-Python when port is already serving ---
 try:
     _is_system_py = r"\Program Files\Python312\python.exe".lower() in sys.executable.lower()
@@ -1118,4 +1126,4 @@ if __name__ == '__main__':
         logger.exception(f"Initial IB connect failed: {exc}")
     logger.info(f"Listener version: {VERSION}")
     logger.info(f"Starting listener on 0.0.0.0:{port} (threaded=False)")
-    app.run(host='0.0.0.0', port=port, threaded=False)
+    app.run(host='0.0.0.0', port=port, threaded=False, use_reloader=False)
