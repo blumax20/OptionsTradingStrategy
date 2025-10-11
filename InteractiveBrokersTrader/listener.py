@@ -32,6 +32,14 @@ def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
         return True
     except Exception:
         return False
+# --- prefer venv instance over system-Python when port is already serving ---
+try:
+    _is_system_py = r"\Program Files\Python312\python.exe".lower() in sys.executable.lower()
+    if _is_system_py and _port_is_open():
+        print("listener: system-python duplicate detected; exiting.", flush=True)
+        sys.exit(0)
+except Exception:
+    pass
 
 # If the lock exists and port is already serving, exit duplicate
 try:
