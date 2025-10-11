@@ -15,6 +15,44 @@ from pathlib import Path
 # Ensure os is imported before _preferred_md_type
 import os
 import sys
+# --- single-instance guard (Windows-safe) ---
+import socket, atexit
+from pathlib import Path as _Path
+
+_LOCK_DIR  = _Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "OptionsTradingStrategy"
+_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+_LOCK_FILE = _LOCK_DIR / "listener.lock"
+
+def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
+    try:
+        _s = socket.socket()
+        _s.settimeout(_timeout)
+        _s.connect((_host, _port))
+        _s.close()
+        return True
+    except Exception:
+        return False
+
+# If the lock exists and port is already serving, exit duplicate
+try:
+    if _LOCK_FILE.exists() and _port_is_open():
+        print("listener: already running; exiting duplicate.", flush=True)
+        sys.exit(0)
+    with open(_LOCK_FILE, "w", encoding="ascii") as _f:
+        _f.write(str(os.getpid()))
+except Exception:
+    pass
+
+@atexit.register
+def _cleanup_lock():
+    try:
+        if _LOCK_FILE.exists():
+            with open(_LOCK_FILE, "r", encoding="ascii") as _f:
+                _pid = _f.read().strip()
+            if _pid == str(os.getpid()):
+                _LOCK_FILE.unlink()
+    except Exception:
+        pass
 # --- MD type selection (env override) and strike fallbacks ---
 def _preferred_md_type() -> int:
     """Read preferred market data type from env (MARKET_DATA_TYPE), default to 1 (live)."""
@@ -734,7 +772,7 @@ def _extract_ticker_from_text(text: str | None) -> str | None:
     if not text or not isinstance(text, str):
         return None
     s = text.strip().upper()
-        # fast-path: "... filled on TICKER. New strategy position is -1"
+    # fast-path: "... filled on TICKER. New strategy position is -1"
     m_on = re.search(r"\bFILLED\s+ON\s+([A-Z]{1,5})(?:\.[A-Z])?\b", s)
     if m_on:
         tick = _clean_symbol(m_on.group(1))
