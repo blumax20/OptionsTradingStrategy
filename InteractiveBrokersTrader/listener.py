@@ -201,6 +201,13 @@ from typing import Dict
 import re
 import platform
 import time
+# Optional production WSGI server on Windows (safer under services)
+try:
+    from waitress import serve as _serve
+    _USE_WAITRESS = True
+except Exception:
+    _serve = None
+    _USE_WAITRESS = False
 
 # --- IB connection helper (robust connect + market data type) ---
 _IB_CLIENT_BASE_ID = 42
@@ -1126,5 +1133,9 @@ if __name__ == '__main__':
     except Exception as exc:
         logger.exception(f"Initial IB connect failed: {exc}")
     logger.info(f"Listener version: {VERSION}")
-    logger.info(f"Starting listener on 0.0.0.0:{port} (threaded=False)")
-    app.run(host='0.0.0.0', port=port, threaded=False, use_reloader=False)
+    if _USE_WAITRESS:
+        logger.info(f"Starting listener on 0.0.0.0:{port} with waitress")
+        _serve(app, host='0.0.0.0', port=port)
+    else:
+        logger.info(f"Starting listener on 0.0.0.0:{port} with Flask (threaded=False, reloader=False)")
+        app.run(host='0.0.0.0', port=port, threaded=False, use_reloader=False)
