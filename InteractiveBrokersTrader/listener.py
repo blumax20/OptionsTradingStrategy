@@ -40,14 +40,7 @@ def _is_running_in_venv() -> bool:
         return False
 
 if not _is_running_in_venv():
-    # If the listener somehow got launched with system Python, exit before binding or doing anything else.
     print(f"listener: non-venv interpreter ({sys.executable}); exiting.", flush=True)
-    try:
-        # If a different copy is already serving, prefer it
-        if _port_is_open():
-            print("listener: port is already open; duplicate exiting.", flush=True)
-    except Exception:
-        pass
     sys.exit(0)
 
 # --- prefer venv instance over system-Python when port is already serving ---
