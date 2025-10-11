@@ -15,6 +15,21 @@ from pathlib import Path
 # Ensure os is imported before _preferred_md_type
 import os
 import sys
+# --- HARD EXIT if not launched from the venv interpreter (Windows safety) ---
+# This runs before any server binding so a stray system Python can’t grab :5001.
+try:
+    _exe = sys.executable.lower()
+    _venv_frag = r"\optionsTradingStrategy\.venv\scripts".lower()
+    _system_exe = r"c:\program files\python312\python.exe".lower()
+    in_venv = (_venv_frag in _exe) or (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix)
+    if (not in_venv) or (_exe == _system_exe):
+        print(f"listener: refusing non-venv interpreter ({sys.executable}); exiting.", flush=True)
+        import os as _os
+        _os._exit(0)  # hard exit: skip atexit and any server startup
+except Exception:
+    # If any check fails, be conservative and exit
+    import os as _os
+    _os._exit(0)
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
 from pathlib import Path as _Path
