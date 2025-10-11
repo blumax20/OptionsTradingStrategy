@@ -183,6 +183,7 @@ from typing import Dict
 import re
 import platform
 from pathlib import Path
+import time
 
 # --- IB connection helper (robust connect + market data type) ---
 _IB_CLIENT_BASE_ID = 42
@@ -1060,32 +1061,40 @@ def health():
         "python": sys.version.split()[0],
     }
     try:
-        # Make a best-effort connection to gather positions
-        _ensure_ib_connected(IB_SHARED, mkt_type=_preferred_md_type())
-        # small sleep to let account data stream in
-        try:
-            IB_SHARED.sleep(0.1)
-        except Exception:
-            pass
-        ps = list(IB_SHARED.positions())
-        payload["positions_count"] = len(ps)
-        # sample up to first 25 positions with compact fields
-        sample = []
-        for p in ps[:25]:
-            c = p.contract
-            sample.append({
-                "symbol": getattr(c, "symbol", ""),
-                "secType": getattr(c, "secType", ""),
-                "exp": getattr(c, "lastTradeDateOrContractMonth", ""),
-                "right": getattr(c, "right", ""),
-                "strike": getattr(c, "strike", ""),
-                "qty": p.position,
-                "avgCost": p.avgCost,
-            })
-        if sample:
-            payload["positions_sample"] = sample
+        # Fast, non-blocking positions snapshot: do not attempt connect here to avoid hangs
+        if IB_SHARED.isConnected():
+            try:
+                IB_SHARED.reqMarketDataType(_preferred_md_type())
+            except Exception:
+                pass
+            try:
+                IB_SHARED.sleep(0.1)
+            except Exception:
+                pass
+            try:
+                ps = list(IB_SHARED.positions())
+            except Exception as _pos_exc:
+                payload["positions_error"] = f"positions: {_pos_exc!r}"
+                ps = []
+            payload["positions_count"] = len(ps)
+            if ps:
+                sample = []
+                for p in ps[:25]:
+                    c = p.contract
+                    sample.append({
+                        "symbol": getattr(c, "symbol", ""),
+                        "secType": getattr(c, "secType", ""),
+                        "exp": getattr(c, "lastTradeDateOrContractMonth", ""),
+                        "right": getattr(c, "right", ""),
+                        "strike": getattr(c, "strike", ""),
+                        "qty": p.position,
+                        "avgCost": p.avgCost,
+                    })
+                payload["positions_sample"] = sample
+        else:
+            payload["positions_error"] = "not connected"
     except Exception as exc:
-        # Do not fail health on positions error
+        # Do not fail health on any error
         payload["positions_error"] = repr(exc)
     return jsonify(payload)
 
