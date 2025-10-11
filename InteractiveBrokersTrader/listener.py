@@ -17,12 +17,8 @@ import os
 import sys
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
-from pathlib import Path as _Path
 
-_LOCK_DIR  = _Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "OptionsTradingStrategy"
-_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-_LOCK_FILE = _LOCK_DIR / "listener.lock"
-
+# --- refuse to run under system Python (enforce venv/service) ---
 def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
     try:
         _s = socket.socket()
@@ -32,7 +28,7 @@ def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
         return True
     except Exception:
         return False
-    
+
 # --- refuse to run under system Python (enforce venv/service) ---
 try:
     if r"\Program Files\Python312\python.exe".lower() in sys.executable.lower():
@@ -40,6 +36,7 @@ try:
         sys.exit(0)
 except Exception:
     pass
+
 # --- prefer venv instance over system-Python when port is already serving ---
 try:
     _is_system_py = r"\Program Files\Python312\python.exe".lower() in sys.executable.lower()
@@ -48,6 +45,11 @@ try:
         sys.exit(0)
 except Exception:
     pass
+
+# --- single-instance lock (after system-python checks) ---
+_LOCK_DIR  = _Path(os.getenv("PROGRAMDATA", r"C:\ProgramData")) / "OptionsTradingStrategy"
+_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+_LOCK_FILE = _LOCK_DIR / "listener.lock"
 
 # If the lock exists and port is already serving, exit duplicate
 try:
