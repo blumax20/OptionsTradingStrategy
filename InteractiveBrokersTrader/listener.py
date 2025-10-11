@@ -17,8 +17,8 @@ import os
 import sys
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
-
-# --- refuse to run under system Python (enforce venv/service) ---
+from pathlib import Path as _Path
+# --- helper to test if port is already open ---
 def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
     try:
         _s = socket.socket()
@@ -200,7 +200,6 @@ import math
 from typing import Dict
 import re
 import platform
-from pathlib import Path
 import time
 
 # --- IB connection helper (robust connect + market data type) ---
