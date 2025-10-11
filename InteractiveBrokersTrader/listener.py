@@ -15,6 +15,23 @@ from pathlib import Path
 # Ensure os is imported before _preferred_md_type
 import os
 import sys
+# --- Force this process (and any re-exec) to remain in the venv on Windows ---
+try:
+    import os as _os, sys as _sys
+    # Hard stop if we're not the venv interpreter
+    _venv_root = r"C:\Users\Administrator\code\OptionsTradingStrategy\.venv\Scripts".lower()
+    if not _sys.executable.lower().startswith(_venv_root):
+        print(f"listener: refusing non-venv interpreter ({_sys.executable}); exiting.", flush=True)
+        _os._exit(0)  # immediate exit (no atexit), so system python can't bind :5001
+
+    # Make any internal re-exec use the venv interpreter, not the base install
+    _os.environ["PYTHONEXECUTABLE"] = _sys.executable
+    if hasattr(_sys, "_base_executable"):
+        _sys._base_executable = _sys.executable
+except Exception:
+    # If anything goes wrong, be conservative and exit
+    import os as __os
+    __os._exit(0)
 # --- HARD EXIT if not launched from the venv interpreter (Windows safety) ---
 # This runs before any server binding so a stray system Python can’t grab :5001.
 try:
