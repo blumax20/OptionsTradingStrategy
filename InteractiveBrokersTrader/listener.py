@@ -29,13 +29,26 @@ def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
     except Exception:
         return False
 
-# --- refuse to run under system Python (enforce venv/service) ---
-try:
-    if r"\Program Files\Python312\python.exe".lower() in sys.executable.lower():
-        print("listener: system-python detected; exiting (use IB_Listener service / venv).", flush=True)
-        sys.exit(0)
-except Exception:
-    pass
+# --- refuse to run outside the venv (enforce venv/service) ---
+def _is_running_in_venv() -> bool:
+    try:
+        # venv if sys.prefix != sys.base_prefix OR the venv Scripts path is in sys.executable
+        in_venv = (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix)
+        in_venv = in_venv or (r"\OptionsTradingStrategy\.venv\Scripts" in sys.executable)
+        return bool(in_venv)
+    except Exception:
+        return False
+
+if not _is_running_in_venv():
+    # If the listener somehow got launched with system Python, exit before binding or doing anything else.
+    print(f"listener: non-venv interpreter ({sys.executable}); exiting.", flush=True)
+    try:
+        # If a different copy is already serving, prefer it
+        if _port_is_open():
+            print("listener: port is already open; duplicate exiting.", flush=True)
+    except Exception:
+        pass
+    sys.exit(0)
 
 # --- prefer venv instance over system-Python when port is already serving ---
 try:
