@@ -113,9 +113,9 @@ def _cleanup_lock():
 def _preferred_md_type() -> int:
     """Read preferred market data type from env (MARKET_DATA_TYPE), default to 1 (live)."""
     try:
-        return int(os.getenv("MARKET_DATA_TYPE", "1"))
+        return int(os.getenv("MARKET_DATA_TYPE", "4"))
     except Exception:
-        return 1
+        return 4
 
 def _nearest_valid_strike(strikes_all: list[float], target: float, prefer: str = "above") -> float | None:
     """Pick nearest available strike to target. prefer 'above' or 'below' when tie/choice."""
@@ -409,7 +409,34 @@ def _webhook_jsonl() -> Path:
     C:\\OptionsHistory\\YY_MM_DD\\webhooks.jsonl
     """
     return _dated_dir() / "webhooks.jsonl"
+def _webhook_results_jsonl() -> Path:
+    return _dated_dir() / "webhook_results.jsonl"
 
+def _append_webhook_result(rec: dict) -> None:
+    try:
+        from json import dumps as _dumps
+        out = _webhook_results_jsonl()
+        with out.open("a", encoding="utf-8") as f:
+            f.write(_dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _log_reject(symbol: str, err: str) -> None:
+    try:
+        import csv as _csv
+        p = _dated_dir() / "rejected_webhooks.csv"
+        write_header = not p.exists()
+        with p.open("a", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            if write_header:
+                w.writerow(["timestamp_ny", "symbol", "error"])
+            try:
+                ts = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            w.writerow([ts, symbol, err])
+    except Exception:
+        pass
 def _append_webhook_event(payload: dict, route: str) -> None:
     """
     Persist the raw inbound webhook payload (plus route & timestamp) as JSONL.
@@ -582,7 +609,7 @@ def get_option_data(symbol: str, width: int = 5):
     stock = Stock(symbol, 'SMART', 'USD')
     try:
         ticker_stock = ib.reqMktData(stock, '', False, False)
-        ib.sleep(1.0)
+        ib.sleep(1.8)
     except Exception as exc:
         logger.warning(f"reqMktData stock failed: {exc}")
         ticker_stock = None
@@ -699,7 +726,7 @@ def get_option_data(symbol: str, width: int = 5):
         stage = "option_mktdata"
         try:
             t = ib.reqMktData(option, '101,106', False, False)
-            ib.sleep(1.0)
+            ib.sleep(1.5)
         except Exception as exc:
             # If market data not subscribed (354), continue with no quotes; we will still compute theo later
             logger.warning(f"[option_mktdata] reqMktData failed for {symbol} {strike}C {expiry_str}: {exc}")
@@ -727,7 +754,7 @@ def get_option_data(symbol: str, width: int = 5):
         stage = "option_put_mktdata"
         try:
             t = ib.reqMktData(option, '101,106', False, False)
-            ib.sleep(1.0)
+            ib.sleep(1.5)
         except Exception as exc:
             logger.warning(f"[option_put_mktdata] reqMktData failed for {symbol} {strike}P {expiry_str}: {exc}")
             t = None
