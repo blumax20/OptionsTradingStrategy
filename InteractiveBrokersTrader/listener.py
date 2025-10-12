@@ -1028,30 +1028,26 @@ def mdtest():
     sym = _clean_symbol(request.args.get('symbol', 'AAPL'))
     mdtype = request.args.get('mdtype', '1')  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
     try:
-        # Ensure IB is connected; prefer helper if present
-        try:
-            _ensure_ib_connected(IB_SHARED, mkt_type=int(mdtype))
-        except NameError:
-            if not IB_SHARED.isConnected():
-                IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
-            try:
-                IB_SHARED.reqMarketDataType(int(mdtype))
-            except Exception:
-                pass
-        # Explicitly set market data type to requested mode
+        # Ensure connected and set market data type
+        _ensure_ib_connected(IB_SHARED, mkt_type=int(mdtype))
         try:
             IB_SHARED.reqMarketDataType(int(mdtype))
         except Exception:
             pass
 
-        # Request a fresh quote and patiently poll for fields
-        timeout_ms = int(request.args.get('timeout_ms', '5000'))  # default ~5s
+        timeout_ms = int(request.args.get('timeout_ms', '5000'))
         poll_ms = 200
         waited = 0
+
+        # fresh quote
         t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
 
+        # initialize fields
+        bid = ask = last = close = None
+        delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
+
+        # poll until we get something or time out
         while waited <= timeout_ms:
-            # collect ticks so far
             bid   = getattr(t, 'bid',   bid)
             ask   = getattr(t, 'ask',   ask)
             last  = getattr(t, 'last',  last)
@@ -1059,26 +1055,13 @@ def mdtest():
             if (bid is not None and ask is not None) or (last is not None or close is not None):
                 break
 
-            # try cooperative ib_insync sleep; if it doesn’t block here, do a hard sleep
+            # cooperative sleep, then hard sleep to guarantee time passes
             try:
                 IB_SHARED.sleep(poll_ms/1000.0)
             except Exception:
                 pass
-            # Always enforce a real pause so waited_ms increases
             time.sleep(poll_ms/1000.0)
 
-            waited += poll_ms
-            delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', delayed)
-        while waited <= timeout_ms:
-            # collect what we have so far
-            bid   = getattr(t, 'bid',   bid)
-            ask   = getattr(t, 'ask',   ask)
-            last  = getattr(t, 'last',  last)
-            close = getattr(t, 'close', close)
-            # if we have at least bid/ask or last/close, we can stop early
-            if (bid is not None and ask is not None) or (last is not None or close is not None):
-                break
-            IB_SHARED.sleep(poll_ms/1000.0)
             waited += poll_ms
             delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', delayed)
 
@@ -1102,27 +1085,8 @@ def mdtest():
             "last": last,
             "close": close
         }
-        # If nothing came in and user did not already request 4, auto retry once with mdtype=4
-        if all(v is None for v in (bid, ask, last, close)) and int(mdtype) != 4:
-            try:
-                IB_SHARED.reqMarketDataType(4)
-            except Exception:
-                pass
-            # quick retry with shorter budget
-            waited = 0
-            for _ in range(5):
-                IB_SHARED.sleep(0.2)
-                bid   = getattr(t, 'bid',   bid)
-                ask   = getattr(t, 'ask',   ask)
-                last  = getattr(t, 'last',  last)
-                close = getattr(t, 'close', close)
-                if (bid is not None and ask is not None) or (last is not None or close is not None):
-                    break
-                waited += 200
-            out.update({"mdtype": 4, "waited_ms": out.get("waited_ms", 0) + waited, "bid": bid, "ask": ask, "last": last, "close": close})
-        # If nothing came in, say so explicitly
         if all(v is None for v in (bid, ask, last, close)):
-            out["note"] = "No ticks received within timeout; try mdtype=4 (delayed-frozen) or verify live/delayed permissions in TWS/Gateway."
+            out["note"] = "No ticks within timeout; mdtype=4 uses delayed/frozen. Verify delayed permissions in IB Gateway."
         return jsonify(out)
     except Exception as e:
         import traceback
