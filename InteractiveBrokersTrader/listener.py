@@ -1045,12 +1045,30 @@ def mdtest():
             pass
 
         # Request a fresh quote and patiently poll for fields
-        timeout_ms = int(request.args.get('timeout_ms', '2500'))  # default ~2.5s
+        timeout_ms = int(request.args.get('timeout_ms', '5000'))  # default ~5s
         poll_ms = 200
         waited = 0
         t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
-        bid = ask = last = close = None
-        delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
+
+        while waited <= timeout_ms:
+            # collect ticks so far
+            bid   = getattr(t, 'bid',   bid)
+            ask   = getattr(t, 'ask',   ask)
+            last  = getattr(t, 'last',  last)
+            close = getattr(t, 'close', close)
+            if (bid is not None and ask is not None) or (last is not None or close is not None):
+                break
+
+            # try cooperative ib_insync sleep; if it doesn’t block here, do a hard sleep
+            try:
+                IB_SHARED.sleep(poll_ms/1000.0)
+            except Exception:
+                pass
+            # Always enforce a real pause so waited_ms increases
+            time.sleep(poll_ms/1000.0)
+
+            waited += poll_ms
+            delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', delayed)
         while waited <= timeout_ms:
             # collect what we have so far
             bid   = getattr(t, 'bid',   bid)
@@ -1194,7 +1212,7 @@ if __name__ == '__main__':
         if not IB_SHARED.isConnected():
             IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
         try:
-            IB_SHARED.reqMarketDataType(1)
+            IB_SHARED.reqMarketDataType(_preferred_md_type())
         except Exception:
             pass
     except Exception as exc:
