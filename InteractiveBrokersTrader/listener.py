@@ -16,37 +16,40 @@ from pathlib import Path
 import os
 import sys
 # --- Force this process (and any re-exec) to remain in the venv on Windows ---
-try:
-    import os as _os, sys as _sys
-    # Hard stop if we're not the venv interpreter
-    _venv_root = r"C:\Users\Administrator\code\OptionsTradingStrategy\.venv\Scripts".lower()
-    if not _sys.executable.lower().startswith(_venv_root):
-        print(f"listener: refusing non-venv interpreter ({_sys.executable}); exiting.", flush=True)
-        _os._exit(0)  # immediate exit (no atexit), so system python can't bind :5001
+import platform
+if platform.system() == "Windows":
+    try:
+        import os as _os, sys as _sys
+        # Hard stop if we're not the venv interpreter
+        _venv_root = r"C:\Users\Administrator\code\OptionsTradingStrategy\.venv\Scripts".lower()
+        if not _sys.executable.lower().startswith(_venv_root):
+            print(f"listener: refusing non-venv interpreter ({_sys.executable}); exiting.", flush=True)
+            _os._exit(0)  # immediate exit (no atexit), so system python can't bind :5001
 
-    # Make any internal re-exec use the venv interpreter, not the base install
-    _os.environ["PYTHONEXECUTABLE"] = _sys.executable
-    if hasattr(_sys, "_base_executable"):
-        _sys._base_executable = _sys.executable
-except Exception:
-    # If anything goes wrong, be conservative and exit
-    import os as __os
-    __os._exit(0)
+        # Make any internal re-exec use the venv interpreter, not the base install
+        _os.environ["PYTHONEXECUTABLE"] = _sys.executable
+        if hasattr(_sys, "_base_executable"):
+            _sys._base_executable = _sys.executable
+    except Exception:
+        # If anything goes wrong, be conservative and exit
+        import os as __os
+        __os._exit(0)
 # --- HARD EXIT if not launched from the venv interpreter (Windows safety) ---
 # This runs before any server binding so a stray system Python can’t grab :5001.
-try:
-    _exe = sys.executable.lower()
-    _venv_frag = r"\optionsTradingStrategy\.venv\scripts".lower()
-    _system_exe = r"c:\program files\python312\python.exe".lower()
-    in_venv = (_venv_frag in _exe) or (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix)
-    if (not in_venv) or (_exe == _system_exe):
-        print(f"listener: refusing non-venv interpreter ({sys.executable}); exiting.", flush=True)
+if platform.system() == "Windows":
+    try:
+        _exe = sys.executable.lower()
+        _venv_frag = r"\optionsTradingStrategy\.venv\scripts".lower()
+        _system_exe = r"c:\program files\python312\python.exe".lower()
+        in_venv = (_venv_frag in _exe) or (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix)
+        if (not in_venv) or (_exe == _system_exe):
+            print(f"listener: refusing non-venv interpreter ({sys.executable}); exiting.", flush=True)
+            import os as _os
+            _os._exit(0)  # hard exit: skip atexit and any server startup
+    except Exception:
+        # If any check fails, be conservative and exit
         import os as _os
-        _os._exit(0)  # hard exit: skip atexit and any server startup
-except Exception:
-    # If any check fails, be conservative and exit
-    import os as _os
-    _os._exit(0)
+        _os._exit(0)
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
 from pathlib import Path as _Path
@@ -63,11 +66,15 @@ def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
 
 # --- refuse to run outside the venv (enforce venv/service) ---
 def _is_running_in_venv() -> bool:
+    """Return True if running inside a Python virtual environment on any OS."""
     try:
-        # venv if sys.prefix != sys.base_prefix OR the venv Scripts path is in sys.executable
-        in_venv = (hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix)
-        in_venv = in_venv or (r"\OptionsTradingStrategy\.venv\Scripts" in sys.executable)
-        return bool(in_venv)
+        # Standard venv detection works cross‑platform
+        if hasattr(sys, "base_prefix") and sys.prefix != sys.base_prefix:
+            return True
+        # Virtualenv sets this
+        if os.environ.get("VIRTUAL_ENV"):
+            return True
+        return False
     except Exception:
         return False
 
@@ -131,6 +138,15 @@ def _nearest_valid_strike(strikes_all: list[float], target: float, prefer: str =
         if below:
             return below[-1]
         return above[0] if above else None
+
+# --- Fallback expiration helper ---
+def _fallback_expiration_str(days: int = 30) -> str:
+    try:
+        d = datetime.now().date() + timedelta(days=int(days))
+        return d.strftime('%Y%m%d')
+    except Exception:
+        # Hard fallback: 30 days from epoch-now if anything odd occurs
+        return (datetime.utcnow().date() + timedelta(days=30)).strftime('%Y%m%d')
 
 # --- SecDef & strike helpers to force "odd if available" ---
 from typing import Iterable
@@ -645,215 +661,237 @@ def get_option_data(symbol: str, width: int = 5):
     if current_price is None:
         return {"_error": True, "stage": stage, "detail": "Unable to determine current price"}
 
-    # Get contract details / conId
-    stage = "contract_details"
-    details = ib.reqContractDetails(stock)
-    if not details:
-        return {"_error": True, "stage": stage, "detail": "No contract details returned for underlying"}
+    # Placeholders to support a theo-only fallback if option qualification fails later
+    expiry_str = None
+    strikes_all = []
+    preferred_tc = None
+    multiplier = None
 
-    con_id = details[0].contract.conId
-
-    # Get expirations, strikes, tradingClass & multiplier from SecDef (enables odd strikes if listed)
-    stage = "secdef"
-    expirations, strikes_all, trading_classes, multipliers = _collect_secdef(ib, symbol, con_id)
-    preferred_tc = _pick_preferred_tc(symbol, trading_classes)
-    multiplier = multipliers[0] if multipliers else None
-
-    if not expirations:
-        return {"_error": True, "stage": stage, "detail": "No expirations available"}
-
-    # Pick expiry nearest to 30 calendar days
-    stage = "pick_expiry"
-    target_date = datetime.now().date()
     try:
-        # Build list of (exp_str, dte) tuples
-        exps = []
-        for d in expirations:
-            try:
-                ed = datetime.strptime(d, '%Y%m%d').date()
-                dte = (ed - target_date).days
-                exps.append((d, dte))
-            except Exception:
-                continue
-        if not exps:
-            return {"_error": True, "stage": stage, "detail": "No valid expiration dates parsed"}
+        # Get contract details / conId
+        stage = "contract_details"
+        details = ib.reqContractDetails(stock)
+        if not details:
+            raise RuntimeError("No contract details returned for underlying")
+        con_id = details[0].contract.conId
 
-        # Prefer expirations with DTE >= MIN_DTE, then pick nearest to TARGET_DTE
-        valid = [(d, dte) for (d, dte) in exps if dte >= MIN_DTE]
-        if valid:
-            expiry_str = min(valid, key=lambda t: abs(t[1] - TARGET_DTE))[0]
+        # Get expirations, strikes, tradingClass & multiplier from SecDef (enables odd strikes if listed)
+        stage = "secdef"
+        expirations, strikes_all, trading_classes, multipliers = _collect_secdef(ib, symbol, con_id)
+        preferred_tc = _pick_preferred_tc(symbol, trading_classes)
+        multiplier = multipliers[0] if multipliers else None
+
+        # Choose expiry nearest to 30 calendar days (or fallback)
+        stage = "pick_expiry"
+        target_date = datetime.now().date()
+        expiry_str = None
+        if expirations:
+            exps = []
+            for d in expirations:
+                try:
+                    ed = datetime.strptime(d, '%Y%m%d').date()
+                    dte = (ed - target_date).days
+                    exps.append((d, dte))
+                except Exception:
+                    continue
+            if not exps:
+                expiry_str = _fallback_expiration_str(TARGET_DTE)
+            else:
+                valid = [(d, dte) for (d, dte) in exps if dte >= MIN_DTE]
+                if valid:
+                    expiry_str = min(valid, key=lambda t: abs(t[1] - TARGET_DTE))[0]
+                else:
+                    expiry_str = min(exps, key=lambda t: abs(t[1] - TARGET_DTE))[0]
         else:
-            # Fallback: original behavior (nearest to TARGET_DTE ignoring the threshold)
-            expiry_str = min(exps, key=lambda t: abs(t[1] - TARGET_DTE))[0]
-    except Exception as exc:
-        return {"_error": True, "stage": stage, "detail": f"Failed to choose expiry: {exc}"}
+            expiry_str = _fallback_expiration_str(TARGET_DTE)
 
-    # Choose ATM strike from available strikes (closest to current_price)
-    stage = "pick_strikes"
-    if not strikes_all:
-        atm_strike = round(current_price)
-        otm_strike = atm_strike + width
-    else:
-        # Force "odd if available": always pick from existing strikes list
-        atm_strike = _closest_existing(strikes_all, current_price)
-        otm_strike = _next_higher_existing(strikes_all, atm_strike)
+        # Choose ATM strike from available strikes (closest to current_price)
+        stage = "pick_strikes"
+        if not strikes_all:
+            atm_strike = round(current_price)
+            otm_strike = atm_strike + 1  # placeholder for width; real quote-based widths below may adjust
+        else:
+            atm_strike = _closest_existing(strikes_all, current_price)
+            otm_strike = _next_higher_existing(strikes_all, atm_strike)
 
-    # Qualify and request option mkt data for both call legs (ATM long, OTM short)
-    stage = "qualify_options"
-    legs_info = []
-    call_strikes = [atm_strike, otm_strike]
-    for idx, strike in enumerate(call_strikes):
-        try:
-            option = _qualify_with_fallback(ib, symbol, expiry_str, strike, 'C', preferred_tc, multiplier)
-        except Exception as exc:
-            # Fallback: pick nearest listed strike above, then below
-            fallback = _nearest_valid_strike(strikes_all, strike, prefer="above")
-            if fallback is None or abs(fallback - strike) < 1e-9:
-                fallback = _nearest_valid_strike(strikes_all, strike, prefer="below")
-            if fallback is None:
-                return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc}"}
+        # Qualify and request option mkt data for both call legs (ATM long, OTM short)
+        stage = "qualify_options"
+        legs_info = []
+        call_strikes = [atm_strike, otm_strike]
+        for idx, strike in enumerate(call_strikes):
             try:
+                option = _qualify_with_fallback(ib, symbol, expiry_str, strike, 'C', preferred_tc, multiplier)
+            except Exception as exc:
+                # Fallback: pick nearest listed strike above, then below
+                fallback = _nearest_valid_strike(strikes_all, strike, prefer="above")
+                if fallback is None or abs(fallback - strike) < 1e-9:
+                    fallback = _nearest_valid_strike(strikes_all, strike, prefer="below")
+                if fallback is None:
+                    raise
                 option = _qualify_with_fallback(ib, symbol, expiry_str, fallback, 'C', preferred_tc, multiplier)
-                strike = fallback  # use the valid strike
+                strike = fallback
                 if idx == 1:
                     otm_strike = strike
                 else:
                     atm_strike = strike
-            except Exception as exc2:
-                return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for {symbol} {strike} {expiry_str}: {exc2}"}
+            # Request option market data incl. generic ticks for OI (101) and IV30 (106)
+            stage = "option_mktdata"
+            try:
+                t = ib.reqMktData(option, '101,106', False, False)
+                ib.sleep(1.5)
+            except Exception:
+                t = None
+            legs_info.append({
+                "strike": strike,
+                "bid": getattr(t, 'bid', None) if t else None,
+                "ask": getattr(t, 'ask', None) if t else None,
+                "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
+                "callOpenInterest": getattr(t, 'callOpenInterest', None) if t else None
+            })
 
-        # Request option market data incl. generic ticks for OI (101) and IV30 (106)
-        stage = "option_mktdata"
-        try:
-            t = ib.reqMktData(option, '101,106', False, False)
-            ib.sleep(1.5)
-        except Exception as exc:
-            # If market data not subscribed (354), continue with no quotes; we will still compute theo later
-            logger.warning(f"[option_mktdata] reqMktData failed for {symbol} {strike}C {expiry_str}: {exc}")
-            t = None
-
-        legs_info.append({
-            "strike": strike,
-            "bid": getattr(t, 'bid', None) if t else None,
-            "ask": getattr(t, 'ask', None) if t else None,
-            "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
-            "callOpenInterest": getattr(t, 'callOpenInterest', None) if t else None
-        })
-
-    # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
-    stage = "qualify_put_options"
-    put_width = abs(otm_strike - atm_strike)
-    # Force "odd if available": pick nearest existing lower strike, not invented
-    put_otm_strike = _next_lower_existing(strikes_all, atm_strike)
-    put_legs_info = []
-    for strike, right in ((atm_strike, 'P'), (put_otm_strike, 'P')):
-        try:
-            option = _qualify_with_fallback(ib, symbol, expiry_str, strike, right, preferred_tc, multiplier)
-        except Exception as exc:
-            return {"_error": True, "stage": stage, "detail": f"qualifyContracts failed for PUT {symbol} {strike} {expiry_str}: {exc}"}
-        stage = "option_put_mktdata"
-        try:
-            t = ib.reqMktData(option, '101,106', False, False)
-            ib.sleep(1.5)
-        except Exception as exc:
-            logger.warning(f"[option_put_mktdata] reqMktData failed for {symbol} {strike}P {expiry_str}: {exc}")
-            t = None
-        put_legs_info.append({
-            "strike": strike,
-            "bid": getattr(t, 'bid', None) if t else None,
-            "ask": getattr(t, 'ask', None) if t else None,
-            "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
-            "putOpenInterest": getattr(t, 'putOpenInterest', None) if t else None
-        })
-
-    # Compute net debit limits from quotes
-    stage = "compute_debit"
-    call_buy_ask = legs_info[0]["ask"]
-    call_sell_bid = legs_info[1]["bid"]
-    call_debit = None
-    if call_buy_ask is not None and call_sell_bid is not None:
-        try:
-            call_debit = float(call_buy_ask) - float(call_sell_bid)
-        except Exception:
-            call_debit = None
-
-    put_buy_ask = put_legs_info[0]["ask"] if put_legs_info else None
-    put_sell_bid = put_legs_info[1]["bid"] if put_legs_info else None
-    put_debit = None
-    if put_buy_ask is not None and put_sell_bid is not None:
-        try:
-            put_debit = float(put_buy_ask) - float(put_sell_bid)
-        except Exception:
-            put_debit = None
-
-    # Quote-based debits for $1, $2.5 and $5 widths using closest available strikes
-    stage = "limit_widths_quotes"
-    call_debit_limit_1 = put_debit_limit_1 = None
-    call_debit_limit_2_5 = put_debit_limit_2_5 = None
-    call_debit_limit_5 = put_debit_limit_5 = None
-    for W in (1.0, 2.5, 5.0):
-        # Calls: long ATM C, short C at ATM+W (pick from listed strikes)
-        try:
-            c_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'C', preferred_tc, multiplier)
-            target_c = atm_strike + W
-            c_candidates = [s for s in strikes_all if s >= target_c]
-            c_shortK = c_candidates[0] if c_candidates else _next_higher_existing(strikes_all, atm_strike)
-            c_short = _qualify_with_fallback(ib, symbol, expiry_str, c_shortK, 'C', preferred_tc, multiplier)
-            tcL = ib.reqMktData(c_long, '', False, False); ib.sleep(0.4)
-            tcS = ib.reqMktData(c_short, '', False, False); ib.sleep(0.4)
-            val = None
-            if getattr(tcL, 'ask', None) is not None and getattr(tcS, 'bid', None) is not None:
-                val = float(tcL.ask) - float(tcS.bid)
-            if abs(W - 1.0) < 1e-9:
-                call_debit_limit_1 = val
-            elif abs(W - 2.5) < 1e-9:
-                call_debit_limit_2_5 = val
+        # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
+        stage = "qualify_put_options"
+        put_otm_strike = _next_lower_existing(strikes_all, atm_strike) if strikes_all else max(atm_strike - 1, 0.01)
+        put_legs_info = []
+        for strike, right in ((atm_strike, 'P'), (put_otm_strike, 'P')):
+            try:
+                option = _qualify_with_fallback(ib, symbol, expiry_str, strike, right, preferred_tc, multiplier)
+            except Exception:
+                # If even put qualification fails, continue; theo-only still possible
+                option = None
+            stage = "option_put_mktdata"
+            if option is not None:
+                try:
+                    t = ib.reqMktData(option, '101,106', False, False)
+                    ib.sleep(1.5)
+                except Exception:
+                    t = None
             else:
-                call_debit_limit_5 = val
-        except Exception as e:
-            logger.warning(f"[LIMIT] call W={W}: {e}")
-        # Puts: long ATM P, short P at ATM-W (pick from listed strikes)
-        try:
-            p_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'P', preferred_tc, multiplier)
-            target_p = max(atm_strike - W, 0.01)
-            p_candidates = [s for s in strikes_all if s <= target_p]
-            p_shortK = p_candidates[-1] if p_candidates else _next_lower_existing(strikes_all, atm_strike)
-            p_short = _qualify_with_fallback(ib, symbol, expiry_str, p_shortK, 'P', preferred_tc, multiplier)
-            tpL = ib.reqMktData(p_long, '', False, False); ib.sleep(0.4)
-            tpS = ib.reqMktData(p_short, '', False, False); ib.sleep(0.4)
-            val = None
-            if getattr(tpL, 'ask', None) is not None and getattr(tpS, 'bid', None) is not None:
-                val = float(tpL.ask) - float(tpS.bid)
-            if abs(W - 1.0) < 1e-9:
-                put_debit_limit_1 = val
-            elif abs(W - 2.5) < 1e-9:
-                put_debit_limit_2_5 = val
-            else:
-                put_debit_limit_5 = val
-        except Exception as e:
-            logger.warning(f"[LIMIT] put W={W}: {e}")
+                t = None
+            put_legs_info.append({
+                "strike": strike,
+                "bid": getattr(t, 'bid', None) if t else None,
+                "ask": getattr(t, 'ask', None) if t else None,
+                "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
+                "putOpenInterest": getattr(t, 'putOpenInterest', None) if t else None
+            })
 
-    return {
-        "_error": False,
-        "symbol": symbol,
-        "current_price": current_price,
-        "atm_strike": atm_strike,
-        "otm_strike": otm_strike,
-        "put_otm_strike": put_otm_strike,
-        "expiration": expiry_str,
-        "implied_volatility_atm": legs_info[0]['impliedVolatility'],
-        "open_interest_atm": legs_info[0]['callOpenInterest'],
-        "implied_volatility_otm": legs_info[1]['impliedVolatility'],
-        "open_interest_otm": legs_info[1]['callOpenInterest'],
-        "call_debit": call_debit,
-        "put_debit": put_debit,
-        "call_debit_limit_1": call_debit_limit_1,
-        "put_debit_limit_1":  put_debit_limit_1,
-        "call_debit_limit_2_5": call_debit_limit_2_5,
-        "put_debit_limit_2_5":  put_debit_limit_2_5,
-        "call_debit_limit_5": call_debit_limit_5,
-        "put_debit_limit_5":  put_debit_limit_5,
-    }
+        # Compute net debit limits from quotes (may be None)
+        stage = "compute_debit"
+        call_buy_ask = legs_info[0]["ask"] if legs_info else None
+        call_sell_bid = legs_info[1]["bid"] if len(legs_info) > 1 else None
+        call_debit = None
+        if call_buy_ask is not None and call_sell_bid is not None:
+            try:
+                call_debit = float(call_buy_ask) - float(call_sell_bid)
+            except Exception:
+                call_debit = None
+
+        put_buy_ask = put_legs_info[0]["ask"] if put_legs_info else None
+        put_sell_bid = put_legs_info[1]["bid"] if len(put_legs_info) > 1 else None
+        put_debit = None
+        if put_buy_ask is not None and put_sell_bid is not None:
+            try:
+                put_debit = float(put_buy_ask) - float(put_sell_bid)
+            except Exception:
+                put_debit = None
+
+        # Quote-based debits for $1, $2.5 and $5 widths using closest available strikes
+        stage = "limit_widths_quotes"
+        call_debit_limit_1 = put_debit_limit_1 = None
+        call_debit_limit_2_5 = put_debit_limit_2_5 = None
+        call_debit_limit_5 = put_debit_limit_5 = None
+        for W in (1.0, 2.5, 5.0):
+            # Calls
+            try:
+                c_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'C', preferred_tc, multiplier)
+                target_c = atm_strike + W
+                c_candidates = [s for s in strikes_all if s >= target_c]
+                c_shortK = c_candidates[0] if c_candidates else _next_higher_existing(strikes_all, atm_strike)
+                c_short = _qualify_with_fallback(ib, symbol, expiry_str, c_shortK, 'C', preferred_tc, multiplier)
+                tcL = ib.reqMktData(c_long, '', False, False); ib.sleep(0.4)
+                tcS = ib.reqMktData(c_short, '', False, False); ib.sleep(0.4)
+                val = None
+                if getattr(tcL, 'ask', None) is not None and getattr(tcS, 'bid', None) is not None:
+                    val = float(tcL.ask) - float(tcS.bid)
+                if abs(W - 1.0) < 1e-9:
+                    call_debit_limit_1 = val
+                elif abs(W - 2.5) < 1e-9:
+                    call_debit_limit_2_5 = val
+                else:
+                    call_debit_limit_5 = val
+            except Exception:
+                pass
+            # Puts
+            try:
+                p_long = _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'P', preferred_tc, multiplier)
+                target_p = max(atm_strike - W, 0.01)
+                p_candidates = [s for s in strikes_all if s <= target_p]
+                p_shortK = p_candidates[-1] if p_candidates else _next_lower_existing(strikes_all, atm_strike)
+                p_short = _qualify_with_fallback(ib, symbol, expiry_str, p_shortK, 'P', preferred_tc, multiplier)
+                tpL = ib.reqMktData(p_long, '', False, False); ib.sleep(0.4)
+                tpS = ib.reqMktData(p_short, '', False, False); ib.sleep(0.4)
+                val = None
+                if getattr(tpL, 'ask', None) is not None and getattr(tpS, 'bid', None) is not None:
+                    val = float(tpL.ask) - float(tpS.bid)
+                if abs(W - 1.0) < 1e-9:
+                    put_debit_limit_1 = val
+                elif abs(W - 2.5) < 1e-9:
+                    put_debit_limit_2_5 = val
+                else:
+                    put_debit_limit_5 = val
+            except Exception:
+                pass
+
+        return {
+            "_error": False,
+            "symbol": symbol,
+            "current_price": current_price,
+            "atm_strike": atm_strike,
+            "otm_strike": otm_strike,
+            "put_otm_strike": put_otm_strike,
+            "expiration": expiry_str,
+            "implied_volatility_atm": legs_info[0]['impliedVolatility'] if legs_info else None,
+            "open_interest_atm": legs_info[0]['callOpenInterest'] if legs_info else None,
+            "implied_volatility_otm": legs_info[1]['impliedVolatility'] if len(legs_info) > 1 else None,
+            "open_interest_otm": legs_info[1]['callOpenInterest'] if len(legs_info) > 1 else None,
+            "call_debit": call_debit,
+            "put_debit": put_debit,
+            "call_debit_limit_1": call_debit_limit_1,
+            "put_debit_limit_1":  put_debit_limit_1,
+            "call_debit_limit_2_5": call_debit_limit_2_5,
+            "put_debit_limit_2_5":  put_debit_limit_2_5,
+            "call_debit_limit_5": call_debit_limit_5,
+            "put_debit_limit_5":  put_debit_limit_5,
+        }
+    except Exception as e:
+        # Theo-only fallback: we have current_price but something later failed (e.g., secdef/qualification).
+        # Build a minimal result so CSV still gets a theoretical row.
+        logger.warning(f"[THEO_ONLY] stage={stage} symbol={symbol} reason={e}")
+        atm_strike = round(current_price)
+        expiry_str = expiry_str or _fallback_expiration_str(TARGET_DTE)
+        return {
+            "_error": False,
+            "_theo_only": True,
+            "symbol": symbol,
+            "current_price": current_price,
+            "atm_strike": atm_strike,
+            "otm_strike": None,
+            "put_otm_strike": None,
+            "expiration": expiry_str,
+            "implied_volatility_atm": None,
+            "open_interest_atm": None,
+            "implied_volatility_otm": None,
+            "open_interest_otm": None,
+            "call_debit": None,
+            "put_debit": None,
+            "call_debit_limit_1": None,
+            "put_debit_limit_1":  None,
+            "call_debit_limit_2_5": None,
+            "put_debit_limit_2_5":  None,
+            "call_debit_limit_5": None,
+            "put_debit_limit_5":  None,
+        }
 
 # --- Extract a ticker from free‑form alert text (very permissive but biased to ALLCAPS tickers) ---
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})(?:\.[A-Z])?\b")
