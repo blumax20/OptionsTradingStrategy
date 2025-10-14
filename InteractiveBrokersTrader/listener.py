@@ -464,12 +464,50 @@ def _append_webhook_event(payload: dict, route: str) -> None:
             ts = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        rec = {"ts": ts, "route": route, "payload": payload}
+        # Capture raw body and content-type for forensic/debug purposes
+        try:
+            raw = request.get_data(as_text=True)
+        except Exception:
+            raw = None
+        try:
+            ctype = request.headers.get("Content-Type")
+        except Exception:
+            ctype = None
+        rec = {"ts": ts, "route": route, "payload": payload, "raw": raw, "content_type": ctype}
         out = _webhook_jsonl()
         with out.open("a", encoding="utf-8") as f:
             f.write(_dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"[WEBHOOK_JSONL] failed to append: {e}")
+
+# --- Helper to robustly parse JSON or fallback to text/plain bodies ---
+def _get_payload():
+    """
+    Return a best-effort payload:
+      - If Content-Type is JSON, parse it (silent).
+      - Else, try to json.loads(raw) if body looks like JSON.
+      - Else, return {"text": raw_string}.
+    """
+    try:
+        if request.is_json:
+            data = request.get_json(silent=True)
+            return data if isinstance(data, (dict, list)) else (data or {})
+    except Exception:
+        pass
+    # Fallback: get raw text and try to parse JSON if it appears to be JSON
+    try:
+        raw = request.get_data(as_text=True) or ""
+    except Exception:
+        raw = ""
+    s = raw.strip()
+    if s.startswith("{") or s.startswith("["):
+        try:
+            import json as _json
+            data = _json.loads(s)
+            return data if isinstance(data, (dict, list)) else {"text": s}
+        except Exception:
+            return {"text": s}
+    return {"text": s}
 
 def _append_csv_row(row: dict):
     """
@@ -924,8 +962,8 @@ def _extract_ticker_from_text(text: str | None) -> str | None:
 # --- Signal endpoints accepting text or flexible JSON payloads ---
 @app.route('/signal/text', methods=['POST'])
 def signal_text():
-    data = request.get_json(silent=True) or {}
-    _append_webhook_event(data, route="/signal/text")
+    data = _get_payload()
+    _append_webhook_event(data if isinstance(data, (dict, list)) else {"raw": str(data)}, route="/signal/text")
     raw_text = data.get('text') or data.get('message') or data.get('alert')
     # allow explicit ticker override via ticker/symbol
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
@@ -952,8 +990,8 @@ def signal_text():
 @app.route('/signal', methods=['POST'])
 def signal_generic():
     """A flexible alias that accepts either {"ticker": "PAYX", ...} or {"text": "... PAYX ..."}."""
-    data = request.get_json(silent=True) or {}
-    _append_webhook_event(data, route="/signal")
+    data = _get_payload()
+    _append_webhook_event(data if isinstance(data, (dict, list)) else {"raw": str(data)}, route="/signal")
     raw_text = data.get('text') or data.get('message') or data.get('alert') or data.get('alert_message')
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(raw_text))
     if not symbol:
@@ -979,8 +1017,8 @@ def signal_generic():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json(silent=True) or {}
-    _append_webhook_event(data, route="/webhook")
+    data = _get_payload()
+    _append_webhook_event(data if isinstance(data, (dict, list)) else {"raw": str(data)}, route="/webhook")
     # Accept both ticker and symbol, or extract from free‑form message/text
     msg = data.get('message') or data.get('alert_message') or data.get('alert') or data.get('text')
     symbol = _clean_symbol(data.get('ticker') or data.get('symbol') or _extract_ticker_from_text(msg))
@@ -1009,7 +1047,7 @@ def webhook():
 
 @app.route('/webhook_batch', methods=['POST'])
 def webhook_batch():
-    data = request.get_json(silent=True)
+    data = _get_payload()
     if data is None:
         data = {}
     try:
