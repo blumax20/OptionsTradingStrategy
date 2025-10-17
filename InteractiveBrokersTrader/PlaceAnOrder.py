@@ -456,7 +456,7 @@ def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: 
     trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, None, quantity=n, action='SELL', order_type='MKT')
     return trade is not None
 
- # --- Cancel any pending/working OPEN (BUY) combo orders for a symbol ---
+# --- Cancel any pending/working OPEN (BUY) combo orders for a symbol ---
 def cancel_open_orders_for_symbol(ib: IB, symbol: str) -> int:
     """
     Cancel all pending/working BUY combo (BAG) orders for the given ticker.
@@ -485,6 +485,42 @@ def cancel_open_orders_for_symbol(ib: IB, symbol: str) -> int:
                     ib.cancelOrder(ord_obj)
                     n_cancel += 1
                     logger.info(f"[{symbol}] Cancelled pending OPEN order (id={ord_obj.orderId}, status={status})")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to cancel order {getattr(ord_obj,'orderId',None)}: {e}")
+        except Exception:
+            continue
+    return n_cancel
+
+# --- Cancel any pending/working CLOSE (SELL) combo orders for a symbol ---
+
+def cancel_close_orders_for_symbol(ib: IB, symbol: str) -> int:
+    """
+    Cancel all pending/working SELL combo (BAG) orders for the given ticker.
+    Returns number of orders cancelled.
+    """
+    try:
+        # Refresh local view of open orders/trades
+        ib.reqOpenOrders()
+        ib.sleep(0.25)
+    except Exception:
+        pass
+    n_cancel = 0
+    for tr in ib.trades():
+        try:
+            c = getattr(tr.contract, 'secType', '')
+            sym = getattr(tr.contract, 'symbol', '')
+            if c != 'BAG' or sym.upper() != symbol.upper():
+                continue
+            ord_obj = tr.order
+            stat = tr.orderStatus
+            act = getattr(ord_obj, 'action', '').upper()
+            status = getattr(stat, 'status', '')
+            # Common working/pre-working states
+            if act == 'SELL' and status in ('PreSubmitted','Submitted','PendingSubmit','ApiPending','ApiCancelled','Inactive'):
+                try:
+                    ib.cancelOrder(ord_obj)
+                    n_cancel += 1
+                    logger.info(f"[{symbol}] Cancelled pending CLOSE order (id={getattr(ord_obj,'orderId',None)}, status={status})")
                 except Exception as e:
                     logger.warning(f"[{symbol}] Failed to cancel order {getattr(ord_obj,'orderId',None)}: {e}")
         except Exception:
@@ -807,8 +843,16 @@ def run_from_csv():
 
             if args.mode == "from-signal":
                 if stype == "CALL_OPEN":
+                    # Latest-signal-wins: cancel any working CLOSE orders before we open
+                    cxl_close = cancel_close_orders_for_symbol(ib, symbol)
+                    if cxl_close > 0:
+                        logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
                     allow_call = True
                 elif stype == "PUT_OPEN":
+                    # Latest-signal-wins: cancel any working CLOSE orders before we open
+                    cxl_close = cancel_close_orders_for_symbol(ib, symbol)
+                    if cxl_close > 0:
+                        logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
                     allow_put = True
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
