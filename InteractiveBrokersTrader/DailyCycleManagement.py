@@ -1,3 +1,5 @@
+import subprocess, sys
+from pathlib import Path
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import logging
@@ -20,6 +22,11 @@ AFTER_HOURS_PLACEMENT = time(17, 0) # 5:00 pm ET
 DAILY_ANALYSIS_COOLDOWN_HOURS = 2      # don't re-run daily analysis inside this window
 WEEKLY_MAINTENANCE_DAY = 6             # Sunday
 
+# ----- External runner for PlaceAnOrder.py (used as a fallback/orchestration hook) -----
+# Resolve script path relative to this file
+PLACE_AN_ORDER_PATH = Path(__file__).with_name("PlaceAnOrder.py")
+# Try to use repo-local venv on Windows; otherwise fall back to current interpreter
+VENV_PY_WIN = Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
 class DailyCycleManagementMixin:
     """
@@ -60,6 +67,42 @@ class DailyCycleManagementMixin:
     # simple in-memory run guards; replace with persistent store if running in multiple processes
     _last_daily_analysis_at: datetime | None = None
     _last_weekly_maintenance_at: datetime | None = None
+
+    def _python_executable(self) -> str:
+        """
+        Choose the Python interpreter for launching PlaceAnOrder.py.
+        Prefers the repo-local Windows venv if it exists; otherwise uses the current interpreter.
+        """
+        try:
+            if sys.platform.startswith("win") and VENV_PY_WIN.exists():
+                return str(VENV_PY_WIN)
+        except Exception:
+            pass
+        return sys.executable
+
+    def _run_place_an_order(self, argv: list[str], timeout: int = 900) -> None:
+        """
+        Best-effort launcher for PlaceAnOrder.py with given args.
+        Captures stdout/stderr into the log for diagnostics.
+        """
+        python = self._python_executable()
+        script = str(PLACE_AN_ORDER_PATH)
+        cmd = [python, script] + argv
+        LOG.info("Launching PlaceAnOrder: %s", " ".join(argv))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if proc.stdout:
+                LOG.info("[PlaceAnOrder stdout]\n%s", proc.stdout.strip())
+            if proc.stderr:
+                LOG.warning("[PlaceAnOrder stderr]\n%s", proc.stderr.strip())
+            if proc.returncode != 0:
+                LOG.error("PlaceAnOrder exited with code %s", proc.returncode)
+        except subprocess.TimeoutExpired:
+            LOG.error("PlaceAnOrder timed out after %ss with args: %s", timeout, " ".join(argv))
+        except FileNotFoundError:
+            LOG.error("PlaceAnOrder.py not found at %s", script)
+        except Exception as e:
+            LOG.exception("Failed to launch PlaceAnOrder: %s", e)
 
     # ---------- Time & Session Utilities ----------
     def _now_ny(self) -> datetime:
@@ -127,47 +170,73 @@ class DailyCycleManagementMixin:
     def _pre_close_market_conversion(self) -> None:
         """
         Convert any stubborn CLOSE limit orders to market in the pre-close window.
-        Host may implement convert_unfilled_close_limits_to_market(cutoff=...), otherwise we no-op.
+        First call the host hook if present, then run a safe force-close sweep via PlaceAnOrder.
         """
         if hasattr(self, "convert_unfilled_close_limits_to_market"):
-            LOG.info("Pre-close sweep: converting unfilled CLOSE limits to market...")
+            LOG.info("Pre-close sweep: converting unfilled CLOSE limits to market (host hook)...")
             try:
                 self.convert_unfilled_close_limits_to_market(cutoff=PRE_CLOSE_SWEEP)
-                LOG.info("Pre-close sweep completed.")
+                LOG.info("Pre-close sweep (host) completed.")
             except Exception as e:
-                LOG.exception("Pre-close sweep failed: %s", e)
+                LOG.exception("Pre-close sweep (host) failed: %s", e)
         else:
-            LOG.info("Pre-close sweep skipped (host method convert_unfilled_close_limits_to_market not implemented).")
+            LOG.info("Pre-close sweep host hook not implemented; using fallback via PlaceAnOrder.")
+
+        # Fallback / reinforcement: force-close anything we can map; allow market fallback in PlaceAnOrder.
+        # Keep min-limit tiny to avoid blocking; tolerate strike drift via --close-tol.
+        self._run_place_an_order([
+            "--mode", "force-close",
+            "--force-close-side", "both",
+            "--min-limit", "0.01",
+            "--close-tol", "2.0",
+            "--verbose"
+        ])
 
     def _after_hours_batch_placement(self) -> None:
         """
-        Place end-of-day signals (e.g., from listener CSV or batch JSON) after-hours.
-        Host may implement place_end_of_day_signals(), otherwise we no-op.
+        Place end-of-day signals (e.g., from listener CSV) after-hours.
+        Run host hook if present, then call PlaceAnOrder to place from-signal orders.
         """
+        ran_host = False
         if hasattr(self, "place_end_of_day_signals"):
-            LOG.info("After-hours batch placement starting...")
+            LOG.info("After-hours batch placement (host hook) starting...")
             try:
                 self.place_end_of_day_signals()
-                LOG.info("After-hours batch placement completed.")
+                LOG.info("After-hours batch placement (host) completed.")
+                ran_host = True
             except Exception as e:
-                LOG.exception("After-hours batch placement failed: %s", e)
-        else:
-            LOG.info("After-hours batch placement skipped (host method place_end_of_day_signals not implemented).")
+                LOG.exception("After-hours batch placement (host) failed: %s", e)
+
+        # Always follow with an explicit from-signal run so settings in CSV are honored uniformly.
+        LOG.info("After-hours batch placement via PlaceAnOrder (from-signal)...")
+        self._run_place_an_order([
+            "--mode", "from-signal",
+            "--min-limit", "0.05",
+            "--verbose"
+        ])
 
     def _enforce_recent_closes(self, days: int = 7) -> None:
         """
         Ensure any CLOSE signals from the last `days` are enforced (no lingering exposure).
-        Host may implement enforce_recent_closures(days=...), otherwise we no-op.
+        Run host hook if present, then run PlaceAnOrder to force-close based on recent signals.
         """
         if hasattr(self, "enforce_recent_closures"):
-            LOG.info("Enforcing recent CLOSE signals (last %d days)...", days)
+            LOG.info("Enforcing recent CLOSE signals (host) for last %d days...", days)
             try:
                 self.enforce_recent_closures(days=days)
-                LOG.info("Recent CLOSE enforcement completed.")
+                LOG.info("Recent CLOSE enforcement (host) completed.")
             except Exception as e:
-                LOG.exception("Recent CLOSE enforcement failed: %s", e)
+                LOG.exception("Recent CLOSE enforcement (host) failed: %s", e)
         else:
-            LOG.info("Recent CLOSE enforcement skipped (host method enforce_recent_closures not implemented).")
+            LOG.info("Recent CLOSE enforcement host hook not implemented; using PlaceAnOrder fallback.")
+
+        # PlaceAnOrder fallback: search last N days' CLOSE rows and close even with missing ATM/exp (market fallback).
+        self._run_place_an_order([
+            "--mode", "force-close",
+            "--min-limit", "0.05",
+            "--close-tol", "2.0",
+            "--verbose"
+        ])
 
     # ---------- Orchestration ----------
     def daily_trading_cycle(self) -> None:
@@ -230,7 +299,7 @@ class DailyCycleManagementMixin:
 
             # Optional: After-hours batch placement + recent closes enforcement
             if self.is_after_hours_placement(now):
-                LOG.info("After-hours placement window (%s).", now)
+                LOG.info("After-hours placement window (%s): enforcing recent closes + placing from-signal.", now)
                 self._enforce_recent_closes(days=7)
                 self._after_hours_batch_placement()
             else:
