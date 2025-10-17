@@ -53,6 +53,15 @@ if platform.system() == "Windows":
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
 from pathlib import Path as _Path
+def _ib_ports_status():
+    import socket
+    res = {}
+    for p in (7497, 7496):
+        s=socket.socket(); s.settimeout(0.5)
+        try: s.connect(('127.0.0.1', p)); res[p]=True
+        except: res[p]=False
+        finally: s.close()
+    return res
 # --- helper to test if port is already open ---
 def _port_is_open(_host="127.0.0.1", _port=5001, _timeout=0.3):
     try:
@@ -650,7 +659,29 @@ def get_option_data(symbol: str, width: int = 5):
             ib.connect('127.0.0.1', 7497, clientId=42)  # paper trading port
     except Exception as exc:
         logger.exception("IB connect failed")
-        return {"_error": True, "stage": stage, "detail": f"Could not connect to IB API: {exc}"}
+        # Theo-only minimal result so CSV still gets an entry even if IB is unreachable
+        return {
+            "_error": False,
+            "_theo_only": True,
+            "symbol": symbol,
+            "current_price": None,
+            "atm_strike": None,
+            "otm_strike": None,
+            "put_otm_strike": None,
+            "expiration": _fallback_expiration_str(TARGET_DTE),
+            "implied_volatility_atm": None,
+            "open_interest_atm": None,
+            "implied_volatility_otm": None,
+            "open_interest_otm": None,
+            "call_debit": None,
+            "put_debit": None,
+            "call_debit_limit_1": None,
+            "put_debit_limit_1":  None,
+            "call_debit_limit_2_5": None,
+            "put_debit_limit_2_5":  None,
+            "call_debit_limit_5": None,
+            "put_debit_limit_5":  None,
+        }
 
     stage = "market_data_type"
     try:
@@ -697,7 +728,29 @@ def get_option_data(symbol: str, width: int = 5):
             logger.warning(f"Historical data fallback failed: {exc}")
 
     if current_price is None:
-        return {"_error": True, "stage": stage, "detail": "Unable to determine current price"}
+        # Still produce a minimal theo-only result so CSV captures the signal context
+        return {
+            "_error": False,
+            "_theo_only": True,
+            "symbol": symbol,
+            "current_price": None,
+            "atm_strike": None,
+            "otm_strike": None,
+            "put_otm_strike": None,
+            "expiration": _fallback_expiration_str(TARGET_DTE),
+            "implied_volatility_atm": None,
+            "open_interest_atm": None,
+            "implied_volatility_otm": None,
+            "open_interest_otm": None,
+            "call_debit": None,
+            "put_debit": None,
+            "call_debit_limit_1": None,
+            "put_debit_limit_1":  None,
+            "call_debit_limit_2_5": None,
+            "put_debit_limit_2_5":  None,
+            "call_debit_limit_5": None,
+            "put_debit_limit_5":  None,
+        }
 
     # Placeholders to support a theo-only fallback if option qualification fails later
     expiry_str = None
