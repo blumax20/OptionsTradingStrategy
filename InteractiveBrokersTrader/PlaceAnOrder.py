@@ -576,6 +576,70 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
                     best = (s_long, s_short, qty, d)
     return (best[0], best[1], best[2]) if best[2] > 0 else (None, None, 0)
 
+
+# --- Fallback: scan positions for any spread for this symbol and close via MARKET order ---
+def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, max_qty: int = 1) -> int:
+    """
+    Fallback: scan positions for this symbol and close any vertical debit spread(s) we can detect
+    using MARKET SELL combo orders. This ignores CSV expiration/ATM hints and uses the actual
+    expirations present in the account. Returns the number of market close orders submitted.
+    If side is 'call' or 'put', restrict to that right; otherwise do both.
+    """
+    side_set = {side.lower()} if side else {"call", "put"}
+    # Build per-expiration/right maps of long(+qty by strike) and short(+qty by strike)
+    from collections import defaultdict
+    placed = 0
+    pos = ib.positions()
+    # Group by (exp,right)
+    buckets: dict[tuple[str,str], dict[str, dict[float, float]]] = {}
+    for p in pos:
+        c = getattr(p, 'contract', None)
+        if not c or getattr(c, 'secType', '') != 'OPT':
+            continue
+        if getattr(c, 'symbol', '').upper() != symbol.upper():
+            continue
+        exp = getattr(c, 'lastTradeDateOrContractMonth', '')
+        right = getattr(c, 'right', '').upper()
+        if right not in ('C','P'):
+            continue
+        if (right == 'C' and 'call' not in side_set) or (right == 'P' and 'put' not in side_set):
+            continue
+        strike = float(getattr(c, 'strike', 0.0))
+        qty = float(getattr(p, 'position', 0.0))
+        key = (exp, right)
+        if key not in buckets:
+            buckets[key] = {'longs': defaultdict(float), 'shorts': defaultdict(float)}
+        if qty > 0:
+            buckets[key]['longs'][strike] += qty
+        elif qty < 0:
+            buckets[key]['shorts'][strike] += abs(qty)
+    # For each (exp,right) try to pair long and short strikes into a vertical and SELL MKT
+    for (exp, right), d in buckets.items():
+        longs = sorted(d['longs'].items())  # list of (strike, qty)
+        shorts = sorted(d['shorts'].items())
+        if not longs or not shorts:
+            continue
+        # For calls, prefer shorts with higher strike than long; for puts, prefer lower
+        for ls, lq in longs:
+            # find a compatible short
+            candidates = [(ss, sq) for ss, sq in shorts if (ss > ls if right == 'C' else ss < ls) and sq > 0]
+            if not candidates:
+                continue
+            # choose closest in strike distance
+            ss, sq = min(candidates, key=lambda t: abs(t[0] - ls))
+            n = int(min(lq, sq, max_qty))
+            if n <= 0:
+                continue
+            # Place MARKET SELL combo using the actual expiration from the position legs
+            tr = place_debit_spread(ib, symbol, exp, float(ls), float(ss), right, None, quantity=n, action='SELL', order_type='MKT')
+            if tr is not None:
+                placed += 1
+                # decrement used qty
+                d['longs'][ls] -= n
+                d['shorts'][ss] -= n
+        # cleanup any zeroed entries (not strictly necessary)
+    return placed
+
 def run_from_csv():
     args = parse_args()
     if args.verbose:
@@ -702,12 +766,13 @@ def run_from_csv():
                 except Exception:
                     pass
 
-            # Skip if any essential piece is missing
-            if symbol in (None, "nan", "NaN") or not expiration or pd.isna(atm):
-                msg = f"[row {idx}] Skipping; missing fields symbol/expiration/atm_strike. sym={symbol}, exp={expiration}, atm={atm}"
+            # Skip opens if essentials are missing; for CLOSE flows we will fall back to positions scan
+            if symbol in (None, "nan", "NaN"):
+                msg = f"[row {idx}] Skipping; missing symbol. sym={symbol}"
                 if args.verbose: logger.info(msg)
                 else: logger.warning(msg)
                 continue
+            missing_exp_or_atm = (not expiration) or pd.isna(atm)
 
             # Helper to enforce min limit
             def enforce_min_limit(x: float | None) -> float | None:
@@ -754,7 +819,7 @@ def run_from_csv():
                     closed_any = False
                     # Close call spread if present
                     call_close_limit = enforce_min_limit(best_close_limit(row, 'C'))
-                    if not pd.isna(k_call) and call_close_limit is not None:
+                    if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {call_close_limit}")
@@ -766,13 +831,13 @@ def run_from_csv():
                                 closed_any = True
                                 placed += 1
                     # fallback to market close if position present
-                    if call_close_limit is None and not pd.isna(k_call):
+                    if call_close_limit is None and not pd.isna(k_call) and not pd.isna(atm):
                         if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), max_qty=args.quantity):
                             logger.info(f"[{symbol}] Submitted CLOSE CALL (MKT fallback) {atm}/{k_call} exp {expiration}")
                             placed += 1
                     # Close put spread if present
                     put_close_limit = enforce_min_limit(best_close_limit(row, 'P'))
-                    if not pd.isna(k_put) and put_close_limit is not None:
+                    if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {put_close_limit}")
@@ -784,13 +849,13 @@ def run_from_csv():
                                 closed_any = True
                                 placed += 1
                     # fallback to market close if position present
-                    if put_close_limit is None and not pd.isna(k_put):
+                    if put_close_limit is None and not pd.isna(k_put) and not pd.isna(atm):
                         if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), max_qty=args.quantity):
                             logger.info(f"[{symbol}] Submitted CLOSE PUT (MKT fallback) {atm}/{k_put} exp {expiration}")
                             placed += 1
                     if not closed_any:
                         # try approximate match within tolerance
-                        if not pd.isna(k_call):
+                        if not pd.isna(k_call) and not pd.isna(atm):
                             vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL(approx) around atm={atm}, other_hint={k_call} tol={args.close_tol} @ {call_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C',
                                                                                       float(atm), float(k_call), tol=args.close_tol, max_qty=args.quantity)
@@ -805,7 +870,7 @@ def run_from_csv():
                                         logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
                                         closed_any = True
                                         placed += 1
-                        if not closed_any and not pd.isna(k_put):
+                        if not closed_any and not pd.isna(k_put) and not pd.isna(atm):
                             vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {put_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
                                                                                       float(atm), float(k_put), tol=args.close_tol, max_qty=args.quantity)
@@ -821,7 +886,19 @@ def run_from_csv():
                                         closed_any = True
                                         placed += 1
                     if not closed_any:
-                        vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
+                        # Final fallback: close any detected spread(s) for this symbol via MARKET orders,
+                        # even if expiration/ATM are missing or mismatched.
+                        restrict = None
+                        if stype == "CALL_CLOSE":
+                            restrict = "call"
+                        elif stype == "PUT_CLOSE":
+                            restrict = "put"
+                        n_closed = 0 if args.dry_run else close_any_spread_for_symbol(ib, symbol, side=restrict, max_qty=args.quantity)
+                        if n_closed > 0:
+                            logger.info(f"[{symbol}] Fallback MARKET close placed for {n_closed} spread(s) via positions scan")
+                            placed += n_closed
+                        else:
+                            vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
                     continue
                 else:
                     vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
@@ -900,6 +977,15 @@ def run_from_csv():
                                         place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', limit, quantity=qty, action='SELL')
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {limit}")
                                         placed += 1
+                # Force-close final fallback: MARKET close anything remaining for this symbol/side(s)
+                if not args.dry_run:
+                    sides = ["call","put"] if args.force_close_side == "both" else [args.force_close_side]
+                    total_fallback = 0
+                    for sside in sides:
+                        total_fallback += close_any_spread_for_symbol(ib, symbol, side=sside, max_qty=args.quantity)
+                    if total_fallback > 0:
+                        logger.info(f"[{symbol}] FORCE-CLOSE fallback MARKET close submitted for {total_fallback} spread(s)")
+                        placed += total_fallback
                 continue
 
             # --- CALL debit spread (ATM long / OTM short) ---
