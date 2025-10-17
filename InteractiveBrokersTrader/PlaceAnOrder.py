@@ -1,7 +1,8 @@
-from ib_insync import IB, Option, LimitOrder
+from ib_insync import IB, Option, LimitOrder, MarketOrder
 from ib_insync.contract import ComboLeg, Contract
 import logging
 import pandas as pd
+from zoneinfo import ZoneInfo
 from datetime import datetime
 
 # --- Normalize symbols (strip exchange prefixes/timeframes/trailing punctuation) ---
@@ -27,7 +28,6 @@ def _parse_ts_ny(val):
     except Exception:
         pass
     return None
-from zoneinfo import ZoneInfo
 import math
 import argparse
 import os
@@ -44,6 +44,7 @@ def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
     except Exception:
         now_ny = datetime.now()
     cutoff = now_ny - timedelta(days=days)
+    cutoff_naive = cutoff.replace(tzinfo=None) if getattr(cutoff, "tzinfo", None) is not None else cutoff
 
     # Filter CLOSE signals in the last N days
     mask_close = (df.get("signal_type", pd.Series(dtype=str)).astype(str).str.upper().isin(["CLOSE","CALL_CLOSE","PUT_CLOSE"]))
@@ -51,7 +52,7 @@ def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
     if df_close.empty:
         return
     df_close["_ts"] = df_close["timestamp_ny"].apply(_parse_ts_ny)
-    df_close = df_close[df_close["_ts"].notna() & (df_close["_ts"] >= cutoff)]
+    df_close = df_close[df_close["_ts"].notna() & (df_close["_ts"] >= cutoff_naive)]
     if df_close.empty:
         return
 
@@ -306,8 +307,8 @@ def has_open_position_for_spread(ib: IB, symbol: str, exp: str, right: str, long
 
 def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str, limit_price: float, quantity: int = 1, action: str = 'BUY'):
     """
-    Place a debit spread (vertical) with two option legs as a combo (BAG) order.
-    right: 'C' for call spread, 'P' for put spread.
+    Place a vertical debit spread (combo BAG). If order_type == 'MKT' or limit_price is None, a MarketOrder is used.
+    action: 'BUY' to OPEN, 'SELL' to CLOSE.
     """
     # Define legs
     long_leg = Option(
@@ -334,7 +335,7 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
         logger.info(f"[{symbol}] {right}-legs qualified: long {long_leg.conId} @{long_strike}, short {short_leg.conId} @{short_strike}, exp {expiration}")
     except Exception as e:
         logger.error(f"[{symbol}] Failed to qualify contracts for {right} spread: {e}")
-        return
+        return None
 
     # Build combo contract
     combo = Contract()
@@ -357,15 +358,59 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
 
     combo.comboLegs = [leg_long, leg_short]
 
-    # Place limit order
+    # Build and place order
     try:
-        order = LimitOrder(action.upper(), quantity, float(limit_price))
-        trade = ib.placeOrder(combo, order)
-        logger.info(f"[{symbol}] Placed {right} debit spread {long_strike}/{short_strike} exp {expiration} @ {limit_price:.2f} (qty={quantity})")
+        # Support both limit and market orders
+        if 'order_type' in place_debit_spread.__code__.co_varnames:
+            pass  # for type checkers
+        # The function signature is updated, so we use order_type param
+    except Exception:
+        pass
+    try:
+        # Accept order_type and limit_price
+        import inspect
+        argspec = inspect.getfullargspec(place_debit_spread)
+        order_type = locals().get('order_type', 'LMT')
+    except Exception:
+        order_type = 'LMT'
+    if not isinstance(order_type, str):
+        order_type = 'LMT'
+    try:
+        if order_type.upper() == 'MKT' or limit_price is None:
+            order = MarketOrder(action.upper(), quantity)
+            trade = ib.placeOrder(combo, order)
+            logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+        else:
+            order = LimitOrder(action.upper(), quantity, float(limit_price))
+            trade = ib.placeOrder(combo, order)
+            logger.info(f"[{symbol}] Placed {right} {'LMT' if action.upper()=='BUY' else 'LMT CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
         return trade
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
-        return
+        return None
+
+# --- Market close helper ---
+def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, max_qty: int = 1):
+    """
+    Same as close_spread_if_present, but places a MARKET SELL combo when a matching position is found.
+    Returns True if an order was sent.
+    """
+    longC = qualify_option(ib, symbol, expiration, atm_strike, right)
+    shortC = qualify_option(ib, symbol, expiration, oth_strike, right)
+    if not longC or not shortC:
+        return False
+    qty_long = qty_short = 0.0
+    for p in ib.positions():
+        if getattr(p.contract, 'conId', None) == longC.conId:
+            qty_long += float(p.position)
+        if getattr(p.contract, 'conId', None) == shortC.conId:
+            qty_short += float(p.position)
+    n = min(abs(int(qty_long)), abs(int(qty_short)), max_qty)
+    if n <= 0:
+        logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
+        return False
+    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, None, quantity=n, action='SELL', order_type='MKT')
+    return trade is not None
 
  # --- Cancel any pending/working OPEN (BUY) combo orders for a symbol ---
 def cancel_open_orders_for_symbol(ib: IB, symbol: str) -> int:
@@ -657,10 +702,17 @@ def run_from_csv():
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE CALL {symbol} {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                             closed_any = True  # simulate success in dry-run
+                            placed += 1
                         else:
                             if close_spread_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), call_close_limit, max_qty=args.quantity):
                                 logger.info(f"[{symbol}] Submitted CLOSE for CALL spread {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                                 closed_any = True
+                                placed += 1
+                    # fallback to market close if position present
+                    if call_close_limit is None and not pd.isna(k_call):
+                        if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), max_qty=args.quantity):
+                            logger.info(f"[{symbol}] Submitted CLOSE CALL (MKT fallback) {atm}/{k_call} exp {expiration}")
+                            placed += 1
                     # Close put spread if present
                     put_close_limit = enforce_min_limit(best_close_limit(row, 'P'))
                     if not pd.isna(k_put) and put_close_limit is not None:
@@ -668,10 +720,17 @@ def run_from_csv():
                         if args.dry_run:
                             vprint(args.verbose, f"[DRY-RUN] CLOSE PUT {symbol} {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                             closed_any = True  # simulate success in dry-run
+                            placed += 1
                         else:
                             if close_spread_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), put_close_limit, max_qty=args.quantity):
                                 logger.info(f"[{symbol}] Submitted CLOSE for PUT spread {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                                 closed_any = True
+                                placed += 1
+                    # fallback to market close if position present
+                    if put_close_limit is None and not pd.isna(k_put):
+                        if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), max_qty=args.quantity):
+                            logger.info(f"[{symbol}] Submitted CLOSE PUT (MKT fallback) {atm}/{k_put} exp {expiration}")
+                            placed += 1
                     if not closed_any:
                         # try approximate match within tolerance
                         if not pd.isna(k_call):
@@ -682,11 +741,13 @@ def run_from_csv():
                                 if args.dry_run:
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE CALL(approx) {symbol} {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit} x{qty}")
                                     closed_any = True
+                                    placed += 1
                                 else:
                                     if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'C',
                                                           call_close_limit, quantity=qty, action='SELL'):
                                         logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
                                         closed_any = True
+                                        placed += 1
                         if not closed_any and not pd.isna(k_put):
                             vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {put_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
@@ -695,11 +756,13 @@ def run_from_csv():
                                 if args.dry_run:
                                     vprint(args.verbose, f"[DRY-RUN] CLOSE PUT(approx) {symbol} {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit} x{qty}")
                                     closed_any = True
+                                    placed += 1
                                 else:
                                     if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'P',
                                                           put_close_limit, quantity=qty, action='SELL'):
                                         logger.info(f"[{symbol}] Submitted CLOSE PUT(approx) {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit}")
                                         closed_any = True
+                                        placed += 1
                     if not closed_any:
                         vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
                     continue
@@ -794,6 +857,14 @@ def run_from_csv():
                             place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', call_limit, quantity=args.quantity)
                             OPEN_SEEN_KEYS.add(key)
                             placed += 1
+                elif call_limit is None and not pd.isna(k_call):
+                    key = _combo_key(symbol, 'C', expiration, float(atm), float(k_call))
+                    if key not in OPEN_SEEN_KEYS and not has_working_open_order(ib, symbol, expiration, 'C', float(atm), float(k_call)) and not has_open_position_for_spread(ib, symbol, expiration, 'C', float(atm), float(k_call)):
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] CALL OPEN MKT {symbol} {atm}/{k_call} exp {expiration} x{args.quantity}")
+                        else:
+                            place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', None, quantity=args.quantity, action='BUY', order_type='MKT')
+                            OPEN_SEEN_KEYS.add(key); placed += 1
                 else:
                     vprint(args.verbose, f"[{symbol}] Call skipped; limit={call_limit}, k_call={k_call}")
             # --- PUT debit spread (ATM long / lower strike short) ---
@@ -816,6 +887,14 @@ def run_from_csv():
                             place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', put_limit, quantity=args.quantity)
                             OPEN_SEEN_KEYS.add(key)
                             placed += 1
+                elif put_limit is None and not pd.isna(k_put):
+                    key = _combo_key(symbol, 'P', expiration, float(atm), float(k_put))
+                    if key not in OPEN_SEEN_KEYS and not has_working_open_order(ib, symbol, expiration, 'P', float(atm), float(k_put)) and not has_open_position_for_spread(ib, symbol, expiration, 'P', float(atm), float(k_put)):
+                        if args.dry_run:
+                            vprint(args.verbose, f"[DRY-RUN] PUT OPEN MKT {symbol} {atm}/{k_put} exp {expiration} x{args.quantity}")
+                        else:
+                            place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', None, quantity=args.quantity, action='BUY', order_type='MKT')
+                            OPEN_SEEN_KEYS.add(key); placed += 1
                 else:
                     vprint(args.verbose, f"[{symbol}] Put skipped; limit={put_limit}, k_put={k_put}")
 

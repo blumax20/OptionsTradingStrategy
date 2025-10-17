@@ -654,57 +654,35 @@ def get_option_data(symbol: str, width: int = 5):
     symbol = _clean_symbol(symbol)
     ib = IB_SHARED
     stage = "connect"
+    # Ensure connected and set market data type (do not early-return; we can always price theo if later pieces fail)
     try:
-        if not ib.isConnected():
-            ib.connect('127.0.0.1', 7497, clientId=42)  # paper trading port
+        _ensure_ib_connected(ib, mkt_type=_preferred_md_type())
     except Exception as exc:
-        logger.exception("IB connect failed")
-        # Theo-only minimal result so CSV still gets an entry even if IB is unreachable
-        return {
-            "_error": False,
-            "_theo_only": True,
-            "symbol": symbol,
-            "current_price": None,
-            "atm_strike": None,
-            "otm_strike": None,
-            "put_otm_strike": None,
-            "expiration": _fallback_expiration_str(TARGET_DTE),
-            "implied_volatility_atm": None,
-            "open_interest_atm": None,
-            "implied_volatility_otm": None,
-            "open_interest_otm": None,
-            "call_debit": None,
-            "put_debit": None,
-            "call_debit_limit_1": None,
-            "put_debit_limit_1":  None,
-            "call_debit_limit_2_5": None,
-            "put_debit_limit_2_5":  None,
-            "call_debit_limit_5": None,
-            "put_debit_limit_5":  None,
-        }
+        logger.warning(f"IB connect failed (will attempt theo-only later if needed): {exc}")
 
-    stage = "market_data_type"
-    try:
-        ib.reqMarketDataType(_preferred_md_type())  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
-    except Exception as exc:
-        logger.warning(f"Could not set market data type: {exc}")
-
-    # Define the stock and try to get a current price; fall back to historical
+    # Define the stock and try to get a current price; fall back to historical with polling first
     stage = "stock_price"
     stock = Stock(symbol, 'SMART', 'USD')
+    ticker_stock = None
     try:
         ticker_stock = ib.reqMktData(stock, '', False, False)
-        ib.sleep(1.8)
     except Exception as exc:
         logger.warning(f"reqMktData stock failed: {exc}")
         ticker_stock = None
 
     current_price = None
-    if ticker_stock:
-        if getattr(ticker_stock, 'last', None) and not str(ticker_stock.last) == 'nan':
-            current_price = float(ticker_stock.last)
-        elif getattr(ticker_stock, 'close', None) and not str(ticker_stock.close) == 'nan':
-            current_price = float(ticker_stock.close)
+    if ticker_stock is not None:
+        vals, _waited = _wait_for_fields(ticker_stock, fields=("last","close","bid","ask"), timeout_ms=10000, step_ms=200)
+        # prefer last > close > mid(bid/ask)
+        try:
+            if vals.get("last") is not None:
+                current_price = float(vals["last"])
+            elif vals.get("close") is not None:
+                current_price = float(vals["close"])
+            elif vals.get("bid") is not None and vals.get("ask") is not None:
+                current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
+        except Exception:
+            current_price = None
 
     if current_price is None:
         # fallback to 1-day historical bar close (after-hours friendly)
@@ -714,7 +692,6 @@ def get_option_data(symbol: str, width: int = 5):
                 whatToShow='TRADES', useRTH=False, formatDate=1
             )
             if (not bars) or (hasattr(bars[-1], "close") and str(bars[-1].close) == "nan"):
-                # second try with BID_ASK in case TRADES is unavailable
                 bars = ib.reqHistoricalData(
                     stock, endDateTime='', durationStr='1 D', barSizeSetting='1 day',
                     whatToShow='BID_ASK', useRTH=False, formatDate=1
@@ -726,7 +703,6 @@ def get_option_data(symbol: str, width: int = 5):
                     current_price = None
         except Exception as exc:
             logger.warning(f"Historical data fallback failed: {exc}")
-
     if current_price is None:
         # Still produce a minimal theo-only result so CSV captures the signal context
         return {
@@ -829,13 +805,14 @@ def get_option_data(symbol: str, width: int = 5):
             stage = "option_mktdata"
             try:
                 t = ib.reqMktData(option, '101,106', False, False)
-                ib.sleep(1.5)
+                vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
             except Exception:
                 t = None
+                vals = {}
             legs_info.append({
                 "strike": strike,
-                "bid": getattr(t, 'bid', None) if t else None,
-                "ask": getattr(t, 'ask', None) if t else None,
+                "bid": vals.get("bid"),
+                "ask": vals.get("ask"),
                 "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
                 "callOpenInterest": getattr(t, 'callOpenInterest', None) if t else None
             })
@@ -854,15 +831,17 @@ def get_option_data(symbol: str, width: int = 5):
             if option is not None:
                 try:
                     t = ib.reqMktData(option, '101,106', False, False)
-                    ib.sleep(1.5)
+                    vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
                 except Exception:
                     t = None
+                    vals = {}
             else:
                 t = None
+                vals = {}
             put_legs_info.append({
                 "strike": strike,
-                "bid": getattr(t, 'bid', None) if t else None,
-                "ask": getattr(t, 'ask', None) if t else None,
+                "bid": vals.get("bid"),
+                "ask": vals.get("ask"),
                 "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
                 "putOpenInterest": getattr(t, 'putOpenInterest', None) if t else None
             })
@@ -900,11 +879,20 @@ def get_option_data(symbol: str, width: int = 5):
                 c_candidates = [s for s in strikes_all if s >= target_c]
                 c_shortK = c_candidates[0] if c_candidates else _next_higher_existing(strikes_all, atm_strike)
                 c_short = _qualify_with_fallback(ib, symbol, expiry_str, c_shortK, 'C', preferred_tc, multiplier)
-                tcL = ib.reqMktData(c_long, '', False, False); ib.sleep(0.4)
-                tcS = ib.reqMktData(c_short, '', False, False); ib.sleep(0.4)
+                tcL = ib.reqMktData(c_long, '', False, False)
+                tcS = ib.reqMktData(c_short, '', False, False)
+                vL, _ = _wait_for_fields(tcL, fields=("ask","last","close"), timeout_ms=10000, step_ms=200)
+                vS, _ = _wait_for_fields(tcS, fields=("bid","last","close"), timeout_ms=10000, step_ms=200)
                 val = None
-                if getattr(tcL, 'ask', None) is not None and getattr(tcS, 'bid', None) is not None:
-                    val = float(tcL.ask) - float(tcS.bid)
+                try:
+                    askL = vL.get("ask")
+                    bidS = vS.get("bid")
+                    if askL is not None and bidS is not None:
+                        val = float(askL) - float(bidS)
+                    elif vL.get("last") is not None and vS.get("close") is not None:
+                        val = float(vL["last"]) - float(vS["close"])
+                except Exception:
+                    val = None
                 if abs(W - 1.0) < 1e-9:
                     call_debit_limit_1 = val
                 elif abs(W - 2.5) < 1e-9:
@@ -920,11 +908,20 @@ def get_option_data(symbol: str, width: int = 5):
                 p_candidates = [s for s in strikes_all if s <= target_p]
                 p_shortK = p_candidates[-1] if p_candidates else _next_lower_existing(strikes_all, atm_strike)
                 p_short = _qualify_with_fallback(ib, symbol, expiry_str, p_shortK, 'P', preferred_tc, multiplier)
-                tpL = ib.reqMktData(p_long, '', False, False); ib.sleep(0.4)
-                tpS = ib.reqMktData(p_short, '', False, False); ib.sleep(0.4)
+                tpL = ib.reqMktData(p_long, '', False, False)
+                tpS = ib.reqMktData(p_short, '', False, False)
+                vL, _ = _wait_for_fields(tpL, fields=("ask","last","close"), timeout_ms=10000, step_ms=200)
+                vS, _ = _wait_for_fields(tpS, fields=("bid","last","close"), timeout_ms=10000, step_ms=200)
                 val = None
-                if getattr(tpL, 'ask', None) is not None and getattr(tpS, 'bid', None) is not None:
-                    val = float(tpL.ask) - float(tpS.bid)
+                try:
+                    askL = vL.get("ask")
+                    bidS = vS.get("bid")
+                    if askL is not None and bidS is not None:
+                        val = float(askL) - float(bidS)
+                    elif vL.get("last") is not None and vS.get("close") is not None:
+                        val = float(vL["last"]) - float(vS["close"])
+                except Exception:
+                    val = None
                 if abs(W - 1.0) < 1e-9:
                     put_debit_limit_1 = val
                 elif abs(W - 2.5) < 1e-9:
@@ -959,11 +956,35 @@ def get_option_data(symbol: str, width: int = 5):
         # Theo-only fallback: we have current_price but something later failed (e.g., secdef/qualification).
         # Build a minimal result so CSV still gets a theoretical row.
         logger.warning(f"[THEO_ONLY] stage={stage} symbol={symbol} reason={e}")
-        atm_strike = round(current_price)
+        atm_strike = round(current_price) if current_price is not None else None
         expiry_str = expiry_str or _fallback_expiration_str(TARGET_DTE)
+        if current_price is None:
+            # Only full theo-only when even the underlying price is unknown
+            return {
+                "_error": False,
+                "_theo_only": True,
+                "symbol": symbol,
+                "current_price": None,
+                "atm_strike": None,
+                "otm_strike": None,
+                "put_otm_strike": None,
+                "expiration": expiry_str,
+                "implied_volatility_atm": None,
+                "open_interest_atm": None,
+                "implied_volatility_otm": None,
+                "open_interest_otm": None,
+                "call_debit": None,
+                "put_debit": None,
+                "call_debit_limit_1": None,
+                "put_debit_limit_1":  None,
+                "call_debit_limit_2_5": None,
+                "put_debit_limit_2_5":  None,
+                "call_debit_limit_5": None,
+                "put_debit_limit_5":  None,
+            }
+        # Otherwise, return a partial result with at least price + ATM and fallback expiry so CSV has useful data
         return {
             "_error": False,
-            "_theo_only": True,
             "symbol": symbol,
             "current_price": current_price,
             "atm_strike": atm_strike,
@@ -983,6 +1004,28 @@ def get_option_data(symbol: str, width: int = 5):
             "call_debit_limit_5": None,
             "put_debit_limit_5":  None,
         }
+# --- Active polling helper for IB market data (replaces fixed sleeps) ---
+def _wait_for_fields(ticker, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200):
+    """
+    Polls a live ib_insync ticker object until any of the desired fields becomes non-None,
+    or timeout is reached. Returns (values: dict[str, any], waited_ms: int).
+    """
+    waited = 0
+    vals = {f: getattr(ticker, f, None) for f in fields}
+    # prefer cooperative ib.sleep, but also do a hard sleep to advance time
+    while waited <= timeout_ms and all(vals.get(f) is None for f in fields):
+        try:
+            IB_SHARED.sleep(step_ms/1000.0)
+        except Exception:
+            pass
+        import time as _time
+        _time.sleep(step_ms/1000.0)
+        waited += step_ms
+        for f in fields:
+            v = getattr(ticker, f, None)
+            if v is not None:
+                vals[f] = v
+    return vals, waited
 
 # --- Extract a ticker from free‑form alert text (very permissive but biased to ALLCAPS tickers) ---
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})(?:\.[A-Z])?\b")
@@ -1263,6 +1306,11 @@ def health():
     try:
         # Fast, non-blocking positions snapshot: do not attempt connect here to avoid hangs
         if IB_SHARED.isConnected():
+            try:
+                if hasattr(IB_SHARED, "pendingTickers") and IB_SHARED.pendingTickers():
+                    IB_SHARED.sleep(0.05)
+            except Exception:
+                pass
             try:
                 IB_SHARED.reqMarketDataType(_preferred_md_type())
             except Exception:
