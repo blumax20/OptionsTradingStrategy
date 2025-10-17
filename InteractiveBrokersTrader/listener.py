@@ -551,7 +551,10 @@ def _append_csv_row(row: dict):
                 except Exception:
                     rounded_row[k] = v
             else:
-                rounded_row[k] = v
+                if isinstance(v, str) and v.strip().lower() in ("nan","none",""):
+                    rounded_row[k] = None
+                else:
+                    rounded_row[k] = v
         w.writerow(rounded_row)
     logger.info(f"[CSV] Appended row to {out_csv}")
 
@@ -599,7 +602,7 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         sigma = 0.25
 
     theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None}
-    if not _is_nan(S) and not _is_nan(atm) and T is not None:
+    if not _is_nan(S) and not _is_nan(atm) and (days_to_exp is not None and days_to_exp > 0):
         try:
             theo = _theo_spread_debits(float(S), float(atm), float(T), float(sigma))
         except Exception as e:
@@ -650,9 +653,11 @@ def _fail(stage: str, msg: str, status: int = 500):
     return jsonify({"error": msg, "stage": stage}), status
 
 def _safe_cancel_md(t):
-    """Cancel a live market data subscription if possible and ignore any errors."""
+    """Cancel a live market data subscription if possible and ignore any errors; flush a tiny delay first."""
     try:
         if t is not None:
+            try: IB_SHARED.sleep(0.05)
+            except Exception: pass
             IB_SHARED.cancelMktData(t.contract)
     except Exception:
         pass
@@ -681,6 +686,15 @@ def get_option_data(symbol: str, width: int = 5):
     current_price = None
     if ticker_stock is not None:
         vals, _waited = _wait_for_fields(ticker_stock, fields=("last","close","bid","ask"), timeout_ms=10000, step_ms=200)
+        # escalate to mdtype=3 if all are missing
+        empty_stock = all(vals.get(k) is None for k in ("last","close","bid","ask"))
+        if empty_stock:
+            try: ib.reqMarketDataType(3)
+            except Exception: pass
+            vals2, _w2 = _wait_for_fields(ticker_stock, fields=("last","close","bid","ask"), timeout_ms=3000, step_ms=200)
+            for k in ("last","close","bid","ask"):
+                if vals2.get(k) is not None:
+                    vals[k] = vals2[k]
         # prefer last > close > mid(bid/ask)
         try:
             if vals.get("last") is not None:
@@ -816,6 +830,14 @@ def get_option_data(symbol: str, width: int = 5):
             try:
                 t = ib.reqMktData(option, '101,106', False, False)
                 vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
+                # if still empty, try delayed mdtype=3 briefly
+                if all(vals.get(k) is None for k in ("bid","ask")):
+                    try: ib.reqMarketDataType(3)
+                    except Exception: pass
+                    vals2, _ = _wait_for_fields(t, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
+                    for k in ("bid","ask","last","close"):
+                        if vals2.get(k) is not None and vals.get(k) is None:
+                            vals[k] = vals2.get(k)
                 _safe_cancel_md(t)
             except Exception:
                 t = None
@@ -843,6 +865,14 @@ def get_option_data(symbol: str, width: int = 5):
                 try:
                     t = ib.reqMktData(option, '101,106', False, False)
                     vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
+                    # if still empty, try delayed mdtype=3 briefly
+                    if all(vals.get(k) is None for k in ("bid","ask")):
+                        try: ib.reqMarketDataType(3)
+                        except Exception: pass
+                        vals2, _ = _wait_for_fields(t, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
+                        for k in ("bid","ask","last","close"):
+                            if vals2.get(k) is not None and vals.get(k) is None:
+                                vals[k] = vals2.get(k)
                     _safe_cancel_md(t)
                 except Exception:
                     t = None
@@ -945,6 +975,12 @@ def get_option_data(symbol: str, width: int = 5):
             except Exception:
                 pass
 
+        hint = {}
+        if call_debit is None and call_buy_ask is None and call_sell_bid is None:
+            hint["no_ticks_calls"] = True
+        if put_debit is None and put_buy_ask is None and put_sell_bid is None:
+            hint["no_ticks_puts"] = True
+        # attach hint only if present
         return {
             "_error": False,
             "symbol": symbol,
@@ -965,6 +1001,7 @@ def get_option_data(symbol: str, width: int = 5):
             "put_debit_limit_2_5":  put_debit_limit_2_5,
             "call_debit_limit_5": call_debit_limit_5,
             "put_debit_limit_5":  put_debit_limit_5,
+            **({"_hint": hint} if hint else {}),
         }
     except Exception as e:
         # Theo-only fallback: we have current_price but something later failed (e.g., secdef/qualification).
@@ -1053,6 +1090,11 @@ def _wait_for_fields(ticker, fields=("bid","ask","last","close"), timeout_ms=300
             v = _clean(getattr(ticker, f, None))
             if not _empty(v):
                 vals[f] = v
+        # Early-exit if we have bid&ask, or ask&last, or close&last
+        if (vals.get("bid") is not None and vals.get("ask") is not None) \
+           or (vals.get("ask") is not None and vals.get("last") is not None) \
+           or (vals.get("close") is not None and vals.get("last") is not None):
+            break
     return vals, waited
 
 # --- Extract a ticker from free‑form alert text (very permissive but biased to ALLCAPS tickers) ---
@@ -1253,6 +1295,7 @@ def mdtest():
         timeout_ms = int(request.args.get('timeout_ms', '5000'))
         poll_ms = 200
         waited = 0
+        waited2 = 0
 
         # fresh quote
         t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
@@ -1320,11 +1363,12 @@ def mdtest():
         except Exception:
             mid = None
 
+        total_waited = waited + (waited2 if 'waited2' in locals() else 0)
         out = {
             "symbol": sym,
             "mdtype": int(mdtype),
             "timeout_ms": timeout_ms,
-            "waited_ms": waited,
+            "waited_ms": total_waited,
             "delayed": delayed,
             "bid": bid,
             "ask": ask,
