@@ -649,6 +649,14 @@ def _fail(stage: str, msg: str, status: int = 500):
     logger.error(f"[{stage}] {msg}")
     return jsonify({"error": msg, "stage": stage}), status
 
+def _safe_cancel_md(t):
+    """Cancel a live market data subscription if possible and ignore any errors."""
+    try:
+        if t is not None:
+            IB_SHARED.cancelMktData(t.contract)
+    except Exception:
+        pass
+
 def get_option_data(symbol: str, width: int = 5):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
     symbol = _clean_symbol(symbol)
@@ -683,6 +691,8 @@ def get_option_data(symbol: str, width: int = 5):
                 current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
         except Exception:
             current_price = None
+    # Always cancel stock market data after polling
+    _safe_cancel_md(ticker_stock)
 
     if current_price is None:
         # fallback to 1-day historical bar close (after-hours friendly)
@@ -806,6 +816,7 @@ def get_option_data(symbol: str, width: int = 5):
             try:
                 t = ib.reqMktData(option, '101,106', False, False)
                 vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
+                _safe_cancel_md(t)
             except Exception:
                 t = None
                 vals = {}
@@ -832,6 +843,7 @@ def get_option_data(symbol: str, width: int = 5):
                 try:
                     t = ib.reqMktData(option, '101,106', False, False)
                     vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
+                    _safe_cancel_md(t)
                 except Exception:
                     t = None
                     vals = {}
@@ -883,6 +895,7 @@ def get_option_data(symbol: str, width: int = 5):
                 tcS = ib.reqMktData(c_short, '', False, False)
                 vL, _ = _wait_for_fields(tcL, fields=("ask","last","close"), timeout_ms=10000, step_ms=200)
                 vS, _ = _wait_for_fields(tcS, fields=("bid","last","close"), timeout_ms=10000, step_ms=200)
+                _safe_cancel_md(tcL); _safe_cancel_md(tcS)
                 val = None
                 try:
                     askL = vL.get("ask")
@@ -912,6 +925,7 @@ def get_option_data(symbol: str, width: int = 5):
                 tpS = ib.reqMktData(p_short, '', False, False)
                 vL, _ = _wait_for_fields(tpL, fields=("ask","last","close"), timeout_ms=10000, step_ms=200)
                 vS, _ = _wait_for_fields(tpS, fields=("bid","last","close"), timeout_ms=10000, step_ms=200)
+                _safe_cancel_md(tpL); _safe_cancel_md(tpS)
                 val = None
                 try:
                     askL = vL.get("ask")
@@ -1007,13 +1021,27 @@ def get_option_data(symbol: str, width: int = 5):
 # --- Active polling helper for IB market data (replaces fixed sleeps) ---
 def _wait_for_fields(ticker, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200):
     """
-    Polls a live ib_insync ticker object until any of the desired fields becomes non-None,
+    Polls a live ib_insync ticker object until any of the desired fields becomes non-None (and not NaN / zero for first sample),
     or timeout is reached. Returns (values: dict[str, any], waited_ms: int).
     """
     waited = 0
-    vals = {f: getattr(ticker, f, None) for f in fields}
+    def _clean(v):
+        try:
+            from math import isnan, isinf
+            if v is None: return None
+            if isinstance(v, float) and (isnan(v) or isinf(v)): return None
+            return v
+        except Exception:
+            return v
+    def _empty(x):
+        # treat None/NaN/Inf and zero as empty to avoid immediate t=0 "present" values
+        if x is None: return True
+        if isinstance(x, (int, float)) and x == 0.0: return True
+        return False
+
+    vals = {f: _clean(getattr(ticker, f, None)) for f in fields}
     # prefer cooperative ib.sleep, but also do a hard sleep to advance time
-    while waited <= timeout_ms and all(vals.get(f) is None for f in fields):
+    while waited <= timeout_ms and all(_empty(vals.get(f)) for f in fields):
         try:
             IB_SHARED.sleep(step_ms/1000.0)
         except Exception:
@@ -1022,8 +1050,8 @@ def _wait_for_fields(ticker, fields=("bid","ask","last","close"), timeout_ms=300
         _time.sleep(step_ms/1000.0)
         waited += step_ms
         for f in fields:
-            v = getattr(ticker, f, None)
-            if v is not None:
+            v = _clean(getattr(ticker, f, None))
+            if not _empty(v):
                 vals[f] = v
     return vals, waited
 
@@ -1184,6 +1212,10 @@ def webhook_batch():
         res = get_option_data(tick)
         if not res or res.get("_error"):
             results.append({"symbol": tick or item, "error": (res or {}).get("detail", "unknown")})
+            try:
+                IB_SHARED.sleep(0.05)
+            except Exception:
+                pass
         else:
             _append_listener_result_to_csv(res, sig)
             if sig:
@@ -1193,7 +1225,18 @@ def webhook_batch():
                     "strategy_position": sig.get("strategy_position"),
                     "raw_message": sig.get("raw_message"),
                 })
+            # annotate a tiny hint if the listener needed to fallback or had no debits
+            hint = {}
+            for k in ("call_debit","put_debit","call_debit_limit_1","put_debit_limit_1","call_debit_limit_2_5","put_debit_limit_2_5","call_debit_limit_5","put_debit_limit_5"):
+                if res.get(k) is None:
+                    hint.setdefault("missing", []).append(k)
+            if hint:
+                res["_hint"] = hint
             results.append(res)
+            try:
+                IB_SHARED.sleep(0.05)
+            except Exception:
+                pass
     return jsonify({"results": results})
 @app.route('/mdtest', methods=['GET'])
 def mdtest():
@@ -1218,24 +1261,56 @@ def mdtest():
         bid = ask = last = close = None
         delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', None)
 
-        # poll until we get something or time out
-        while waited <= timeout_ms:
-            bid   = getattr(t, 'bid',   bid)
-            ask   = getattr(t, 'ask',   ask)
-            last  = getattr(t, 'last',  last)
-            close = getattr(t, 'close', close)
-            if (bid is not None and ask is not None) or (last is not None or close is not None):
-                break
+        from math import isnan, isinf
+        def _nz(x, prior=None):
+            if x is None: return prior
+            if isinstance(x, float) and (isnan(x) or isinf(x)): return prior
+            return x
 
-            # cooperative sleep, then hard sleep to guarantee time passes
+        # sleep-first loop to ensure we don't exit at t=0
+        while True:
             try:
                 IB_SHARED.sleep(poll_ms/1000.0)
             except Exception:
                 pass
             time.sleep(poll_ms/1000.0)
-
             waited += poll_ms
+
+            bid   = _nz(getattr(t, 'bid',   None), bid)
+            ask   = _nz(getattr(t, 'ask',   None), ask)
+            last  = _nz(getattr(t, 'last',  None), last)
+            close = _nz(getattr(t, 'close', None), close)
+
+            if (bid is not None and ask is not None) or (last is not None or close is not None):
+                break
+            if waited >= timeout_ms:
+                break
             delayed = getattr(getattr(t, 'tickAttrib', None), 'delayed', delayed)
+
+        # If nothing arrived under mdtype=4 (delayed-frozen), try mdtype=3 (delayed) once
+        if all(v is None for v in (bid, ask, last, close)) and int(mdtype) == 4:
+            try:
+                IB_SHARED.cancelMktData(t.contract)
+            except Exception:
+                pass
+            try:
+                IB_SHARED.reqMarketDataType(3)
+            except Exception:
+                pass
+            t = IB_SHARED.reqMktData(Stock(sym, 'SMART', 'USD'), '', False, False)
+            # second window ~ 3 seconds
+            waited2 = 0
+            while waited2 < 3000:
+                try: IB_SHARED.sleep(poll_ms/1000.0) 
+                except Exception: pass
+                time.sleep(poll_ms/1000.0)
+                waited2 += poll_ms
+                bid   = _nz(getattr(t, 'bid',   None), bid)
+                ask   = _nz(getattr(t, 'ask',   None), ask)
+                last  = _nz(getattr(t, 'last',  None), last)
+                close = _nz(getattr(t, 'close', None), close)
+                if (bid is not None and ask is not None) or (last is not None or close is not None):
+                    break
 
         # compute mid if possible
         mid = None
@@ -1258,7 +1333,7 @@ def mdtest():
             "close": close
         }
         if all(v is None for v in (bid, ask, last, close)):
-            out["note"] = "No ticks within timeout; mdtype=4 uses delayed/frozen. Verify delayed permissions in IB Gateway."
+            out["note"] = "No ticks within timeout; tried mdtype=4 (delayed-frozen) and mdtype=3 (delayed). Verify delayed permissions and try real curl: %SystemRoot%\\System32\\curl.exe"
         return jsonify(out)
     except Exception as e:
         import traceback
