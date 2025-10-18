@@ -223,6 +223,10 @@ def parse_args():
                    help="Verbose logging per row and decision.")
     p.add_argument("--quiet", action="store_true",
                    help="Reduce ib_insync console noise (sets ib_insync logging to WARNING and disables console logging).")
+    p.add_argument("--use-live-open", choices=["off","mid","join"], default="off",
+                   help="If not 'off', price OPEN orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = ask(long)-bid(short).")
+    p.add_argument("--use-live-close", choices=["off","mid","join"], default="off",
+                   help="If not 'off', price CLOSE orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = bid(long)-ask(short).")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -350,6 +354,72 @@ def live_debit_limit(ib: IB, symbol: str, exp: str, right: str, longK: float, sh
         return None
     except Exception:
         return None
+def _ticker_mid(t):
+    b = getattr(t, 'bid', None); a = getattr(t, 'ask', None)
+    try:
+        import math
+        if isinstance(a,(int,float)) and isinstance(b,(int,float)) and not math.isnan(a) and not math.isnan(b) and a > 0 and b >= 0:
+            return (float(a)+float(b))/2.0
+    except Exception:
+        pass
+    lst = getattr(t, 'last', None)
+    try:
+        import math
+        if isinstance(lst,(int,float)) and not math.isnan(lst):
+            return float(lst)
+    except Exception:
+        pass
+    return None
+
+
+def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
+                      longK: float, shortK: float,
+                      action: str,        # 'BUY' for OPEN, 'SELL' for CLOSE
+                      scheme: str = 'join',
+                      timeout: float = 3.0) -> float | None:
+    """
+    Compute a live net positive price for the combo using either:
+      - scheme='join':  OPEN(BUY):  ask(long) - bid(short)
+                        CLOSE(SELL): bid(long) - ask(short)
+      - scheme='mid' :  OPEN/CLOSE: mid(long) - mid(short)
+    Returns a rounded positive float, or None if unavailable.
+    """
+    longC = qualify_option(ib, symbol, exp, longK, right)
+    shortC = qualify_option(ib, symbol, exp, shortK, right)
+    if not longC or not shortC:
+        return None
+    tL = ib.reqMktData(longC, '', False, False)
+    tS = ib.reqMktData(shortC, '', False, False)
+    waited = 0.0; step = 0.2
+    import time, math
+    try:
+        while waited < timeout:
+            time.sleep(step); waited += step
+            L_bid = getattr(tL, 'bid', None); L_ask = getattr(tL, 'ask', None)
+            S_bid = getattr(tS, 'bid', None); S_ask = getattr(tS, 'ask', None)
+            if scheme == 'join':
+                if action.upper() == 'BUY':
+                    if isinstance(L_ask,(int,float)) and isinstance(S_bid,(int,float)) and L_ask is not None and S_bid is not None and not math.isnan(L_ask) and not math.isnan(S_bid) and L_ask > 0 and S_bid >= 0:
+                        val = float(L_ask) - float(S_bid)
+                        if val > 0:
+                            return round(val, 2)
+                else:
+                    if isinstance(L_bid,(int,float)) and isinstance(S_ask,(int,float)) and L_bid is not None and S_ask is not None and not math.isnan(L_bid) and not math.isnan(S_ask) and S_ask > 0 and L_bid >= 0:
+                        val = float(L_bid) - float(S_ask)
+                        if val > 0:
+                            return round(val, 2)
+            else:
+                mL = _ticker_mid(tL); mS = _ticker_mid(tS)
+                if mL is not None and mS is not None:
+                    val = float(mL) - float(mS)
+                    if val > 0:
+                        return round(val, 2)
+        return None
+    finally:
+        try: ib.cancelMktData(longC)
+        except Exception: pass
+        try: ib.cancelMktData(shortC)
+        except Exception: pass
 # --- De-duplication helpers for opens (idempotency per run) ---
 OPEN_SEEN_KEYS: set[str] = set()
 
@@ -926,7 +996,11 @@ def run_from_csv():
                     # Attempt to close whichever spread we hold (call and/or put) by inspecting positions
                     closed_any = False
                     # Close call spread if present
-                    call_close_limit = enforce_min_limit(best_close_limit(row, 'C'))
+                    live_close_limit_c = None
+                    if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm) and not pd.isna(k_call):
+                        live_close_limit_c = live_spread_price(ib, symbol, expiration, 'C', float(atm), float(k_call),
+                                                               action='SELL', scheme=args.use_live_close, timeout=3.0)
+                    call_close_limit = (live_close_limit_c if (live_close_limit_c is not None) else enforce_min_limit(best_close_limit(row, 'C')))
                     if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
@@ -944,7 +1018,11 @@ def run_from_csv():
                             logger.info(f"[{symbol}] Submitted CLOSE CALL (MKT fallback) {atm}/{k_call} exp {expiration}")
                             placed += 1
                     # Close put spread if present
-                    put_close_limit = enforce_min_limit(best_close_limit(row, 'P'))
+                    live_close_limit_p = None
+                    if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm) and not pd.isna(k_put):
+                        live_close_limit_p = live_spread_price(ib, symbol, expiration, 'P', float(atm), float(k_put),
+                                                               action='SELL', scheme=args.use_live_close, timeout=3.0)
+                    put_close_limit = (live_close_limit_p if (live_close_limit_p is not None) else enforce_min_limit(best_close_limit(row, 'P')))
                     if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
@@ -1023,7 +1101,15 @@ def run_from_csv():
                 sides = ["call","put"] if args.force_close_side == "both" else [args.force_close_side]
                 for side in sides:
                     if side == "call":
-                        limit = enforce_min_limit(best_close_limit(row, 'C'))
+                        limit = None
+                        if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm):
+                            hint = k_call if side == 'call' else k_put
+                            if not pd.isna(hint):
+                                limit = live_spread_price(ib, symbol, expiration, ('C' if side=='call' else 'P'),
+                                                          float(atm), float(hint),
+                                                          action='SELL', scheme=args.use_live_close, timeout=3.0)
+                        if limit is None:
+                            limit = enforce_min_limit(best_close_limit(row, ('C' if side=='call' else 'P')))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE CALL skipped; limit below min or missing")
                         else:
@@ -1055,7 +1141,15 @@ def run_from_csv():
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE CALL(approx) {a_atm}/{a_oth} exp {expiration} @ {limit}")
                                         placed += 1
                     else:
-                        limit = enforce_min_limit(best_close_limit(row, 'P'))
+                        limit = None
+                        if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm):
+                            hint = k_call if side == 'call' else k_put
+                            if not pd.isna(hint):
+                                limit = live_spread_price(ib, symbol, expiration, ('C' if side=='call' else 'P'),
+                                                          float(atm), float(hint),
+                                                          action='SELL', scheme=args.use_live_close, timeout=3.0)
+                        if limit is None:
+                            limit = enforce_min_limit(best_close_limit(row, ('C' if side=='call' else 'P')))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE PUT skipped; limit below min or missing")
                         else:
@@ -1099,6 +1193,13 @@ def run_from_csv():
             # --- CALL debit spread (ATM long / OTM short) ---
             if allow_call and not pd.isna(k_call):
                 attempted = False
+                live_open_limit = None
+                if getattr(args, "use_live_open", "off") in ("mid","join"):
+                    live_open_limit = live_spread_price(ib, symbol, expiration, 'C', float(atm), float(k_call),
+                                                        action='BUY', scheme=args.use_live_open, timeout=3.0)
+                    if args.verbose and live_open_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] CALL OPEN live({args.use_live_open}) {atm}/{k_call} exp {expiration} @ {live_open_limit}")
+                
                 _raw_theo_call = best_theoretical_limit(row, 'C')
                 _raw_theo_put  = best_theoretical_limit(row, 'P')
                 theo_call = enforce_min_limit(_raw_theo_call)
@@ -1122,29 +1223,35 @@ def run_from_csv():
                                    raw_theo=_raw_theo_call, min_limit=args.min_limit, bumped=False,
                                    exp=expiration, atm=float(atm), oth=float(k_call))
                 # 1) Theo-first
-                if not skip and theo_call is not None:
-                    vprint(args.verbose, f"[{symbol}] CALL OPEN theo {atm}/{k_call} exp {expiration} @ {theo_call}")
+                chosen_open_limit = None
+                if not skip:
+                    if live_open_limit is not None:
+                        chosen_open_limit = enforce_min_limit(live_open_limit)
+                    elif theo_call is not None:
+                        chosen_open_limit = theo_call
+                if chosen_open_limit is not None:
+                    vprint(args.verbose, f"[{symbol}] CALL OPEN theo {atm}/{k_call} exp {expiration} @ {chosen_open_limit}")
                     if args.dry_run:
-                        vprint(args.verbose, f"[DRY-RUN] CALL OPEN theo {symbol} {atm}/{k_call} exp {expiration} @ {theo_call} x{args.quantity}")
+                        vprint(args.verbose, f"[DRY-RUN] CALL OPEN theo {symbol} {atm}/{k_call} exp {expiration} @ {chosen_open_limit} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyC); placed += 1
                         record_attempt(symbol, "open_call", "placed", "success",
-                                       exp=expiration, atm=float(atm), oth=float(k_call), limit=theo_call)
+                                       exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
                     else:
-                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', theo_call, quantity=args.quantity)
+                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyC); placed += 1; attempted = True
                             record_attempt(symbol, "open_call", "placed", "success",
-                                           exp=expiration, atm=float(atm), oth=float(k_call), limit=theo_call)
+                                           exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
                         else:
                             # Retry once with refreshed expiration; then derive live limit
                             new_exp = nearest_valid_expiration(ib, symbol, 'C', float(atm), expiration)
                             if new_exp and new_exp != expiration:
                                 vprint(args.verbose, f"[{symbol}] CALL OPEN retry with refreshed expiration {new_exp}")
-                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', theo_call, quantity=args.quantity)
+                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
                                     record_attempt(symbol, "open_call", "placed", "success",
-                                                   exp=new_exp, atm=float(atm), oth=float(k_call), limit=theo_call)
+                                                   exp=new_exp, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
                                     if live is not None:
@@ -1199,6 +1306,12 @@ def run_from_csv():
             # --- PUT debit spread (ATM long / lower strike short) ---
             if allow_put and not pd.isna(k_put):
                 attempted = False
+                live_open_limit = None
+                if getattr(args, "use_live_open", "off") in ("mid","join"):
+                    live_open_limit = live_spread_price(ib, symbol, expiration, 'P', float(atm), float(k_put),
+                                                        action='BUY', scheme=args.use_live_open, timeout=3.0)
+                    if args.verbose and live_open_limit is not None:
+                        vprint(args.verbose, f"[{symbol}] PUT OPEN live({args.use_live_open}) {atm}/{k_put} exp {expiration} @ {live_open_limit}")
                 _raw_theo_call = best_theoretical_limit(row, 'C')
                 _raw_theo_put  = best_theoretical_limit(row, 'P')
                 theo_call = enforce_min_limit(_raw_theo_call)
@@ -1222,28 +1335,34 @@ def run_from_csv():
                                    raw_theo=_raw_theo_put, min_limit=args.min_limit, bumped=False,
                                    exp=expiration, atm=float(atm), oth=float(k_put))
                 # 1) Theo-first
-                if not skip and theo_put is not None:
-                    vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {theo_put}")
+                chosen_open_limit = None
+                if not skip:
+                    if live_open_limit is not None:
+                        chosen_open_limit = enforce_min_limit(live_open_limit)
+                    elif theo_put is not None:
+                        chosen_open_limit = theo_put
+                if chosen_open_limit is not None:
+                    vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {live_open_limit}")
                     if args.dry_run:
-                        vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {theo_put} x{args.quantity}")
+                        vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {live_open_limit} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyP); placed += 1
                         record_attempt(symbol, "open_put", "placed", "success",
-                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=theo_put)
+                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=live_open_limit)
                     else:
-                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', theo_put, quantity=args.quantity)
+                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', live_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
                             record_attempt(symbol, "open_put", "placed", "success",
-                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=theo_put)
+                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=live_open_limit)
                         else:
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                             if new_exp and new_exp != expiration:
                                 vprint(args.verbose, f"[{symbol}] PUT OPEN retry with refreshed expiration {new_exp}")
-                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', theo_put, quantity=args.quantity)
+                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_open_limit, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
                                     record_attempt(symbol, "open_put", "placed", "success",
-                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=theo_put)
+                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=live_open_limit)
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     if live is not None:

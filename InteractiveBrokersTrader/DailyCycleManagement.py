@@ -203,6 +203,7 @@ class DailyCycleManagementMixin:
             "--force-close-side", "both",
             "--min-limit", "0.01",
             "--close-tol", "2.0",
+            "--use-live-close", "join",
             "--verbose"
         ])
 
@@ -227,6 +228,7 @@ class DailyCycleManagementMixin:
             "--mode", "from-signal",
             "--min-limit", "0.05",
             "--bump-to-min",
+            "--use-live-open", "mid",
             "--quiet"
         ])
 
@@ -249,6 +251,7 @@ class DailyCycleManagementMixin:
         self._run_place_an_order([
             "--mode", "force-close",
             "--min-limit", "0.05",
+            "--use-live-close", "join",
             "--verbose",
             "--quiet"
         ])
