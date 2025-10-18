@@ -118,6 +118,27 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.exception("Failed to launch PlaceAnOrder: %s", e)
 
+    def _safe_host_call(self, name: str, *args, **kwargs):
+        """
+        Safely call an optional host-implemented method.
+        If missing, log and skip. If it raises, log the exception and skip.
+        Returns the method's return value or None on failure/missing.
+        """
+        if not hasattr(self, name):
+            LOG.warning("Host method '%s' not implemented; skipping.", name)
+            return None
+        try:
+            return getattr(self, name)(*args, **kwargs)
+        except Exception as e:
+            LOG.exception("Host method '%s' raised an exception: %s", name, e)
+            return None
+
+    def _warn_missing_sector_data(self, context: str = "Analysis"):
+        """
+        Log the standardized message requested by the user when sector data is missing.
+        """
+        LOG.error("Sector data is missing. Recommend running HistoricalDataCollector.py; unable to optimize. [%s]", context)
+
     # ---------- Time & Session Utilities ----------
     def _now_ny(self) -> datetime:
         return datetime.now(NY)
@@ -792,28 +813,31 @@ class DailyCycleManagementMixin:
 
                     # 1. Scan for new candidates
                     sectors = ['TECH', 'FINANCE', 'HEALTHCARE', 'ENERGY', 'CONSUMER']
-                    self.scan_sector_candidates(sectors)
+                    self._safe_host_call("scan_sector_candidates", sectors)
 
                     # 2. Filter by liquidity and IV
-                    filtered_candidates = self.filter_candidates_by_criteria()
+                    filtered_candidates = self._safe_host_call("filter_candidates_by_criteria") or []
                     LOG.info("Filtered candidates: %s", len(filtered_candidates) if filtered_candidates else 0)
 
                     # 3. Collect and organize historical data
-                    self.update_historical_data(filtered_candidates)
-                    sector_data = self.organize_sector_data()
+                    self._safe_host_call("update_historical_data", filtered_candidates)
+                    sector_data = self._safe_host_call("organize_sector_data") or {}
+                    if not sector_data:
+                        self._warn_missing_sector_data("Daily analysis")
 
                     # 4. Optimize strategies per sector
-                    optimized_params = self.optimize_sector_strategy(sector_data)
-                    _ = optimized_params  # keep for future use/logging
+                    optimized_params = self._safe_host_call("optimize_sector_strategy", sector_data)
+                    if optimized_params is None:
+                        self._warn_missing_sector_data("Optimize strategies")
 
                     # 5. Select top 5 performers per sector
-                    top_candidates = self.select_top_performers(sector_data, 5)
+                    top_candidates = self._safe_host_call("select_top_performers", sector_data, 5) or []
 
                     # 6. Generate signals
-                    signals = self.generate_trade_signals(top_candidates)
+                    signals = self._safe_host_call("generate_trade_signals", top_candidates) or []
 
                     # 7. Prepare orders for next day
-                    self.prepare_next_day_orders(signals)
+                    self._safe_host_call("prepare_next_day_orders", signals)
 
                     # Optional hook
                     if hasattr(self, "post_daily_analysis"):
@@ -859,13 +883,13 @@ class DailyCycleManagementMixin:
                     self.pre_market_open()
 
                 # Execute prepared orders
-                self.execute_pending_orders()
+                self._safe_host_call("execute_pending_orders")
 
                 # Manage existing positions
-                self.manage_existing_positions()
+                self._safe_host_call("manage_existing_positions")
 
                 # Handle failed orders
-                self.retry_failed_orders()
+                self._safe_host_call("retry_failed_orders")
 
                 if hasattr(self, "post_market_open"):
                     self.post_market_open()
@@ -897,16 +921,18 @@ class DailyCycleManagementMixin:
                 self.pre_weekly_maintenance()
 
             # Update historical data
-            self.update_all_historical_data()
+            self._safe_host_call("update_all_historical_data")
 
             # Re-optimise strategies
-            self.reoptimize_all_sectors()
+            reopt = self._safe_host_call("reoptimize_all_sectors")
+            if reopt is None:
+                self._warn_missing_sector_data("Weekly re-optimise")
 
             # Remove high IV candidates
-            self.remove_high_iv_candidates()
+            self._safe_host_call("remove_high_iv_candidates")
 
             # Rebalance sector allocations
-            self.rebalance_sector_exposure()
+            self._safe_host_call("rebalance_sector_exposure")
 
             if hasattr(self, "post_weekly_maintenance"):
                 self.post_weekly_maintenance()
