@@ -249,10 +249,123 @@ class DailyCycleManagementMixin:
         self._run_place_an_order([
             "--mode", "force-close",
             "--min-limit", "0.05",
-            "--close-tol", "2.0",
             "--verbose",
             "--quiet"
         ])
+
+    def _reconcile_positions_with_signals_lookback(self, days: int = 21) -> None:
+        """
+        Outside RTH, reconcile current positions against the *latest* signal per symbol
+        by scanning only the symbols we currently hold. For each held symbol, walk the
+        last `days` of CSVs (newest -> oldest) and stop at the first matching row.
+        If that row's signal is OPEN -> log and skip; if CLOSE -> submit a force-close
+        via PlaceAnOrder. This minimizes work and keeps the decision relevant.
+        """
+        # 1) Collect currently held option symbols
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("Reconcile: ib_insync unavailable; skipping IB position check: %s", e)
+            return
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=882, timeout=6)
+        except Exception as e:
+            LOG.warning("Reconcile: could not connect to IB: %s", e)
+            return
+
+        held_syms: set[str] = set()
+        try:
+            poss = ib.positions()
+            for p in poss:
+                c = p.contract
+                if getattr(c, 'secType', '') != 'OPT':
+                    continue
+                q = float(p.position or 0.0)
+                if abs(q) < 1e-9:
+                    continue
+                held_syms.add((getattr(c, 'symbol', '') or '').upper())
+        except Exception as e:
+            LOG.warning("Reconcile: error fetching positions: %s", e)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        if not held_syms:
+            LOG.info("Reconcile: no open option positions detected.")
+            return
+
+        # 2) For each held symbol, scan newest->oldest CSVs until we find its latest signal
+        from zoneinfo import ZoneInfo
+        NY_TZ = ZoneInfo("America/New_York")
+        now = self._now_ny()
+
+        def _csv_path_for(dt: datetime) -> str:
+            folder = dt.astimezone(NY_TZ).strftime("%y_%m_%d")
+            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
+
+        looked = 0
+        submitted = 0
+        for sym in sorted(held_syms):
+            found_side = None
+            found_day = None
+            # newest -> oldest days
+            for d in range(0, max(1, days)):
+                dt = now - timedelta(days=d)
+                fp = _csv_path_for(dt)
+                if not os.path.exists(fp):
+                    continue
+                try:
+                    # choose the last occurrence for the day if multiple rows exist
+                    last_row = None
+                    with open(fp, newline='', encoding='utf-8') as fh:
+                        rdr = csv.DictReader(fh)
+                        for row in rdr:
+                            rsym = (row.get('symbol') or '').strip().upper()
+                            if rsym != sym:
+                                continue
+                            last_row = row  # keep walking; last win per day
+                    if last_row is None:
+                        continue
+                    # we found the latest-for-day; interpret its side
+                    side_raw = (last_row.get('signal_type') or last_row.get('signal_side') or last_row.get('strategy_position') or '')
+                    side = side_raw.strip().lower()
+                    found_side = side
+                    found_day = dt.date()
+                    break  # stop scanning older days for this symbol
+                except Exception as e:
+                    LOG.warning("Reconcile: error reading %s for %s: %s", fp, sym, e)
+                    continue
+
+            looked += 1
+            if not found_side:
+                LOG.info("Reconcile: no recent signal found within %d day(s) for %s; skipping.", days, sym)
+                continue
+
+            if 'open' in found_side:
+                LOG.info("Reconcile: latest signal for %s is OPEN (on %s); leaving position as-is.", sym, found_day)
+                continue
+
+            if 'close' in found_side:
+                try:
+                    self._run_place_an_order([
+                        "--mode", "force-close",
+                        "--symbols", sym,
+                        "--min-limit", "0.05",
+                        "--quiet"
+                    ])
+                    submitted += 1
+                    LOG.info("Reconcile: submitted CLOSE for %s based on latest CLOSE signal (on %s).", sym, found_day)
+                except Exception as e:
+                    LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
+                continue
+
+            LOG.info("Reconcile: latest signal for %s is '%s' (on %s); no action taken.", sym, found_side, found_day)
+
+        LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
     def _rth_liquidity_cleanup(self) -> None:
         """
@@ -428,6 +541,12 @@ class DailyCycleManagementMixin:
                     # Decide: alert, retry, or mark degraded state
                     return
 
+            # New: outside RTH reconciliation against latest CLOSE signals (21-day lookback)
+            try:
+                self._reconcile_positions_with_signals_lookback(days=21)
+            except Exception as e:
+                LOG.warning("Reconcile step skipped due to error: %s", e)
+
             # Optional: After-hours batch placement + recent closes enforcement
             if self.is_after_hours_placement(now):
                 LOG.info("After-hours placement window (%s): enforcing recent closes + placing from-signal.", now)
@@ -465,7 +584,12 @@ class DailyCycleManagementMixin:
                 LOG.exception("Market open cycle failed: %s", e)
                 return
         else:
-            LOG.info("Outside RTH and not after close; no cycle executed at %s", now)
+            # Outside RTH but not yet past MARKET_CLOSE (e.g., weekends before 17:00).
+            LOG.info("Outside RTH and not after close; running reconcile lookback at %s", now)
+            try:
+                self._reconcile_positions_with_signals_lookback(days=21)
+            except Exception as e:
+                LOG.warning("Reconcile step skipped due to error: %s", e)
 
     def weekly_maintenance(self) -> None:
         """Weekly strategy maintenance with guard to run once per Sunday."""
@@ -525,18 +649,18 @@ if __name__ == "__main__":
     )
 
     class _Runner(DailyCycleManagementMixin):
-        """
-        Minimal host to drive the after-hours placement only.
-        Override the analysis guard so we always skip heavy analysis from the task
-        and proceed to the safe after-hours placement + recent-closes enforcement.
-        """
-        def _can_run_daily_analysis(self) -> bool:  # type: ignore[override]
-            return False
+        """Forces DailyCycleManagement to always run regardless of trading day or time."""
+        def _can_run_daily_analysis(self) -> bool:  # always allow
+            return True
+        def _is_trading_day(self, when=None) -> bool:  # always treat as trading day
+            return True
 
-    LOG.info("DailyCycleManagement runner starting...")
+    LOG.info("DailyCycleManagement runner starting (forced execution mode)...")
     try:
-        _Runner().daily_trading_cycle()
-        LOG.info("DailyCycleManagement runner completed.")
+        r = _Runner()
+        r.daily_trading_cycle()
+        LOG.info("DailyCycleManagement runner completed successfully.")
+        sys.exit(0)
     except Exception:
         LOG.exception("DailyCycleManagement runner failed.")
         sys.exit(1)
