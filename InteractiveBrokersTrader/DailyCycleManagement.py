@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import logging
-import csv, os
+import csv, os, uuid
 
 LOG = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
@@ -26,6 +26,47 @@ WEEKLY_MAINTENANCE_DAY = 6             # Sunday
 
 # Minimum OI required for at least one leg to keep an order during RTH
 MIN_OI_FOR_RTH = 100
+
+def _attempts_csv_path() -> str:
+    from datetime import datetime
+    root = r"C:\OptionsHistory\logs" if sys.platform.startswith("win") else "./logs"
+    os.makedirs(root, exist_ok=True)
+    stamp = datetime.now(NY).strftime("%y_%m_%d_%H%M%S")
+    return os.path.join(root, f"attempts_{stamp}.csv")
+
+class _AttemptLogger:
+    _active_path: str | None = None
+
+    @classmethod
+    def path(cls) -> str:
+        if not cls._active_path:
+            cls._active_path = _attempts_csv_path()
+        return cls._active_path
+
+    @classmethod
+    def write(cls, **kw):
+        path = cls.path()
+        row = {
+            "ts":     kw.get("ts") or datetime.now(NY).isoformat(),
+            "symbol": kw.get("symbol", ""),
+            "action": kw.get("action", ""),     # e.g., close / hold / noop
+            "status": kw.get("status", ""),     # submitted / skipped / placed
+            "reason": kw.get("reason", ""),     # reconcile_mismatch / reconcile_close_signal / ...
+            "exp":    kw.get("exp", ""),
+            "right":  kw.get("right", ""),
+            "atm":    kw.get("atm", ""),
+            "oth":    kw.get("oth", ""),
+            "limit":  kw.get("limit", ""),
+            "source": kw.get("source", "dcm"),
+            "uid":    kw.get("uid", str(uuid.uuid4())[:8]),
+        }
+        hdr = list(row.keys())
+        exists = os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=hdr)
+            if not exists:
+                w.writeheader()
+            w.writerow(row)
 
 def _ny_csv_path() -> str:
     """
@@ -227,6 +268,7 @@ class DailyCycleManagementMixin:
             "--use-live-close", "join",
             "--verbose"
         ])
+        self._summarize_latest_attempts()
 
     def _after_hours_batch_placement(self) -> None:
         """
@@ -284,6 +326,12 @@ class DailyCycleManagementMixin:
         try:
             import glob, csv, os
             paths = sorted(glob.glob(os.path.join(root, "attempts_*.csv")), key=os.path.getmtime, reverse=True)
+            try:
+                active = getattr(_AttemptLogger, "_active_path", None)
+                if active and os.path.exists(active):
+                    paths.insert(0, active)
+            except Exception:
+                pass
             if not paths:
                 LOG.info("Attempts summary: no attempts_*.csv found in %s", root)
                 return
@@ -342,6 +390,7 @@ class DailyCycleManagementMixin:
             "--verbose",
             "--quiet"
         ])
+        self._summarize_latest_attempts()
 
     def _reconcile_positions_with_signals_lookback(self, days: int = 21) -> None:
         """
@@ -520,6 +569,14 @@ class DailyCycleManagementMixin:
                         submitted += 1
                         LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).",
                                  sym, cur_sign, sp, found_day)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                                 reason="reconcile_mismatch",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
                     except Exception as e:
                         LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
@@ -540,12 +597,28 @@ class DailyCycleManagementMixin:
                         submitted += 1
                         LOG.info("Reconcile: submitted CLOSE for %s (ambiguous current position) to align with latest OPEN signal (sign=%s, date=%s).",
                                  sym, sp, found_day)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                                 reason="reconcile_ambiguous",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
                     except Exception as e:
                         LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
 
                 LOG.info("Reconcile: latest OPEN for %s matches current orientation (sign=%s, signal=%s, date=%s); leaving position as-is.",
                          sym, cur_sign, sp, found_day)
+                try:
+                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                         reason="latest_open_matches",
+                                         exp=found_row.get("expiration",""),
+                                         right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                         source="dcm-reconcile")
+                except Exception:
+                    pass
                 continue
 
             if is_close:
@@ -558,10 +631,26 @@ class DailyCycleManagementMixin:
                     ])
                     submitted += 1
                     LOG.info("Reconcile: submitted CLOSE for %s based on latest CLOSE signal (on %s).", sym, found_day)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                             reason="reconcile_close_signal",
+                                             exp=found_row.get("expiration",""),
+                                             right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                             source="dcm-reconcile")
+                    except Exception:
+                        pass
                 except Exception as e:
                     LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                 continue
 
+            try:
+                _AttemptLogger.write(symbol=sym, action="noop", status="skipped",
+                                     reason=f"signal={side}",
+                                     exp=found_row.get("expiration",""),
+                                     right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                     source="dcm-reconcile")
+            except Exception:
+                pass
             LOG.info("Reconcile: latest signal for %s is '%s' (on %s); no action taken.", sym, side, found_day)
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
@@ -1025,6 +1114,10 @@ class DailyCycleManagementMixin:
                     self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
                 except Exception as e:
                     LOG.warning("Diagnostic open-from-signal (weekend) failed: %s", e)
+            try:
+                self._summarize_latest_attempts()
+            except Exception:
+                pass
 
     def weekly_maintenance(self) -> None:
         """Weekly strategy maintenance with guard to run once per Sunday."""
