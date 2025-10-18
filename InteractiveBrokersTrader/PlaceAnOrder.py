@@ -1,6 +1,7 @@
 from ib_insync import IB, Option, LimitOrder, MarketOrder
 from ib_insync.contract import ComboLeg, Contract
 import logging
+from ib_insync import util as _ibutil
 import pandas as pd
 from zoneinfo import ZoneInfo
 import json
@@ -220,6 +221,8 @@ def parse_args():
                    help="Print intended actions but do not place orders.")
     p.add_argument("--verbose", action="store_true",
                    help="Verbose logging per row and decision.")
+    p.add_argument("--quiet", action="store_true",
+                   help="Reduce ib_insync console noise (sets ib_insync logging to WARNING and disables console logging).")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -727,6 +730,19 @@ def run_from_csv():
     args = parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
+    # Quiet console noise if requested
+    if getattr(args, "quiet", False) and not getattr(args, "verbose", False):
+        try:
+            logging.getLogger("ib_insync").setLevel(logging.WARNING)
+            logging.getLogger("ib_insync.wrapper").setLevel(logging.WARNING)
+            logging.getLogger("ib_insync.client").setLevel(logging.WARNING)
+            # turn off ib_insync's console log mirroring
+            try:
+                _ibutil.logToConsole(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
     only = None
     if args.symbols:
         only = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
