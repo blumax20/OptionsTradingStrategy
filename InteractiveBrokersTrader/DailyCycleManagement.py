@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import logging
+import csv, os
 
 LOG = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
@@ -15,12 +16,25 @@ MARKET_CLOSE = time(16, 0)
 PRE_CLOSE_SWEEP = time(15, 0)       # 3:00 pm ET
 PRE_CLOSE_SWEEP_END = time(15, 30)  # safety window
 
-# Optional “after-hours placement” time
+#
+# Note: After-hours placement deliberately ignores OI checks (RTH-only cleanup handles low-liquidity orders).
 AFTER_HOURS_PLACEMENT = time(17, 0) # 5:00 pm ET
 
 # Idempotency windows to prevent double-running cycles
 DAILY_ANALYSIS_COOLDOWN_HOURS = 2      # don't re-run daily analysis inside this window
 WEEKLY_MAINTENANCE_DAY = 6             # Sunday
+
+# Minimum OI required for at least one leg to keep an order during RTH
+MIN_OI_FOR_RTH = 100
+
+def _ny_csv_path() -> str:
+    """
+    Build today's combined listener CSV path using New York date.
+    Example: C:\\OptionsHistory\\yy_MM_dd\\combined_listener_spreads.csv
+    """
+    ny_now = datetime.now(NY)
+    folder = ny_now.strftime("%y_%m_%d")
+    return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
 
 # ----- External runner for PlaceAnOrder.py (used as a fallback/orchestration hook) -----
 # Resolve script path relative to this file
@@ -212,7 +226,8 @@ class DailyCycleManagementMixin:
         self._run_place_an_order([
             "--mode", "from-signal",
             "--min-limit", "0.05",
-            "--verbose"
+            "--bump-to-min",
+            "--quiet"
         ])
 
     def _enforce_recent_closes(self, days: int = 7) -> None:
@@ -235,8 +250,124 @@ class DailyCycleManagementMixin:
             "--mode", "force-close",
             "--min-limit", "0.05",
             "--close-tol", "2.0",
-            "--verbose"
+            "--verbose",
+            "--quiet"
         ])
+
+    def _rth_liquidity_cleanup(self) -> None:
+        """
+        During Regular Trading Hours, remove/cancel open unfilled vertical combo orders where NEITHER leg has
+        live open interest (from IB market data) greater than MIN_OI_FOR_RTH. This uses generic tick 101
+        (OPTION_OPEN_INTEREST) to fetch current OI for each leg.
+        """
+        try:
+            from ib_insync import IB, Contract, ContractDetails, Ticker
+        except Exception as e:
+            LOG.warning("ib_insync unavailable for RTH liquidity cleanup: %s", e)
+            return
+
+        # Connect to IB and inspect open trades
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=879, timeout=6)
+        except Exception as e:
+            LOG.warning("RTH cleanup: could not connect to IB: %s", e)
+            return
+
+        # Helper: resolve an option contract from leg conId
+        def _resolve_opt(conId: int):
+            try:
+                cds = ib.reqContractDetails(Contract(conId=conId))
+                oc = cds[0].contract if cds else None
+                return oc if oc and getattr(oc, 'secType', '') == 'OPT' else None
+            except Exception:
+                return None
+
+        # Helper: fetch live open interest for a given option contract (generic tick 101)
+        def _live_oi(opt_contract: Contract) -> int | None:
+            try:
+                tkr: Ticker = ib.reqMktData(opt_contract, genericTickList='101', snapshot=False, regulatorySnapshot=False)
+                # give the feed a brief moment to populate; then poll a couple of times
+                for _ in range(6):
+                    ib.sleep(0.2)
+                    if getattr(tkr, 'optionOpenInterest', None) is not None:
+                        return int(tkr.optionOpenInterest)
+                return None
+            except Exception:
+                return None
+
+        try:
+            trades = ib.openTrades()
+            if not trades:
+                LOG.info("RTH cleanup: no open trades to evaluate.")
+                return
+
+            cancelled = 0
+            for tr in trades:
+                c = tr.contract
+                s = tr.orderStatus
+                o = tr.order
+
+                # Only consider active, unfilled COMBO (BAG) orders
+                if getattr(c, 'secType', '') != 'BAG':
+                    continue
+                status = (getattr(s, 'status', '') or '').lower()
+                if status in ('filled', 'cancelled', 'apicancelled'):
+                    continue
+
+                legs = getattr(c, 'comboLegs', None) or []
+                if len(legs) < 2:
+                    continue
+
+                # Resolve legs -> option contracts
+                leg_opts = []
+                for leg in legs:
+                    conId = getattr(leg, 'conId', None)
+                    if not conId:
+                        leg_opts = []
+                        break
+                    oc = _resolve_opt(conId)
+                    if not oc:
+                        leg_opts = []
+                        break
+                    leg_opts.append(oc)
+                if len(leg_opts) < 2:
+                    continue
+
+                # Assume vertical: common sym/exp/right and >=2 distinct strikes
+                syms   = { oc.symbol for oc in leg_opts }
+                exps   = { getattr(oc, 'lastTradeDateOrContractMonth', '') for oc in leg_opts }
+                rights = { getattr(oc, 'right', '') for oc in leg_opts }
+                strikes= sorted({ float(getattr(oc, 'strike', 0.0)) for oc in leg_opts })
+                if len(syms) != 1 or len(exps) != 1 or len(rights) != 1 or len(strikes) < 2:
+                    continue
+                sym = next(iter(syms)); exp = next(iter(exps)); right = next(iter(rights))
+
+                # Pull live OI for each leg
+                oi_values = []
+                for oc in leg_opts:
+                    oi = _live_oi(oc)
+                    oi_values.append(oi if oi is not None else -1)
+
+                # If BOTH legs have OI <= threshold (or unknown), cancel
+                leg1_ok = oi_values[0] is not None and oi_values[0] > MIN_OI_FOR_RTH
+                leg2_ok = oi_values[1] is not None and oi_values[1] > MIN_OI_FOR_RTH
+                if not (leg1_ok or leg2_ok):
+                    try:
+                        ib.cancelOrder(o)
+                        cancelled += 1
+                        lmt = getattr(o, 'lmtPrice', None)
+                        net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
+                        LOG.info("RTH cleanup: cancelled low-OI order %s %s %s strikes=%s OI=%s (threshold>%d) spread=%s",
+                                 sym, exp, right, strikes, oi_values, MIN_OI_FOR_RTH, net)
+                    except Exception as e:
+                        LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
+            LOG.info("RTH cleanup completed. Cancelled %d low-liquidity open order(s).", cancelled)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
 
     # ---------- Orchestration ----------
     def daily_trading_cycle(self) -> None:
@@ -309,6 +440,11 @@ class DailyCycleManagementMixin:
         # Cycle C: Market open execution
         if self.is_market_open(now):
             LOG.info("Market open cycle starting...")
+            # New: cancel open unfilled orders if neither leg has OI > threshold (based on today's CSV)
+            try:
+                self._rth_liquidity_cleanup()
+            except Exception as e:
+                LOG.warning("RTH liquidity cleanup skipped due to error: %s", e)
             try:
                 if hasattr(self, "pre_market_open"):
                     self.pre_market_open()
@@ -366,3 +502,41 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.exception("Weekly maintenance failed: %s", e)
             return
+
+
+# ----- Runnable entry point for scheduled after-hours placement -----
+if __name__ == "__main__":
+    import os, sys, logging
+    from pathlib import Path
+    # Configure logging to console and a persistent log on Windows
+    log_dir = Path(r"C:\OptionsHistory\logs") if sys.platform.startswith("win") else Path("./logs")
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    log_path = log_dir / "DailyCycle.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
+        ]
+    )
+
+    class _Runner(DailyCycleManagementMixin):
+        """
+        Minimal host to drive the after-hours placement only.
+        Override the analysis guard so we always skip heavy analysis from the task
+        and proceed to the safe after-hours placement + recent-closes enforcement.
+        """
+        def _can_run_daily_analysis(self) -> bool:  # type: ignore[override]
+            return False
+
+    LOG.info("DailyCycleManagement runner starting...")
+    try:
+        _Runner().daily_trading_cycle()
+        LOG.info("DailyCycleManagement runner completed.")
+    except Exception:
+        LOG.exception("DailyCycleManagement runner failed.")
+        sys.exit(1)
