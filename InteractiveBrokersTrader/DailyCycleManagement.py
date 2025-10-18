@@ -439,6 +439,216 @@ class DailyCycleManagementMixin:
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
+    def _rth_risk_exits(self, days_old: int = 7, loss_frac: float = 0.5, gain_frac: float = 0.5) -> None:
+        """
+        During Regular Trading Hours, scan currently-held vertical debit spreads that are older than `days_old`
+        and close them with a limit order if either:
+          * Loss >= loss_frac (e.g., 50%) of entry debit, or
+          * Profit >= gain_frac (e.g., 50%) of potential profit (width - entry debit).
+
+        We infer entry price from OPEN executions per leg and compute current net using mid quotes per leg.
+        If thresholds are met, we delegate the actual close placement to PlaceAnOrder (--mode force-close).
+        """
+        try:
+            from ib_insync import IB, Contract, Ticker, util, ExecutionFilter
+        except Exception as e:
+            LOG.warning("Risk exits: ib_insync unavailable: %s", e)
+            return
+
+        NY_TZ = ZoneInfo("America/New_York")
+        now = self._now_ny()
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=878, timeout=6)
+        except Exception as e:
+            LOG.warning("Risk exits: could not connect to IB: %s", e)
+            return
+
+        def _mid(t: Ticker) -> float | None:
+            if t.bid is not None and t.ask is not None and t.ask > 0 and t.bid >= 0:
+                return (t.bid + t.ask) / 2
+            return t.last if t.last is not None else None
+
+        # Build current positions per symbol, split by rights and strikes to detect vertical debits
+        try:
+            poss = ib.positions()
+        except Exception as e:
+            LOG.warning("Risk exits: positions() error: %s", e)
+            try: ib.disconnect()
+            except: pass
+            return
+
+        # Collect OPT legs per symbol with their contract ids, avgCost and qty
+        legs_by_sym: dict[str, list[dict]] = {}
+        for p in poss:
+            c = p.contract
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            q = float(p.position or 0.0)
+            if abs(q) < 1e-9:
+                continue
+            legs_by_sym.setdefault(c.symbol.upper(), []).append({
+                "conId": c.conId,
+                "right": getattr(c, "right", "").upper(),
+                "strike": float(getattr(c, "strike", 0.0)),
+                "avgCost": float(p.avgCost or 0.0),
+                "qty": q,
+                "contract": c
+            })
+
+        if not legs_by_sym:
+            LOG.info("Risk exits: no open option legs to evaluate.")
+            try: ib.disconnect()
+            except: pass
+            return
+
+        # Pull executions for last 30 days to infer OPEN entry prices and age
+        since = (now.astimezone(ZoneInfo("UTC")) - timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
+        try:
+            fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
+        except Exception as e:
+            LOG.warning("Risk exits: reqExecutions error: %s", e)
+            fills = []
+
+        # Build exec info by conId for OPEN legs
+        open_execs: dict[int, list[dict]] = {}
+        for f in fills:
+            c = f.contract
+            e = f.execution
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            if getattr(e, "openClose", "") != "O":
+                continue
+            try:
+                t_utc = util.parseIBDatetime(getattr(e, "time", ""))
+            except Exception:
+                t_utc = None
+            open_execs.setdefault(c.conId, []).append({
+                "side": e.side,    # BUY/SELL
+                "shares": float(getattr(e, "shares", 0.0) or 0.0),
+                "price": float(getattr(e, "price", 0.0) or 0.0),
+                "t": t_utc
+            })
+
+        def _avg_open_price(conId: int) -> tuple[float | None, datetime | None]:
+            rows = open_execs.get(conId, [])
+            if not rows:
+                return None, None
+            # volume-weighted average open price and earliest time
+            tot_px = 0.0
+            tot_sh = 0.0
+            t0 = None
+            for r in rows:
+                sh = abs(r["shares"])
+                tot_sh += sh
+                tot_px += r["price"] * sh
+                if r["t"] and (t0 is None or r["t"] < t0):
+                    t0 = r["t"]
+            return ((tot_px / tot_sh) if tot_sh else None), (t0.astimezone(NY_TZ) if t0 else None)
+
+        submitted = 0
+        checked = 0
+
+        for sym, legs in sorted(legs_by_sym.items()):
+            # look for a vertical debit (CALL debit or PUT debit) with 2+ legs
+            calls = [(l["strike"], l) for l in legs if l["right"] == "C"]
+            puts  = [(l["strike"], l) for l in legs if l["right"] == "P"]
+
+            def _process_vertical(strike_low: float, long_leg: dict, strike_high: float, short_leg: dict, right: str):
+                nonlocal submitted, checked
+                checked += 1
+
+                # Determine age from earliest OPEN exec across the two legs
+                long_avg, long_t0 = _avg_open_price(long_leg["conId"])
+                short_avg, short_t0 = _avg_open_price(short_leg["conId"])
+                t0 = min([t for t in [long_t0, short_t0] if t is not None], default=None)
+                if t0 is None or (now - t0) < timedelta(days=days_old):
+                    return  # ignore if too new or no exec time
+
+                # Entry net (debit) = long_avg - short_avg
+                if long_avg is None or short_avg is None:
+                    return
+                entry = max(0.0, (long_avg - short_avg))
+
+                # Current net using mid prices
+                try:
+                    # fully qualify contracts to request market data
+                    long_c = Contract(conId=long_leg["conId"])
+                    short_c = Contract(conId=short_leg["conId"])
+                    # reqContractDetails to expand (safer for MD)
+                    lcd = ib.reqContractDetails(long_c)
+                    scd = ib.reqContractDetails(short_c)
+                    if not lcd or not scd:
+                        return
+                    long_c = lcd[0].contract
+                    short_c = scd[0].contract
+                    tl = ib.reqMktData(long_c, snapshot=False)
+                    ts = ib.reqMktData(short_c, snapshot=False)
+                    # brief poll
+                    for _ in range(8):
+                        ib.sleep(0.2)
+                        if _mid(tl) is not None and _mid(ts) is not None:
+                            break
+                    curr = None
+                    ml = _mid(tl)
+                    ms = _mid(ts)
+                    if ml is not None and ms is not None:
+                        curr = max(0.0, ml - ms)
+                    if curr is None:
+                        return
+                except Exception as e:
+                    LOG.warning("Risk exits: MD error for %s %s strikes(%s,%s): %s", sym, right, strike_low, strike_high, e)
+                    return
+
+                width = abs(strike_high - strike_low)
+                # stop-loss: current <= (1 - loss_frac) * entry
+                stop_hit = curr <= (1.0 - loss_frac) * entry
+                # take-profit: current >= entry + gain_frac * (width - entry)
+                tp_hit = curr >= entry + gain_frac * max(0.0, (width - entry))
+
+                if not (stop_hit or tp_hit):
+                    return
+
+                # Delegate to PlaceAnOrder to place a CLOSE (it will use a limit close per its internal logic)
+                try:
+                    self._run_place_an_order([
+                        "--mode", "force-close",
+                        "--symbols", sym,
+                        "--quiet"
+                    ])
+                    submitted += 1
+                    reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_hit else "TP(>=%.0f%% max profit)" % (gain_frac*100)
+                    LOG.info("Risk exits: submitted CLOSE for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
+                             sym, right, strike_low, strike_high, (now - t0).days, entry, curr, width, reason)
+                except Exception as e:
+                    LOG.warning("Risk exits: failed to submit CLOSE for %s: %s", sym, e)
+
+            # Check for call debit: +qty at lower strike, -qty at higher strike
+            if len(calls) >= 2:
+                # find any pair that looks like + at lower and - at higher
+                for s1, l1 in calls:
+                    for s2, l2 in calls:
+                        if s1 >= s2: 
+                            continue
+                        if l1["qty"] > 0 and l2["qty"] < 0:
+                            _process_vertical(s1, l1, s2, l2, "CALL")
+
+            # Check for put debit: +qty at higher strike, -qty at lower strike
+            if len(puts) >= 2:
+                for s1, l1 in puts:
+                    for s2, l2 in puts:
+                        if s1 <= s2:
+                            continue
+                        if l1["qty"] > 0 and l2["qty"] < 0:
+                            _process_vertical(s2, l2, s1, l1, "PUT")
+
+        LOG.info("Risk exits: evaluated %d candidate vertical(s); submitted %d CLOSE order(s).", checked, submitted)
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+
     def _rth_liquidity_cleanup(self) -> None:
         """
         During Regular Trading Hours, remove/cancel open unfilled vertical combo orders where NEITHER leg has
@@ -636,6 +846,11 @@ class DailyCycleManagementMixin:
                 self._rth_liquidity_cleanup()
             except Exception as e:
                 LOG.warning("RTH liquidity cleanup skipped due to error: %s", e)
+            # New: take-profit / stop-loss exits for older positions (RTH only)
+            try:
+                self._rth_risk_exits(days_old=7, loss_frac=0.5, gain_frac=0.5)
+            except Exception as e:
+                LOG.warning("Risk exits skipped due to error: %s", e)
             try:
                 if hasattr(self, "pre_market_open"):
                     self.pre_market_open()
@@ -721,17 +936,18 @@ if __name__ == "__main__":
     )
 
     class _Runner(DailyCycleManagementMixin):
-        """Forces DailyCycleManagement to always run regardless of trading day or time."""
-        def _can_run_daily_analysis(self) -> bool:  # always allow
-            return True
-        def _is_trading_day(self, when=None) -> bool:  # always treat as trading day
+        """
+        Force daily analysis to be eligible, but otherwise use the normal session logic.
+        On weekends or outside RTH this will naturally take the after-close path (including reconcile).
+        """
+        def _can_run_daily_analysis(self) -> bool:  # always allow analysis eligibility
             return True
 
-    LOG.info("DailyCycleManagement runner starting (forced execution mode)...")
+    LOG.info("DailyCycleManagement runner starting (analysis enabled; normal session logic)...")
     try:
         r = _Runner()
         r.daily_trading_cycle()
-        LOG.info("DailyCycleManagement runner completed successfully.")
+        LOG.info("DailyCycleManagement runner completed.")
         sys.exit(0)
     except Exception:
         LOG.exception("DailyCycleManagement runner failed.")
