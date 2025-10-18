@@ -135,6 +135,44 @@ class DailyCycleManagementMixin:
             pass
         return sys.executable
 
+    def _has_working_close_order(self, sym: str) -> bool:
+        """
+        Return True if there is an existing working CLOSE order (SELL combo) for the given symbol.
+        This prevents DCM from submitting duplicate CLOSE orders for the same symbol during a run.
+        """
+        try:
+            from ib_insync import IB
+        except Exception:
+            return False
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=883, timeout=6)
+        except Exception:
+            return False
+
+        try:
+            trades = ib.openTrades() or []
+            up = sym.upper()
+            for tr in trades:
+                c = getattr(tr, "contract", None)
+                o = getattr(tr, "order", None)
+                s = getattr(tr, "orderStatus", None)
+                if not c or not o or not s:
+                    continue
+                if (getattr(c, "secType", "") == "BAG"
+                    and (getattr(c, "symbol", "") or "").upper() == up
+                    and (getattr(o, "action", "") or "").upper() == "SELL"):
+                    st = (getattr(s, "status", "") or "").lower()
+                    if st not in ("filled", "cancelled", "apicancelled"):
+                        return True
+            return False
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
     def _run_place_an_order(self, argv: list[str], timeout: int = 900) -> None:
         """
         Best-effort launcher for PlaceAnOrder.py with given args.
@@ -265,8 +303,7 @@ class DailyCycleManagementMixin:
             "--force-close-side", "both",
             "--min-limit", "0.01",
             "--close-tol", "2.0",
-            "--use-live-close", "join",
-            "--verbose"
+            "--use-live-close", "join"
         ])
         self._summarize_latest_attempts()
 
@@ -387,7 +424,6 @@ class DailyCycleManagementMixin:
             "--mode", "force-close",
             "--min-limit", "0.05",
             "--use-live-close", "join",
-            "--verbose",
             "--quiet"
         ])
         self._summarize_latest_attempts()
@@ -559,6 +595,19 @@ class DailyCycleManagementMixin:
             if is_open and sp is not None:
                 # If our orientation is known and mismatches the latest OPEN, close.
                 if cur_sign is not None and sp != cur_sign:
+                    if not hasattr(self, "_submitted_close_syms"):
+                        self._submitted_close_syms = set()
+                    if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                        LOG.info("Reconcile: skipping CLOSE for %s (already submitted this run or working close order exists).", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                                 reason="working_close_order",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
+                        continue
                     try:
                         self._run_place_an_order([
                             "--mode", "force-close",
@@ -566,6 +615,8 @@ class DailyCycleManagementMixin:
                             "--min-limit", "0.05",
                             "--quiet"
                         ])
+                        if hasattr(self, "_submitted_close_syms"):
+                            self._submitted_close_syms.add(sym)
                         submitted += 1
                         LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).",
                                  sym, cur_sign, sp, found_day)
@@ -587,6 +638,19 @@ class DailyCycleManagementMixin:
                 if cur_sign is None:
                     # Heuristic: if we hold both sides or ambiguous legs, and the latest signal is OPEN,
                     # force CLOSE to align with the latest signal's side.
+                    if not hasattr(self, "_submitted_close_syms"):
+                        self._submitted_close_syms = set()
+                    if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                        LOG.info("Reconcile: skipping CLOSE for %s (already submitted this run or working close order exists).", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                                 reason="working_close_order",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
+                        continue
                     try:
                         self._run_place_an_order([
                             "--mode", "force-close",
@@ -594,6 +658,8 @@ class DailyCycleManagementMixin:
                             "--min-limit", "0.05",
                             "--quiet"
                         ])
+                        if hasattr(self, "_submitted_close_syms"):
+                            self._submitted_close_syms.add(sym)
                         submitted += 1
                         LOG.info("Reconcile: submitted CLOSE for %s (ambiguous current position) to align with latest OPEN signal (sign=%s, date=%s).",
                                  sym, sp, found_day)
@@ -622,6 +688,19 @@ class DailyCycleManagementMixin:
                 continue
 
             if is_close:
+                if not hasattr(self, "_submitted_close_syms"):
+                    self._submitted_close_syms = set()
+                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted this run or working close order exists).", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                             reason="working_close_order",
+                                             exp=found_row.get("expiration",""),
+                                             right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                             source="dcm-reconcile")
+                    except Exception:
+                        pass
+                    continue
                 try:
                     self._run_place_an_order([
                         "--mode", "force-close",
@@ -629,6 +708,8 @@ class DailyCycleManagementMixin:
                         "--min-limit", "0.05",
                         "--quiet"
                     ])
+                    if hasattr(self, "_submitted_close_syms"):
+                        self._submitted_close_syms.add(sym)
                     submitted += 1
                     LOG.info("Reconcile: submitted CLOSE for %s based on latest CLOSE signal (on %s).", sym, found_day)
                     try:
