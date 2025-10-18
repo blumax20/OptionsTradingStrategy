@@ -3,6 +3,8 @@ from ib_insync.contract import ComboLeg, Contract
 import logging
 import pandas as pd
 from zoneinfo import ZoneInfo
+import json
+import csv
 # --- Normalize symbols (strip exchange prefixes/timeframes/trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     if not raw or not isinstance(raw, str):
@@ -157,6 +159,40 @@ def find_latest_combined_csv() -> Path | None:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("PlaceAnOrder")
 
+# ---- Structured health/decision logging (machine-readable) ----
+ATTEMPTS: list[dict] = []
+
+def _now_ny_iso() -> str:
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).isoformat()
+    except Exception:
+        return datetime.now().isoformat()
+
+def log_decision(evt: str, symbol: str | None, reason: str, **fields):
+    """
+    Emit a single-line JSON event (prefixed with HEALTH_EVT) to ib_cycle.log (stdout).
+    Example: HEALTH_EVT {"evt":"skip_open","symbol":"PEP","reason":"working_order",...}
+    """
+    payload = {"ts": _now_ny_iso(), "evt": evt, "symbol": (symbol or ""), "reason": reason}
+    if fields:
+        payload.update(fields)
+    try:
+        logger.info("HEALTH_EVT " + json.dumps(payload, default=str))
+    except Exception:
+        logger.info(f"HEALTH_EVT {{'evt':'{evt}','symbol':'{symbol}','reason':'{reason}'}}")
+
+def record_attempt(symbol: str, action: str, status: str, reason: str, **fields):
+    """
+    Accumulate a row for this run and also emit a HEALTH_EVT line.
+    status: 'placed' | 'skipped' | 'error'
+    action: 'open_call' | 'open_put' | 'close' | 'force_close' | etc.
+    """
+    row = {"ts": _now_ny_iso(), "symbol": symbol or "", "action": action, "status": status, "reason": reason}
+    if fields:
+        row.update(fields)
+    ATTEMPTS.append(row)
+    log_decision("attempt", symbol, reason, action=action, status=status, **fields)
+
 def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
@@ -253,6 +289,10 @@ def qualify_option(ib: IB, symbol: str, expiration: str, strike: float, right: s
                    strike=float(strike), right=right.upper(), exchange='SMART', currency='USD')
         return ib.qualifyContracts(c)[0]
     except Exception:
+        try:
+            log_decision("error", symbol, "qualify_failed", exp=expiration, right=right, strike=strike)
+        except Exception:
+            pass
         return None
 def nearest_valid_expiration(ib: IB, symbol: str, right: str, strike: float, desired_exp: str) -> str | None:
     """Pick desired expiry if valid, else the closest available by date for this symbol/right/strike."""
@@ -365,7 +405,7 @@ def has_open_position_for_spread(ib: IB, symbol: str, exp: str, right: str, long
             qty_short += float(p.position)
     return (qty_long > 0) and (qty_short < 0)
 
-def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str,limit_price: float | None, quantity: int = 1, action: str = 'BUY', order_type: str = 'LMT'):    
+def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str,limit_price: float | None, quantity: int = 1, action: str = 'BUY', order_type: str = 'LMT'):
     """
     Place a vertical debit spread (combo BAG). If order_type == 'MKT' or limit_price is None, a MarketOrder is used.
     action: 'BUY' to OPEN, 'SELL' to CLOSE.
@@ -431,6 +471,13 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
         return trade
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
+        try:
+            record_attempt(symbol, ("close" if action.upper()=="SELL" else f"open_{right.lower()}"),
+                           "error", "place_failed",
+                           exp=expiration, right=right, longK=long_strike, shortK=short_strike,
+                           limit=limit_price, err=str(e))
+        except Exception:
+            pass
         return None
 
 # --- Market close helper ---
@@ -807,6 +854,7 @@ def run_from_csv():
                 msg = f"[row {idx}] Skipping; missing symbol. sym={symbol}"
                 if args.verbose: logger.info(msg)
                 else: logger.warning(msg)
+                record_attempt(symbol or "", "open", "skipped", "missing_symbol", row_index=int(idx))
                 continue
             missing_exp_or_atm = (not expiration) or pd.isna(atm)
 
@@ -1035,20 +1083,42 @@ def run_from_csv():
             # --- CALL debit spread (ATM long / OTM short) ---
             if allow_call and not pd.isna(k_call):
                 attempted = False
-                theo_call = enforce_min_limit(best_theoretical_limit(row, 'C'))
+                _raw_theo_call = best_theoretical_limit(row, 'C')
+                _raw_theo_put  = best_theoretical_limit(row, 'P')
+                theo_call = enforce_min_limit(_raw_theo_call)
+                theo_put  = enforce_min_limit(_raw_theo_put)
                 keyC = _combo_key(symbol, 'C', expiration, float(atm), float(k_call))
-                skip = (keyC in OPEN_SEEN_KEYS) or has_working_open_order(ib, symbol, expiration, 'C', float(atm), float(k_call)) or has_open_position_for_spread(ib, symbol, expiration, 'C', float(atm), float(k_call))
-
+                dup_run = (keyC in OPEN_SEEN_KEYS)
+                wip     = has_working_open_order(ib, symbol, expiration, 'C', float(atm), float(k_call))
+                held    = has_open_position_for_spread(ib, symbol, expiration, 'C', float(atm), float(k_call))
+                skip = dup_run or wip or held
+                if dup_run:
+                    record_attempt(symbol, "open_call", "skipped", "dup_in_run",
+                                   exp=expiration, right='C', atm=float(atm), oth=float(k_call))
+                if wip:
+                    record_attempt(symbol, "open_call", "skipped", "working_order",
+                                   exp=expiration, right='C', atm=float(atm), oth=float(k_call))
+                if held:
+                    record_attempt(symbol, "open_call", "skipped", "already_held",
+                                   exp=expiration, right='C', atm=float(atm), oth=float(k_call))
+                if _raw_theo_call is not None and _raw_theo_call < args.min_limit and not args.bump_to_min:
+                    record_attempt(symbol, "open_call", "skipped", "min_limit_reject",
+                                   raw_theo=_raw_theo_call, min_limit=args.min_limit, bumped=False,
+                                   exp=expiration, atm=float(atm), oth=float(k_call))
                 # 1) Theo-first
                 if not skip and theo_call is not None:
                     vprint(args.verbose, f"[{symbol}] CALL OPEN theo {atm}/{k_call} exp {expiration} @ {theo_call}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] CALL OPEN theo {symbol} {atm}/{k_call} exp {expiration} @ {theo_call} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyC); placed += 1
+                        record_attempt(symbol, "open_call", "placed", "success",
+                                       exp=expiration, atm=float(atm), oth=float(k_call), limit=theo_call)
                     else:
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', theo_call, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyC); placed += 1; attempted = True
+                            record_attempt(symbol, "open_call", "placed", "success",
+                                           exp=expiration, atm=float(atm), oth=float(k_call), limit=theo_call)
                         else:
                             # Retry once with refreshed expiration; then derive live limit
                             new_exp = nearest_valid_expiration(ib, symbol, 'C', float(atm), expiration)
@@ -1057,13 +1127,17 @@ def run_from_csv():
                                 tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', theo_call, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
+                                    record_attempt(symbol, "open_call", "placed", "success",
+                                                   exp=new_exp, atm=float(atm), oth=float(k_call), limit=theo_call)
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
                                     if live is not None:
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', enforce_min_limit(live), quantity=args.quantity)
+                                        live_limit = enforce_min_limit(live)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', live_limit, quantity=args.quantity)
                                         if tr is not None:
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
-
+                                            record_attempt(symbol, "open_call", "placed", "success",
+                                                           exp=new_exp, atm=float(atm), oth=float(k_call), limit=live_limit)
                 # 2) Fallback to debit_limit only when both legs have OI ≥ 100
                 if not attempted:
                     oi_ok = False
@@ -1073,6 +1147,11 @@ def run_from_csv():
                         oi_ok = (oi1 >= 100) and (oi2 >= 100)
                     except Exception:
                         oi_ok = False
+                    if not oi_ok:
+                        record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                                       oi_atm=oi1, oi_otm=oi2, threshold=100,
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
+                                       oth=float(k_call) if not pd.isna(k_call) else None)
                     if oi_ok:
                         for kk in ("call_debit_limit_2_5","call_debit_limit_1","call_debit_limit_5"):
                             lv = enforce_min_limit(row.get(kk))
@@ -1081,6 +1160,8 @@ def run_from_csv():
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] CALL OPEN fallback limit {symbol} {atm}/{k_call} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
+                                record_attempt(symbol, "open_call", "placed", "success",
+                                               exp=expiration, atm=float(atm), oth=float(k_call), limit=lv)
                                 break
                             tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', lv, quantity=args.quantity)
                             if tr is None:
@@ -1092,24 +1173,52 @@ def run_from_csv():
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', lv2, quantity=args.quantity)
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
+                                record_attempt(symbol, "open_call", "placed", "success",
+                                               exp=(new_exp if 'new_exp' in locals() and new_exp else expiration),
+                                               atm=float(atm), oth=float(k_call), limit=(theo_call if 'theo_call' in locals() else None))
                                 break
+                if allow_call and not attempted:
+                    record_attempt(symbol, "open_call", "skipped", "no_viable_limit_or_conditions",
+                                   exp=expiration, atm=float(atm), oth=float(k_call))
             # --- PUT debit spread (ATM long / lower strike short) ---
             if allow_put and not pd.isna(k_put):
                 attempted = False
-                theo_put = enforce_min_limit(best_theoretical_limit(row, 'P'))
+                _raw_theo_call = best_theoretical_limit(row, 'C')
+                _raw_theo_put  = best_theoretical_limit(row, 'P')
+                theo_call = enforce_min_limit(_raw_theo_call)
+                theo_put  = enforce_min_limit(_raw_theo_put)
                 keyP = _combo_key(symbol, 'P', expiration, float(atm), float(k_put))
-                skip = (keyP in OPEN_SEEN_KEYS) or has_working_open_order(ib, symbol, expiration, 'P', float(atm), float(k_put)) or has_open_position_for_spread(ib, symbol, expiration, 'P', float(atm), float(k_put))
-
+                dup_run = (keyP in OPEN_SEEN_KEYS)
+                wip     = has_working_open_order(ib, symbol, expiration, 'P', float(atm), float(k_put))
+                held    = has_open_position_for_spread(ib, symbol, expiration, 'P', float(atm), float(k_put))
+                skip = dup_run or wip or held
+                if dup_run:
+                    record_attempt(symbol, "open_put", "skipped", "dup_in_run",
+                                   exp=expiration, right='P', atm=float(atm), oth=float(k_put))
+                if wip:
+                    record_attempt(symbol, "open_put", "skipped", "working_order",
+                                   exp=expiration, right='P', atm=float(atm), oth=float(k_put))
+                if held:
+                    record_attempt(symbol, "open_put", "skipped", "already_held",
+                                   exp=expiration, right='P', atm=float(atm), oth=float(k_put))
+                if _raw_theo_put is not None and _raw_theo_put < args.min_limit and not args.bump_to_min:
+                    record_attempt(symbol, "open_put", "skipped", "min_limit_reject",
+                                   raw_theo=_raw_theo_put, min_limit=args.min_limit, bumped=False,
+                                   exp=expiration, atm=float(atm), oth=float(k_put))
                 # 1) Theo-first
                 if not skip and theo_put is not None:
                     vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {theo_put}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {theo_put} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyP); placed += 1
+                        record_attempt(symbol, "open_put", "placed", "success",
+                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=theo_put)
                     else:
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', theo_put, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
+                            record_attempt(symbol, "open_put", "placed", "success",
+                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=theo_put)
                         else:
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                             if new_exp and new_exp != expiration:
@@ -1117,13 +1226,17 @@ def run_from_csv():
                                 tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', theo_put, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
+                                    record_attempt(symbol, "open_put", "placed", "success",
+                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=theo_put)
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     if live is not None:
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', enforce_min_limit(live), quantity=args.quantity)
+                                        live_limit = enforce_min_limit(live)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_limit, quantity=args.quantity)
                                         if tr is not None:
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
-
+                                            record_attempt(symbol, "open_put", "placed", "success",
+                                                           exp=new_exp, atm=float(atm), oth=float(k_put), limit=live_limit)
                 # 2) Fallback to debit_limit only when both legs have OI ≥ 100
                 if not attempted:
                     oi_ok = False
@@ -1133,6 +1246,11 @@ def run_from_csv():
                         oi_ok = (oi1 >= 100) and (oi2 >= 100)
                     except Exception:
                         oi_ok = False
+                    if not oi_ok:
+                        record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                                       oi_atm=oi1, oi_otm=oi2, threshold=100,
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
+                                       oth=float(k_put) if not pd.isna(k_put) else None)
                     if oi_ok:
                         for kk in ("put_debit_limit_2_5","put_debit_limit_1","put_debit_limit_5"):
                             lv = enforce_min_limit(row.get(kk))
@@ -1141,6 +1259,8 @@ def run_from_csv():
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] PUT OPEN fallback limit {symbol} {atm}/{k_put} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyP); placed += 1
+                                record_attempt(symbol, "open_put", "placed", "success",
+                                               exp=expiration, atm=float(atm), oth=float(k_put), limit=lv)
                                 break
                             tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', lv, quantity=args.quantity)
                             if tr is None:
@@ -1152,11 +1272,32 @@ def run_from_csv():
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', lv2, quantity=args.quantity)
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyP); placed += 1
+                                record_attempt(symbol, "open_put", "placed", "success",
+                                               exp=(new_exp if 'new_exp' in locals() and new_exp else expiration),
+                                               atm=float(atm), oth=float(k_put), limit=(theo_put if 'theo_put' in locals() else None))
                                 break
+                if allow_put and not attempted:
+                    record_attempt(symbol, "open_put", "skipped", "no_viable_limit_or_conditions",
+                                   exp=expiration, atm=float(atm), oth=float(k_put))
         except Exception as e:
             logger.error(f"[row {idx}] Unexpected error: {e}")
 
     logger.info(f"Completed. Orders {'simulated' if args.dry_run else 'attempted'}: {placed}")
+    # Persist run attempts (sidecar CSV) for health diagnostics
+    try:
+        out_dir = Path(r"C:\OptionsHistory\logs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = out_dir / (f"attempts_{today_folder_yy_mm_dd(args.date)}_{datetime.now().strftime('%H%M%S')}.csv")
+        if ATTEMPTS:
+            cols = ["ts","symbol","action","status","reason","exp","right","atm","oth","limit","raw_theo","min_limit","bumped","oi_atm","oi_otm","threshold","longK","shortK","err","row_index"]
+            with open(out_csv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                for r in ATTEMPTS:
+                    w.writerow(r)
+            logger.info(f"Wrote attempts summary: {out_csv}")
+    except Exception as e:
+        logger.warning(f"Could not write attempts CSV: {e}")
     ib.disconnect()
 
 if __name__ == "__main__":
