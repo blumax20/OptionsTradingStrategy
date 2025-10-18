@@ -249,9 +249,75 @@ class DailyCycleManagementMixin:
             "--mode", "from-signal",
             "--min-limit", "0.05",
             "--bump-to-min",
-            "--use-live-open", "mid",
+            "--use-live-open", "join",
             "--quiet"
         ])
+        self._summarize_latest_attempts()
+    def _diagnostic_open_from_signal(self, method: str = "join", min_limit: float = 0.05, bump_to_min: bool = True) -> None:
+        """
+        Diagnostic helper to try (re)placing today's OPEN orders directly from the CSV using PlaceAnOrder,
+        with a controllable live-limit method ('join' or 'mid'). After the run, summarize latest attempts.
+        """
+        argv = [
+            "--mode", "from-signal",
+            "--min-limit", f"{min_limit:.2f}",
+            "--use-live-open", method,
+            "--quiet"
+        ]
+        if bump_to_min:
+            argv.append("--bump-to-min")
+        try:
+            LOG.info("Diagnostic open-from-signal: using %s limits, min_limit=%.2f, bump_to_min=%s", method, min_limit, bump_to_min)
+            self._run_place_an_order(argv)
+        finally:
+            try:
+                self._summarize_latest_attempts()
+            except Exception as e:
+                LOG.warning("Attempts summary failed: %s", e)
+
+    def _summarize_latest_attempts(self) -> None:
+        """
+        Read the most recent attempts_*.csv from C:\\OptionsHistory\\logs and log a concise summary:
+        total placed, and grouped counts for non-placed by 'reason'. Also log last 20 not-placed rows.
+        """
+        root = r"C:\OptionsHistory\logs" if sys.platform.startswith("win") else "./logs"
+        try:
+            import glob, csv, os
+            paths = sorted(glob.glob(os.path.join(root, "attempts_*.csv")), key=os.path.getmtime, reverse=True)
+            if not paths:
+                LOG.info("Attempts summary: no attempts_*.csv found in %s", root)
+                return
+            latest = paths[0]
+            placed = 0
+            non = {}
+            rows = []
+            with open(latest, newline="", encoding="utf-8") as fh:
+                rdr = csv.DictReader(fh)
+                for r in rdr:
+                    rows.append(r)
+            for r in rows:
+                st = (r.get("status") or "").strip().lower()
+                if st == "placed":
+                    placed += 1
+                else:
+                    reason = (r.get("reason") or "").strip() or "(unknown)"
+                    non[reason] = non.get(reason, 0) + 1
+            LOG.info("Attempts summary (%s): placed=%d, not-placed=%d", latest, placed, len(rows) - placed)
+            if non:
+                LOG.info("Not-placed by reason:")
+                for k, v in sorted(non.items(), key=lambda kv: kv[1], reverse=True):
+                    LOG.info("  %-32s : %d", k, v)
+            # Log last 20 not-placed lines for quick inspection
+            not_placed = [r for r in rows if (r.get("status") or "").strip().lower() != "placed"]
+            tail = not_placed[-20:]
+            if tail:
+                LOG.info("Last %d not-placed rows:", len(tail))
+                for r in tail:
+                    LOG.info("  ts=%s sym=%s action=%s exp=%s right=%s limit=%s reason=%s",
+                             r.get("ts",""), r.get("symbol",""), r.get("action",""),
+                             r.get("exp",""), r.get("right",""), r.get("limit",""), r.get("reason",""))
+        except Exception as e:
+            LOG.warning("Attempts summary error: %s", e)
 
     def _enforce_recent_closes(self, days: int = 7) -> None:
         """
@@ -302,8 +368,8 @@ class DailyCycleManagementMixin:
         held_info: dict[str, int | None] = {}
         try:
             poss = ib.positions()
-            # Gather all option legs per symbol
-            legs_by_sym: dict[str, list[tuple[str, float, float]]] = {}
+            # Gather all option legs per symbol with avgCost to compute exposure
+            legs_by_sym: dict[str, list[tuple[str, float, float, float]]] = {}
             for p in poss:
                 c = p.contract
                 if getattr(c, 'secType', '') != 'OPT':
@@ -312,39 +378,54 @@ class DailyCycleManagementMixin:
                 if abs(q) < 1e-9:
                     continue
                 sym = (getattr(c, 'symbol', '') or '').upper()
-                right = (getattr(c, 'right', '') or '').upper()
+                right = (getattr(c, 'right', '') or '').upper()   # 'C' or 'P'
                 strike = float(getattr(c, 'strike', 0.0))
-                legs_by_sym.setdefault(sym, []).append((right, strike, q))
+                avg = float(p.avgCost or 0.0)
+                legs_by_sym.setdefault(sym, []).append((right, strike, q, avg))
+
             # For each symbol, try to infer orientation
             for sym, legs in legs_by_sym.items():
                 sign: int | None = None
                 # Only consider if at least 2 legs
                 if len(legs) >= 2:
                     # Separate by right
-                    calls = [(strike, qty) for r, strike, qty in legs if r == "CALL"]
-                    puts  = [(strike, qty) for r, strike, qty in legs if r == "PUT"]
+                    calls = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "C"]
+                    puts  = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "P"]
                     call_debit = False
                     put_debit = False
                     # For CALLs: qty>0 at lower strike, qty<0 at higher strike (vertical debit)
                     for i in range(len(calls)):
                         for j in range(len(calls)):
                             if i == j: continue
-                            s1, q1 = calls[i]
-                            s2, q2 = calls[j]
+                            s1, q1, _ = calls[i]
+                            s2, q2, _ = calls[j]
                             if s1 < s2 and q1 > 0 and q2 < 0:
                                 call_debit = True
                     # For PUTs: qty>0 at higher strike, qty<0 at lower strike (vertical debit)
                     for i in range(len(puts)):
                         for j in range(len(puts)):
                             if i == j: continue
-                            s1, q1 = puts[i]
-                            s2, q2 = puts[j]
+                            s1, q1, _ = puts[i]
+                            s2, q2, _ = puts[j]
                             if s1 > s2 and q1 > 0 and q2 < 0:
                                 put_debit = True
+
                     if call_debit and not put_debit:
                         sign = +1
                     elif put_debit and not call_debit:
                         sign = -1
+                    elif call_debit and put_debit:
+                        # Both a call debit and a put debit exist (e.g., both sides open at once).
+                        # Choose a dominant orientation by notional exposure (|qty| * avgCost * 100).
+                        call_notional = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in calls)
+                        put_notional  = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in puts)
+                        if call_notional > put_notional:
+                            sign = +1
+                        elif put_notional > call_notional:
+                            sign = -1
+                        else:
+                            # still ambiguous
+                            sign = None
                     else:
                         sign = None
                 held_info[sym] = sign
@@ -427,7 +508,7 @@ class DailyCycleManagementMixin:
                 is_open = True
 
             if is_open and sp is not None:
-                # If we can infer both current and intended orientation, check for mismatch
+                # If our orientation is known and mismatches the latest OPEN, close.
                 if cur_sign is not None and sp != cur_sign:
                     try:
                         self._run_place_an_order([
@@ -437,13 +518,35 @@ class DailyCycleManagementMixin:
                             "--quiet"
                         ])
                         submitted += 1
-                        LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).", sym, cur_sign, sp, found_day)
+                        LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).",
+                                 sym, cur_sign, sp, found_day)
                     except Exception as e:
                         LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
-                else:
-                    LOG.info("Reconcile: latest OPEN for %s matches current orientation (sign=%s, signal=%s, date=%s); leaving position as-is.", sym, cur_sign, sp, found_day)
+
+                # If our orientation is unknown (sign=None) but we clearly hold option legs,
+                # and the latest signal indicates opening the *opposite* side (put vs call),
+                # heuristically close to reconcile back to the most recent signal.
+                if cur_sign is None:
+                    # Heuristic: if we hold both sides or ambiguous legs, and the latest signal is OPEN,
+                    # force CLOSE to align with the latest signal's side.
+                    try:
+                        self._run_place_an_order([
+                            "--mode", "force-close",
+                            "--symbols", sym,
+                            "--min-limit", "0.05",
+                            "--quiet"
+                        ])
+                        submitted += 1
+                        LOG.info("Reconcile: submitted CLOSE for %s (ambiguous current position) to align with latest OPEN signal (sign=%s, date=%s).",
+                                 sym, sp, found_day)
+                    except Exception as e:
+                        LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
+
+                LOG.info("Reconcile: latest OPEN for %s matches current orientation (sign=%s, signal=%s, date=%s); leaving position as-is.",
+                         sym, cur_sign, sp, found_day)
+                continue
 
             if is_close:
                 try:
@@ -793,6 +896,14 @@ class DailyCycleManagementMixin:
         """Execute daily trading cycle with guards and logging."""
         now = self._now_ny()
 
+        # Optional diagnostic: force an immediate from-signal OPEN placement using join limits
+        # if DCM_DIAG_OPEN=1 is set in the environment (useful for interactive/testing sessions).
+        if (os.environ.get("DCM_DIAG_OPEN") or "").strip() == "1":
+            try:
+                self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
+            except Exception as e:
+                LOG.warning("Diagnostic open-from-signal step skipped due to error: %s", e)
+
         # Cycle A: Pre-close sweep (convert lingering CLOSE limits to market)
         if self.is_pre_close_window(now):
             LOG.info("Pre-close window detected (%s); running market-conversion sweep.", now)
@@ -861,6 +972,10 @@ class DailyCycleManagementMixin:
                 LOG.info("After-hours placement window (%s): enforcing recent closes + placing from-signal.", now)
                 self._enforce_recent_closes(days=7)
                 self._after_hours_batch_placement()
+                try:
+                    self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
+                except Exception as e:
+                    LOG.warning("Diagnostic open-from-signal (after-hours) failed: %s", e)
             else:
                 LOG.info("Not yet in after-hours placement window at %s; skipping placement.", now)
             return
@@ -904,6 +1019,12 @@ class DailyCycleManagementMixin:
                 self._reconcile_positions_with_signals_lookback(days=21)
             except Exception as e:
                 LOG.warning("Reconcile step skipped due to error: %s", e)
+            # Optional weekend diagnostic if DCM_DIAG_OPEN=1: try placing from-signal with join quotes
+            if (os.environ.get("DCM_DIAG_OPEN") or "").strip() == "1":
+                try:
+                    self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
+                except Exception as e:
+                    LOG.warning("Diagnostic open-from-signal (weekend) failed: %s", e)
 
     def weekly_maintenance(self) -> None:
         """Weekly strategy maintenance with guard to run once per Sunday."""
