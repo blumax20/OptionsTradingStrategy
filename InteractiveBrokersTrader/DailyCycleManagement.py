@@ -258,10 +258,9 @@ class DailyCycleManagementMixin:
         Outside RTH, reconcile current positions against the *latest* signal per symbol
         by scanning only the symbols we currently hold. For each held symbol, walk the
         last `days` of CSVs (newest -> oldest) and stop at the first matching row.
-        If that row's signal is OPEN -> log and skip; if CLOSE -> submit a force-close
-        via PlaceAnOrder. This minimizes work and keeps the decision relevant.
+        If that row's signal is OPEN (and matches orientation) -> log and skip; if CLOSE or mismatched OPEN -> submit a force-close.
         """
-        # 1) Collect currently held option symbols
+        # 1) Collect currently held option symbols and their orientation
         try:
             from ib_insync import IB
         except Exception as e:
@@ -275,9 +274,12 @@ class DailyCycleManagementMixin:
             LOG.warning("Reconcile: could not connect to IB: %s", e)
             return
 
-        held_syms: set[str] = set()
+        # held_info: dict[symbol: str, sign: int|None]
+        held_info: dict[str, int | None] = {}
         try:
             poss = ib.positions()
+            # Gather all option legs per symbol
+            legs_by_sym: dict[str, list[tuple[str, float, float]]] = {}
             for p in poss:
                 c = p.contract
                 if getattr(c, 'secType', '') != 'OPT':
@@ -285,7 +287,43 @@ class DailyCycleManagementMixin:
                 q = float(p.position or 0.0)
                 if abs(q) < 1e-9:
                     continue
-                held_syms.add((getattr(c, 'symbol', '') or '').upper())
+                sym = (getattr(c, 'symbol', '') or '').upper()
+                right = (getattr(c, 'right', '') or '').upper()
+                strike = float(getattr(c, 'strike', 0.0))
+                legs_by_sym.setdefault(sym, []).append((right, strike, q))
+            # For each symbol, try to infer orientation
+            for sym, legs in legs_by_sym.items():
+                sign: int | None = None
+                # Only consider if at least 2 legs
+                if len(legs) >= 2:
+                    # Separate by right
+                    calls = [(strike, qty) for r, strike, qty in legs if r == "CALL"]
+                    puts  = [(strike, qty) for r, strike, qty in legs if r == "PUT"]
+                    call_debit = False
+                    put_debit = False
+                    # For CALLs: qty>0 at lower strike, qty<0 at higher strike (vertical debit)
+                    for i in range(len(calls)):
+                        for j in range(len(calls)):
+                            if i == j: continue
+                            s1, q1 = calls[i]
+                            s2, q2 = calls[j]
+                            if s1 < s2 and q1 > 0 and q2 < 0:
+                                call_debit = True
+                    # For PUTs: qty>0 at higher strike, qty<0 at lower strike (vertical debit)
+                    for i in range(len(puts)):
+                        for j in range(len(puts)):
+                            if i == j: continue
+                            s1, q1 = puts[i]
+                            s2, q2 = puts[j]
+                            if s1 > s2 and q1 > 0 and q2 < 0:
+                                put_debit = True
+                    if call_debit and not put_debit:
+                        sign = +1
+                    elif put_debit and not call_debit:
+                        sign = -1
+                    else:
+                        sign = None
+                held_info[sym] = sign
         except Exception as e:
             LOG.warning("Reconcile: error fetching positions: %s", e)
         finally:
@@ -294,7 +332,7 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-        if not held_syms:
+        if not held_info:
             LOG.info("Reconcile: no open option positions detected.")
             return
 
@@ -309,8 +347,8 @@ class DailyCycleManagementMixin:
 
         looked = 0
         submitted = 0
-        for sym in sorted(held_syms):
-            found_side = None
+        for sym, cur_sign in sorted(held_info.items()):
+            found_row = None
             found_day = None
             # newest -> oldest days
             for d in range(0, max(1, days)):
@@ -319,7 +357,6 @@ class DailyCycleManagementMixin:
                 if not os.path.exists(fp):
                     continue
                 try:
-                    # choose the last occurrence for the day if multiple rows exist
                     last_row = None
                     with open(fp, newline='', encoding='utf-8') as fh:
                         rdr = csv.DictReader(fh)
@@ -327,13 +364,10 @@ class DailyCycleManagementMixin:
                             rsym = (row.get('symbol') or '').strip().upper()
                             if rsym != sym:
                                 continue
-                            last_row = row  # keep walking; last win per day
+                            last_row = row  # last matching row for the day
                     if last_row is None:
                         continue
-                    # we found the latest-for-day; interpret its side
-                    side_raw = (last_row.get('signal_type') or last_row.get('signal_side') or last_row.get('strategy_position') or '')
-                    side = side_raw.strip().lower()
-                    found_side = side
+                    found_row = last_row
                     found_day = dt.date()
                     break  # stop scanning older days for this symbol
                 except Exception as e:
@@ -341,15 +375,53 @@ class DailyCycleManagementMixin:
                     continue
 
             looked += 1
-            if not found_side:
+            if not found_row:
                 LOG.info("Reconcile: no recent signal found within %d day(s) for %s; skipping.", days, sym)
                 continue
 
-            if 'open' in found_side:
-                LOG.info("Reconcile: latest signal for %s is OPEN (on %s); leaving position as-is.", sym, found_day)
-                continue
+            # Extract strategy_position first; fallback to signal_type/signal_side
+            sp_raw = (found_row.get('strategy_position') or '').strip()
+            side_raw = (found_row.get('signal_type') or found_row.get('signal_side') or '')
+            side = side_raw.strip().lower()
+            sp = None
+            try:
+                sp_int = int(sp_raw)
+                if sp_int in (1, -1):
+                    sp = sp_int
+            except Exception:
+                sp = None
 
-            if 'close' in found_side:
+            is_open = False
+            is_close = False
+            # Determine open/close intent
+            if 'close' in side:
+                is_close = True
+            elif 'open' in side:
+                is_open = True
+            elif sp is not None:
+                # If side not clear but sp present, treat as open
+                is_open = True
+
+            if is_open and sp is not None:
+                # If we can infer both current and intended orientation, check for mismatch
+                if cur_sign is not None and sp != cur_sign:
+                    try:
+                        self._run_place_an_order([
+                            "--mode", "force-close",
+                            "--symbols", sym,
+                            "--min-limit", "0.05",
+                            "--quiet"
+                        ])
+                        submitted += 1
+                        LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).", sym, cur_sign, sp, found_day)
+                    except Exception as e:
+                        LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
+                    continue
+                else:
+                    LOG.info("Reconcile: latest OPEN for %s matches current orientation (sign=%s, signal=%s, date=%s); leaving position as-is.", sym, cur_sign, sp, found_day)
+                    continue
+
+            if is_close:
                 try:
                     self._run_place_an_order([
                         "--mode", "force-close",
@@ -363,7 +435,7 @@ class DailyCycleManagementMixin:
                     LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                 continue
 
-            LOG.info("Reconcile: latest signal for %s is '%s' (on %s); no action taken.", sym, found_side, found_day)
+            LOG.info("Reconcile: latest signal for %s is '%s' (on %s); no action taken.", sym, side, found_day)
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
