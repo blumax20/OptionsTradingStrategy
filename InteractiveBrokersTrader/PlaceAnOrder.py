@@ -213,7 +213,7 @@ def parse_args():
                    help="Minimum limit price; orders below this are skipped (or bumped if --bump-to-min).")
     p.add_argument("--bump-to-min", action="store_true",
                    help="If set, limits below --min-limit are bumped up to the minimum instead of skipping.")
-    p.add_argument("--close-tol", type=float, default=0.5,
+    p.add_argument("--close-tol", type=float, default=25.0,
                    help="Strike tolerance for approximate close matching (e.g., 0.5 for $0.50).")
     p.add_argument("--force-close-side", choices=["call","put","both"], default="both",
                    help="Which side(s) to close in --mode force-close.")

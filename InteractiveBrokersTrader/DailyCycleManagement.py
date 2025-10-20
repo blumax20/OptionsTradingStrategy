@@ -28,10 +28,17 @@ WEEKLY_MAINTENANCE_DAY = 6             # Sunday
 MIN_OI_FOR_RTH = 100
 
 def _attempts_csv_path() -> str:
+    """
+    Generate the attempts CSV path under the current date's OptionsHistory folder.
+    Example: C:\\OptionsHistory\\25_10_18\\attempts_25_10_18_151230.csv
+    """
     from datetime import datetime
-    root = r"C:\OptionsHistory\logs" if sys.platform.startswith("win") else "./logs"
+    ny_now = datetime.now(NY)
+    folder = ny_now.strftime("%y_%m_%d")
+    # Use dated folder instead of the logs directory
+    root = fr"C:\OptionsHistory\{folder}" if sys.platform.startswith("win") else f"./{folder}"
     os.makedirs(root, exist_ok=True)
-    stamp = datetime.now(NY).strftime("%y_%m_%d_%H%M%S")
+    stamp = ny_now.strftime("%y_%m_%d_%H%M%S")
     return os.path.join(root, f"attempts_{stamp}.csv")
 
 class _AttemptLogger:
@@ -84,6 +91,146 @@ PLACE_AN_ORDER_PATH = Path(__file__).with_name("PlaceAnOrder.py")
 VENV_PY_WIN = Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
 class DailyCycleManagementMixin:
+
+    def _try_close_from_positions(self, sym: str, prefer: str = "MKT") -> bool:
+        """
+        Best-effort direct close using current IB positions for `sym`.
+        - If a long vertical debit is detected (CALL or PUT), submit a combo close as a BAG:
+            * legs: BUY long leg back? (No) — For closing a long vertical we submit an overall SELL order and specify
+              legs as BUY (lower/call or higher/put) and SELL (higher/call or lower/put) matching the original open.
+              This mirrors IB's combo behavior as used by PlaceAnOrder.
+        - If a short vertical is detected, submit an overall BUY.
+        - If no clean vertical is found but orphan option legs exist, flatten each leg with a market order.
+        - If a stock position is present for `sym`, flatten it (SELL if long, BUY if short).
+        Returns True if at least one order was submitted.
+        """
+        try:
+            from ib_insync import IB, Contract, ComboLeg, ContractDetails, MarketOrder, LimitOrder
+        except Exception as e:
+            LOG.warning("direct-close: ib_insync unavailable: %s", e)
+            return False
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=884, timeout=6)
+        except Exception as e:
+            LOG.warning("direct-close: connect failed: %s", e)
+            return False
+
+        submitted = False
+        up = (sym or '').upper()
+        try:
+            # Collect all open legs for symbol (OPT and STK)
+            poss = ib.positions() or []
+            opt_legs = []   # list of dicts for OPT legs
+            stk_leg  = None # tuple(qty, contract) for stock
+            for p in poss:
+                c = p.contract
+                q = float(p.position or 0.0)
+                if abs(q) < 1e-9:
+                    continue
+                if getattr(c, 'symbol', '').upper() != up:
+                    continue
+                if getattr(c, 'secType', '') == 'OPT':
+                    opt_legs.append({
+                        'conId': c.conId,
+                        'right': getattr(c, 'right', '').upper(),
+                        'strike': float(getattr(c, 'strike', 0.0)),
+                        'qty': q
+                    })
+                elif getattr(c, 'secType', '') == 'STK':
+                    stk_leg = (q, c)
+
+            # Helper to place a combo close
+            def _place_combo(right: str, low: float, high: float, longConId: int, shortConId: int, is_long_vertical: bool) -> bool:
+                try:
+                    bag = Contract()
+                    bag.symbol = up
+                    bag.secType = 'BAG'
+                    bag.exchange = 'SMART'
+                    bag.currency = 'USD'
+                    bag.comboLegs = [
+                        ComboLeg(conId=longConId, ratio=1, action='BUY', exchange='SMART'),
+                        ComboLeg(conId=shortConId, ratio=1, action='SELL', exchange='SMART')
+                    ]
+                    action = 'SELL' if is_long_vertical else 'BUY'
+                    order = MarketOrder(action, 1) if (prefer or 'MKT').upper() == 'MKT' else LimitOrder(action, 1, 0.01)
+                    tr = ib.placeOrder(bag, order)
+                    LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, (prefer or 'MKT').upper())
+                    return True
+                except Exception as e:
+                    LOG.warning("direct-close: combo place failed for %s %s %s/%s: %s", up, right, low, high, e)
+                    return False
+
+            # Try to detect a vertical debit (long) or short vertical for CALLs
+            calls = sorted([l for l in opt_legs if l['right'] == 'C'], key=lambda x: x['strike'])
+            puts  = sorted([l for l in opt_legs if l['right'] == 'P'], key=lambda x: x['strike'])
+
+            # Detect CALL vertical: long + at lower strike and short - at higher strike
+            for i in range(len(calls)):
+                for j in range(i+1, len(calls)):
+                    lo, hi = calls[i], calls[j]
+                    if lo['qty'] > 0 and hi['qty'] < 0:
+                        if _place_combo('CALL', lo['strike'], hi['strike'], lo['conId'], hi['conId'], True):
+                            submitted = True
+                            break
+                    elif lo['qty'] < 0 and hi['qty'] > 0:
+                        # short call vertical (credit) -> close with BUY
+                        if _place_combo('CALL', lo['strike'], hi['strike'], hi['conId'], lo['conId'], False):
+                            submitted = True
+                            break
+                if submitted:
+                    break
+
+            # Detect PUT vertical: long + at higher strike and short - at lower strike
+            if not submitted:
+                for i in range(len(puts)):
+                    for j in range(i+1, len(puts)):
+                        lo, hi = puts[i], puts[j]  # lo has lower strike, hi higher strike
+                        # long put vertical: + at higher (hi), - at lower (lo)
+                        if hi['qty'] > 0 and lo['qty'] < 0:
+                            if _place_combo('PUT', lo['strike'], hi['strike'], hi['conId'], lo['conId'], True):
+                                submitted = True
+                                break
+                        elif hi['qty'] < 0 and lo['qty'] > 0:
+                            # short put vertical -> close with BUY
+                            if _place_combo('PUT', lo['strike'], hi['strike'], lo['conId'], hi['conId'], False):
+                                submitted = True
+                                break
+                    if submitted:
+                        break
+
+            # If no vertical combo placed, flatten orphan option legs
+            if not submitted and opt_legs:
+                for leg in opt_legs:
+                    try:
+                        c = Contract(conId=leg['conId'])
+                        action = 'SELL' if leg['qty'] > 0 else 'BUY'
+                        order = MarketOrder(action, int(abs(leg['qty'])))
+                        ib.placeOrder(c, order)
+                        submitted = True
+                        LOG.info("direct-close: flattened single leg %s %s @ strike %.2f via %s", up, leg['right'], leg['strike'], action)
+                    except Exception as e:
+                        LOG.warning("direct-close: failed to flatten leg %s %s %.2f: %s", up, leg['right'], leg['strike'], e)
+
+            # Flatten stock position if present
+            if stk_leg:
+                qty, c = stk_leg
+                try:
+                    action = 'SELL' if qty > 0 else 'BUY'
+                    order = MarketOrder(action, int(abs(qty)))
+                    ib.placeOrder(c, order)
+                    submitted = True
+                    LOG.info("direct-close: flattened stock position %s qty=%s via %s", up, qty, action)
+                except Exception as e:
+                    LOG.warning("direct-close: failed to flatten stock %s: %s", up, e)
+
+            return submitted
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
     """
     Mixin that provides:
       - robust market session checks (open/after-close) in America/New_York
@@ -359,19 +506,32 @@ class DailyCycleManagementMixin:
         Read the most recent attempts_*.csv from C:\\OptionsHistory\\logs and log a concise summary:
         total placed, and grouped counts for non-placed by 'reason'. Also log last 20 not-placed rows.
         """
-        root = r"C:\OptionsHistory\logs" if sys.platform.startswith("win") else "./logs"
         try:
             import glob, csv, os
-            paths = sorted(glob.glob(os.path.join(root, "attempts_*.csv")), key=os.path.getmtime, reverse=True)
+            # Search today's dated folder first, then logs as a fallback
+            ny_today  = datetime.now(NY).strftime("%y_%m_%d")
+            root_today = fr"C:\OptionsHistory\{ny_today}" if sys.platform.startswith("win") else f"./{ny_today}"
+            root_logs  = r"C:\OptionsHistory\logs" if sys.platform.startswith("win") else "./logs"
+
+            paths = []
+            for root_dir in (root_today, root_logs):
+                if os.path.exists(root_dir):
+                    paths.extend(glob.glob(os.path.join(root_dir, "attempts_*.csv")))
+            # Prefer most recently modified
+            paths = sorted(paths, key=os.path.getmtime, reverse=True)
+
+            # If the active in-memory path exists, put it first
             try:
                 active = getattr(_AttemptLogger, "_active_path", None)
                 if active and os.path.exists(active):
                     paths.insert(0, active)
             except Exception:
                 pass
+
             if not paths:
-                LOG.info("Attempts summary: no attempts_*.csv found in %s", root)
+                LOG.info("Attempts summary: no attempts_*.csv found in %s or %s", root_today, root_logs)
                 return
+
             latest = paths[0]
             placed = 0
             non = {}
@@ -608,7 +768,21 @@ class DailyCycleManagementMixin:
                         except Exception:
                             pass
                         continue
-                    try:
+                    # Try direct close from current positions first (market), then fallback to PlaceAnOrder
+                    if self._try_close_from_positions(sym, prefer='MKT'):
+                        if hasattr(self, "_submitted_close_syms"):
+                            self._submitted_close_syms.add(sym)
+                        submitted += 1
+                        LOG.info("Reconcile: direct-close from positions submitted for %s.", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                                 reason="direct_close_from_positions",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
+                    else:
                         self._run_place_an_order([
                             "--mode", "force-close",
                             "--symbols", sym,
@@ -618,8 +792,7 @@ class DailyCycleManagementMixin:
                         if hasattr(self, "_submitted_close_syms"):
                             self._submitted_close_syms.add(sym)
                         submitted += 1
-                        LOG.info("Reconcile: submitted CLOSE for %s due to mismatched OPEN (current sign=%s, signal=%s, date=%s).",
-                                 sym, cur_sign, sp, found_day)
+                        LOG.info("Reconcile: submitted CLOSE for %s via PlaceAnOrder.", sym)
                         try:
                             _AttemptLogger.write(symbol=sym, action="close", status="submitted",
                                                  reason="reconcile_mismatch",
@@ -628,8 +801,6 @@ class DailyCycleManagementMixin:
                                                  source="dcm-reconcile")
                         except Exception:
                             pass
-                    except Exception as e:
-                        LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
 
                 # If our orientation is unknown (sign=None) but we clearly hold option legs,
@@ -651,7 +822,21 @@ class DailyCycleManagementMixin:
                         except Exception:
                             pass
                         continue
-                    try:
+                    # Try direct close from current positions first (market), then fallback to PlaceAnOrder
+                    if self._try_close_from_positions(sym, prefer='MKT'):
+                        if hasattr(self, "_submitted_close_syms"):
+                            self._submitted_close_syms.add(sym)
+                        submitted += 1
+                        LOG.info("Reconcile: direct-close from positions submitted for %s.", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                                 reason="direct_close_from_positions",
+                                                 exp=found_row.get("expiration",""),
+                                                 right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                                 source="dcm-reconcile")
+                        except Exception:
+                            pass
+                    else:
                         self._run_place_an_order([
                             "--mode", "force-close",
                             "--symbols", sym,
@@ -661,8 +846,7 @@ class DailyCycleManagementMixin:
                         if hasattr(self, "_submitted_close_syms"):
                             self._submitted_close_syms.add(sym)
                         submitted += 1
-                        LOG.info("Reconcile: submitted CLOSE for %s (ambiguous current position) to align with latest OPEN signal (sign=%s, date=%s).",
-                                 sym, sp, found_day)
+                        LOG.info("Reconcile: submitted CLOSE for %s via PlaceAnOrder.", sym)
                         try:
                             _AttemptLogger.write(symbol=sym, action="close", status="submitted",
                                                  reason="reconcile_ambiguous",
@@ -671,8 +855,6 @@ class DailyCycleManagementMixin:
                                                  source="dcm-reconcile")
                         except Exception:
                             pass
-                    except Exception as e:
-                        LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                     continue
 
                 LOG.info("Reconcile: latest OPEN for %s matches current orientation (sign=%s, signal=%s, date=%s); leaving position as-is.",
@@ -701,7 +883,21 @@ class DailyCycleManagementMixin:
                     except Exception:
                         pass
                     continue
-                try:
+                # Try direct close from current positions first (market), then fallback to PlaceAnOrder
+                if self._try_close_from_positions(sym, prefer='MKT'):
+                    if hasattr(self, "_submitted_close_syms"):
+                        self._submitted_close_syms.add(sym)
+                    submitted += 1
+                    LOG.info("Reconcile: direct-close from positions submitted for %s.", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="submitted",
+                                             reason="direct_close_from_positions",
+                                             exp=found_row.get("expiration",""),
+                                             right=(found_row.get("right","") or found_row.get("signal_right","")),
+                                             source="dcm-reconcile")
+                    except Exception:
+                        pass
+                else:
                     self._run_place_an_order([
                         "--mode", "force-close",
                         "--symbols", sym,
@@ -711,7 +907,7 @@ class DailyCycleManagementMixin:
                     if hasattr(self, "_submitted_close_syms"):
                         self._submitted_close_syms.add(sym)
                     submitted += 1
-                    LOG.info("Reconcile: submitted CLOSE for %s based on latest CLOSE signal (on %s).", sym, found_day)
+                    LOG.info("Reconcile: submitted CLOSE for %s via PlaceAnOrder.", sym)
                     try:
                         _AttemptLogger.write(symbol=sym, action="close", status="submitted",
                                              reason="reconcile_close_signal",
@@ -720,8 +916,6 @@ class DailyCycleManagementMixin:
                                              source="dcm-reconcile")
                     except Exception:
                         pass
-                except Exception as e:
-                    LOG.warning("Reconcile: failed to submit CLOSE for %s: %s", sym, e)
                 continue
 
             try:
