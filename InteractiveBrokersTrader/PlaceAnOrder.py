@@ -215,6 +215,12 @@ def parse_args():
                    help="If set, limits below --min-limit are bumped up to the minimum instead of skipping.")
     p.add_argument("--close-tol", type=float, default=25.0,
                    help="Strike tolerance for approximate close matching (e.g., 0.5 for $0.50).")
+    p.add_argument("--close-tol-scale", type=float, default=None,
+               help="Fraction of underlying spot used to derive tolerance (e.g. 0.015 for 1.5%). Overrides --close-tol when set.")
+    p.add_argument("--close-tol-min", type=float, default=2.0,
+               help="Floor for computed tolerance (strike units).")
+    p.add_argument("--close-tol-max", type=float, default=50.0,
+               help="Ceiling for computed tolerance (strike units).")
     p.add_argument("--force-close-side", choices=["call","put","both"], default="both",
                    help="Which side(s) to close in --mode force-close.")
     p.add_argument("--dry-run", action="store_true",

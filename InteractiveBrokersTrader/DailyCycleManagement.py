@@ -38,6 +38,7 @@ def _attempts_csv_path() -> str:
     # Use dated folder instead of the logs directory
     root = fr"C:\OptionsHistory\{folder}" if sys.platform.startswith("win") else f"./{folder}"
     os.makedirs(root, exist_ok=True)
+    LOG.info("Attempt CSV path resolved to: %s", root)
     stamp = ny_now.strftime("%y_%m_%d_%H%M%S")
     return os.path.join(root, f"attempts_{stamp}.csv")
 
@@ -1458,12 +1459,18 @@ if __name__ == "__main__":
         Force daily analysis to be eligible, but otherwise use the normal session logic.
         On weekends or outside RTH this will naturally take the after-close path (including reconcile).
         """
+        def __init__(self):
+            # Reset the active attempts log path on each run to avoid stale logs
+            _AttemptLogger._active_path = None
+            super().__init__()
         def _can_run_daily_analysis(self) -> bool:  # always allow analysis eligibility
             return True
 
     LOG.info("DailyCycleManagement runner starting (analysis enabled; normal session logic)...")
     try:
         r = _Runner()
+        # Reset the active attempts log path before each run to avoid stale logs
+        _AttemptLogger._active_path = None
         r.daily_trading_cycle()
         LOG.info("DailyCycleManagement runner completed.")
         sys.exit(0)
