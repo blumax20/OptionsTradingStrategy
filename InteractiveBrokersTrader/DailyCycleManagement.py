@@ -431,29 +431,120 @@ class DailyCycleManagementMixin:
     # ---------- Mid/End-of-day Helpers (safe, optional) ----------
     def _pre_close_market_conversion(self) -> None:
         """
-        Convert any stubborn CLOSE limit orders to market in the pre-close window.
-        First call the host hook if present, then run a safe force-close sweep via PlaceAnOrder.
+        Pre-close behavior (≈ 15:00 ET):
+        1) Find symbols with working CLOSE limit combo orders (BAG, LMT).
+        2) Confirm the latest signal (incl. today) is CLOSE within 21 days.
+        3) If true, delegate a force close to PlaceAnOrder for that symbol.
         """
-        if hasattr(self, "convert_unfilled_close_limits_to_market"):
-            LOG.info("Pre-close sweep: converting unfilled CLOSE limits to market (host hook)...")
-            try:
-                self.convert_unfilled_close_limits_to_market(cutoff=PRE_CLOSE_SWEEP)
-                LOG.info("Pre-close sweep (host) completed.")
-            except Exception as e:
-                LOG.exception("Pre-close sweep (host) failed: %s", e)
-        else:
-            LOG.info("Pre-close sweep host hook not implemented; using fallback via PlaceAnOrder.")
+        lookback_days = 21
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("Pre-close: ib_insync unavailable: %s", e)
+            return
 
-        # Fallback / reinforcement: force-close anything we can map; allow market fallback in PlaceAnOrder.
-        # Keep min-limit tiny to avoid blocking; tolerate strike drift via --close-tol.
-        self._run_place_an_order([
-            "--mode", "force-close",
-            "--force-close-side", "both",
-            "--min-limit", "0.01",
-            "--close-tol", "2.0",
-            "--use-live-close", "join"
-        ])
-        self._summarize_latest_attempts()
+        def _is_working_close_limit(tr) -> tuple[bool, str | None]:
+            c = getattr(tr, 'contract', None)
+            o = getattr(tr, 'order', None)
+            s = getattr(tr, 'orderStatus', None)
+            if not (c and o and s):
+                return (False, None)
+            if getattr(c, 'secType', '') != 'BAG':
+                return (False, None)
+            action = (getattr(o, 'action', '') or '').upper()
+            # SELL = closing long debit, BUY = closing short credit
+            if action not in ('SELL', 'BUY'):
+                return (False, None)
+            status = (getattr(s, 'status', '') or '').lower()
+            if status in ('filled', 'cancelled', 'apicancelled'):
+                return (False, None)
+            if (getattr(o, 'orderType', '') or '').upper() != 'LMT':
+                return (False, None)
+            sym = (getattr(c, 'symbol', '') or '').upper()
+            return (True, sym)
+
+        def _csv_path_for(dt: datetime) -> str:
+            folder = dt.astimezone(NY).strftime('%y_%m_%d')
+            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
+
+        def _latest_signal_is_close(sym: str, days: int = lookback_days) -> bool:
+            sym = (sym or '').upper()
+            now = self._now_ny()
+            for d in range(0, max(1, days)):
+                fp = _csv_path_for(now - timedelta(days=d))
+                if not os.path.exists(fp):
+                    continue
+                try:
+                    last_row = None
+                    with open(fp, newline='', encoding='utf-8') as fh:
+                        rdr = csv.DictReader(fh)
+                        for row in rdr:
+                            if (row.get('symbol', '') or '').strip().upper() == sym:
+                                last_row = row
+                    if last_row is None:
+                        continue
+                    side_raw = (last_row.get('signal_type') or last_row.get('signal_side') or '').strip().lower()
+                    if 'close' in side_raw:
+                        return True
+                    if 'open' in side_raw:
+                        return False
+                    return False  # ambiguous -> do nothing for safety
+                except Exception as e:
+                    LOG.warning("Pre-close: error reading %s for %s: %s", fp, sym, e)
+                    continue
+            return False
+
+        # Collect working close LMT symbols
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+        except Exception as e:
+            LOG.warning("Pre-close: could not connect to IB: %s", e)
+            return
+
+        try:
+            syms = set()
+            for tr in ib.openTrades() or []:
+                ok, sym = _is_working_close_limit(tr)
+                if ok and sym:
+                    syms.add(sym)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        if not syms:
+            LOG.info("Pre-close: no working CLOSE limit combo orders detected.")
+            try: self._summarize_latest_attempts()
+            except Exception: pass
+            return
+
+        eligible = sorted([s for s in syms if _latest_signal_is_close(s, lookback_days)])
+        skipped  = sorted(list(set(syms) - set(eligible)))
+        if skipped:
+            LOG.info("Pre-close: skipping (latest signal is not CLOSE): %s", ", ".join(skipped))
+
+        if not eligible:
+            LOG.info("Pre-close: no symbols passed the latest-CLOSE filter; nothing to convert/place.")
+            try: self._summarize_latest_attempts()
+            except Exception: pass
+            return
+
+        for sym in eligible:
+            LOG.info("Pre-close: forcing close for %s via PlaceAnOrder (latest signal=CLOSE)", sym)
+            self._run_place_an_order([
+                "--mode", "force-close",
+                "--symbols", sym,
+                "--min-limit", "0.01",
+                "--use-live-close", "join",
+                "--quiet"
+            ])
+
+        try:
+            self._summarize_latest_attempts()
+        except Exception as e:
+            LOG.warning("Attempts summary failed: %s", e)
 
     def _after_hours_batch_placement(self) -> None:
         """
