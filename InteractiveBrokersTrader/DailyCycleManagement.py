@@ -69,12 +69,32 @@ class _AttemptLogger:
             "uid":    kw.get("uid", str(uuid.uuid4())[:8]),
         }
         hdr = list(row.keys())
+        # Write to primary log file (logs folder or wherever _active_path points)
         exists = os.path.exists(path)
         with open(path, "a", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=hdr)
             if not exists:
                 w.writeheader()
             w.writerow(row)
+
+        # Additionally, write to today's dated folder under C:\OptionsHistory\<yy_mm_dd>\attempts_<yy_mm_dd>.csv
+        try:
+            from datetime import datetime
+            import sys
+            # Get today's New York date
+            ny_now = datetime.now(NY)
+            folder = ny_now.strftime("%y_%m_%d")
+            root = fr"C:\OptionsHistory\{folder}" if sys.platform.startswith("win") else f"./{folder}"
+            os.makedirs(root, exist_ok=True)
+            dated_csv = os.path.join(root, f"attempts_{folder}.csv")
+            exists_dated = os.path.exists(dated_csv)
+            with open(dated_csv, "a", newline="", encoding="utf-8") as fh2:
+                w2 = csv.DictWriter(fh2, fieldnames=hdr)
+                if not exists_dated:
+                    w2.writeheader()
+                w2.writerow(row)
+        except Exception as e:
+            LOG.warning("Failed to write to daily attempts CSV: %s", e)
 
 def _ny_csv_path() -> str:
     """
