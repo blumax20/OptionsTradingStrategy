@@ -142,6 +142,45 @@ def _dated_dir(date: datetime | None = None) -> Path:
 def combined_csv_for(date: datetime | None = None) -> Path:
     return _dated_dir(date) / "combined_listener_spreads.csv"
 
+# --- Attempts CSV paths/writers (day-rolled append) ---
+def _attempts_dir(date_override: str | None = None) -> Path:
+    return OUTPUT_BASE / today_folder_yy_mm_dd(date_override)
+
+def _attempts_dayrolled_path(date_override: str | None = None) -> Path:
+    d = _attempts_dir(date_override)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"attempts_{today_folder_yy_mm_dd(date_override)}.csv"
+
+def _attempts_append(rows: list[dict], date_override: str | None = None) -> Path | None:
+    """
+    Append rows to the day-rolled attempts CSV. Creates file and header if missing.
+    Returns the path written or None if nothing to write.
+    """
+    if not rows:
+        return None
+    path = _attempts_dayrolled_path(date_override)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a union header from the rows to preserve fields
+    header_keys: set[str] = set()
+    for r in rows:
+        if isinstance(r, dict):
+            header_keys.update(r.keys())
+    header = sorted(list(header_keys)) if header_keys else sorted(list(rows[0].keys()))
+
+    file_exists = path.exists() and path.stat().st_size > 0
+    try:
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+    except Exception as e:
+        logger.warning(f"Failed to append attempts to {path}: {e}")
+        return None
+    return path
+
 def find_latest_combined_csv() -> Path | None:
     if not OUTPUT_BASE.exists():
         return None
@@ -193,6 +232,42 @@ def record_attempt(symbol: str, action: str, status: str, reason: str, **fields)
         row.update(fields)
     ATTEMPTS.append(row)
     log_decision("attempt", symbol, reason, action=action, status=status, **fields)
+        # Best-effort immediate append so mid-run actions survive early exits
+    try:
+        _attempts_append([row])
+    except Exception:
+        pass
+
+# --- OI gating and RTH detection helpers ---
+def _is_rth(now: datetime | None = None) -> bool:
+    """Return True if now is Regular Trading Hours (Mon-Fri, 09:30–16:00 America/New_York)."""
+    try:
+        tz = ZoneInfo("America/New_York")
+    except Exception:
+        tz = None
+    n = now or (datetime.now(tz) if tz else datetime.now())
+    # Monday=0 ... Friday=5
+    if n.weekday() > 4:
+        return False
+    hh, mm = n.hour, n.minute
+    # 09:30 <= time < 16:00 (inclusive lower, exclusive upper)
+    return (hh > 9 or (hh == 9 and mm >= 30)) and (hh < 16)
+
+def _oi_ok(row: pd.Series, right: str, threshold: int) -> bool:
+    """
+    True if both legs' open interest meet threshold for the given right.
+    Missing/NaN is treated as 0.
+    """
+    try:
+        if right.upper() == 'C':
+            oi1 = float(row.get("open_interest_atm_call") or 0.0)
+            oi2 = float(row.get("open_interest_otm_call") or 0.0)
+        else:
+            oi1 = float(row.get("open_interest_atm_put") or 0.0)
+            oi2 = float(row.get("open_interest_otm_put") or 0.0)
+        return (oi1 >= float(threshold)) and (oi2 >= float(threshold))
+    except Exception:
+        return False
 
 def vprint(enabled: bool, msg: str):
     if enabled:
@@ -233,6 +308,10 @@ def parse_args():
                    help="If not 'off', price OPEN orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = ask(long)-bid(short).")
     p.add_argument("--use-live-close", choices=["off","mid","join"], default="off",
                    help="If not 'off', price CLOSE orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = bid(long)-ask(short).")
+    p.add_argument("--oi-threshold", type=int, default=100,
+                   help="Minimum OI required on BOTH legs to allow OPEN orders (applies per --oi-check).")
+    p.add_argument("--oi-check", choices=["off","rth","always"], default="rth",
+                   help="When to enforce the OI gate for OPEN orders: 'off' (never), 'rth' (only during 09:30–16:00 NY), or 'always'.")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -543,10 +622,34 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             order = MarketOrder(action.upper(), quantity)
             trade = ib.placeOrder(combo, order)
             logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            try:
+                rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                              "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                              "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                              "open_put")
+                record_attempt(symbol, rec_action, "placed", "success",
+                               exp=str(expiration), right=right.upper(),
+                               longK=float(long_strike), shortK=float(short_strike),
+                               order_type="MKT", limit=None,
+                               qty=int(quantity), order_action=action.upper())
+            except Exception:
+                pass       
         else:
             order = LimitOrder(action.upper(), quantity, float(limit_price))
             trade = ib.placeOrder(combo, order)
             logger.info(f"[{symbol}] Placed {right} {'LMT' if action.upper()=='BUY' else 'LMT CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
+            try:
+                rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                              "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                              "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                              "open_put")
+                record_attempt(symbol, rec_action, "placed", "success",
+                               exp=str(expiration), right=right.upper(),
+                               longK=float(long_strike), shortK=float(short_strike),
+                               order_type="LMT", limit=float(limit_price) if limit_price is not None else None,
+                               qty=int(quantity), order_action=action.upper())
+            except Exception:
+                pass        
         return trade
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
@@ -611,6 +714,14 @@ def cancel_open_orders_for_symbol(ib: IB, symbol: str) -> int:
                     ib.cancelOrder(ord_obj)
                     n_cancel += 1
                     logger.info(f"[{symbol}] Cancelled pending OPEN order (id={ord_obj.orderId}, status={status})")
+                    try:
+                        record_attempt(symbol, "cancel_open", "placed", "cancelled",
+                                       exp=getattr(tr.contract, "comboLegsDescrip", ""),
+                                       right="?", longK=None, shortK=None,
+                                       order_id=getattr(ord_obj, "orderId", None),
+                                       prev_status=status)
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.warning(f"[{symbol}] Failed to cancel order {getattr(ord_obj,'orderId',None)}: {e}")
         except Exception:
@@ -647,6 +758,14 @@ def cancel_close_orders_for_symbol(ib: IB, symbol: str) -> int:
                     ib.cancelOrder(ord_obj)
                     n_cancel += 1
                     logger.info(f"[{symbol}] Cancelled pending CLOSE order (id={getattr(ord_obj,'orderId',None)}, status={status})")
+                    try:
+                        record_attempt(symbol, "cancel_close", "placed", "cancelled",
+                                       exp=getattr(tr.contract, "comboLegsDescrip", ""),
+                                       right="?", longK=None, shortK=None,
+                                       order_id=getattr(ord_obj, "orderId", None),
+                                       prev_status=status)
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.warning(f"[{symbol}] Failed to cancel order {getattr(ord_obj,'orderId',None)}: {e}")
         except Exception:
@@ -1198,6 +1317,20 @@ def run_from_csv():
 
             # --- CALL debit spread (ATM long / OTM short) ---
             if allow_call and not pd.isna(k_call):
+                # Early OI gate for CALL opens (applies to both theo/live and fallback paths)
+                _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
+                if _need_oi and not _oi_ok(row, 'C', args.oi_threshold):
+                    try:
+                        oi1 = float(row.get("open_interest_atm_call") or 0.0)
+                        oi2 = float(row.get("open_interest_otm_call") or 0.0)
+                    except Exception:
+                        oi1 = oi2 = 0.0
+                    record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                                   exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
+                                   oth=float(k_call) if not pd.isna(k_call) else None,
+                                   oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
+                    # Skip any CALL open attempts for this row
+                    continue
                 attempted = False
                 live_open_limit = None
                 if getattr(args, "use_live_open", "off") in ("mid","join"):
@@ -1311,6 +1444,20 @@ def run_from_csv():
                                    exp=expiration, atm=float(atm), oth=float(k_call))
             # --- PUT debit spread (ATM long / lower strike short) ---
             if allow_put and not pd.isna(k_put):
+                # Early OI gate for PUT opens (applies to both theo/live and fallback paths)
+                _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
+                if _need_oi and not _oi_ok(row, 'P', args.oi_threshold):
+                    try:
+                        oi1 = float(row.get("open_interest_atm_put") or 0.0)
+                        oi2 = float(row.get("open_interest_otm_put") or 0.0)
+                    except Exception:
+                        oi1 = oi2 = 0.0
+                    record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                                   exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
+                                   oth=float(k_put) if not pd.isna(k_put) else None,
+                                   oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
+                    # Skip any PUT open attempts for this row
+                    continue
                 attempted = False
                 live_open_limit = None
                 if getattr(args, "use_live_open", "off") in ("mid","join"):
@@ -1440,6 +1587,12 @@ def run_from_csv():
     except Exception as e:
         logger.warning(f"Could not write attempts CSV: {e}")
     ib.disconnect()
-
+    # --- Final attempts flush to day-rolled file ---
+    try:
+        out_path = _attempts_append(ATTEMPTS)
+        if out_path:
+            logger.info(f"Wrote attempts (append) to day-rolled file: {out_path}")
+    except Exception as _e:
+        logger.warning(f"Final attempts append failed: {_e}")
 if __name__ == "__main__":
     run_from_csv()
