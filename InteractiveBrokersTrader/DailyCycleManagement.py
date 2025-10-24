@@ -675,6 +675,15 @@ class DailyCycleManagementMixin:
                     continue
             return False
 
+        # Check if today's combined CSV exists (used to decide fallback behavior)
+        try:
+            csv_today_path = _csv_path_for(self._now_ny())
+            csv_exists_today = os.path.exists(csv_today_path)
+            if not csv_exists_today:
+                LOG.warning("Pre-close: today's combined CSV missing at %s; will use positions-based MARKET fallback.", csv_today_path)
+        except Exception:
+            csv_exists_today = False
+
         # Collect working close LMT symbols
         ib = IB()
         try:
@@ -753,8 +762,23 @@ class DailyCycleManagementMixin:
         # Submit conversions/force-closes
         for sym in sorted(close_candidates):
             try:
-                # First preference: if a working close limit exists, convert via PlaceAnOrder join-close;
-                # otherwise, force-close from signal.
+                if not csv_exists_today:
+                    # Fallback path when today's CSV is missing: reconstruct spreads from positions and MKT-close.
+                    did = False
+                    try:
+                        did = self._try_close_from_positions(sym, prefer="MKT")
+                    except Exception as _e:
+                        LOG.warning("Pre-close: positions-fallback close failed for %s: %s", sym, _e)
+                    if did:
+                        self._attempt(symbol=sym, action="close", status="submitted",
+                                      reason="preclose_positions_fallback_csv_missing", source="dcm-preclose")
+                    else:
+                        self._attempt(symbol=sym, action="close", status="skipped",
+                                      reason="preclose_positions_fallback_no_match", source="dcm-preclose")
+                    # Do not attempt PlaceAnOrder when CSV is missing
+                    continue
+
+                # Normal path with CSV present: delegate to PlaceAnOrder first
                 mode = "force-close"
                 argv = [
                     "--mode", mode,
@@ -765,7 +789,27 @@ class DailyCycleManagementMixin:
                 ]
                 self._attempt(symbol=sym, action="close", status="queued", reason="preclose_latest_close", source="dcm-preclose")
                 self._run_place_an_order(argv)
-                self._attempt(symbol=sym, action="close", status="submitted", reason="preclose_latest_close", source="dcm-preclose")
+
+                # If, after delegation, there is still no working CLOSE order for this symbol, force a positions-based MKT close.
+                if not self._has_working_close_order(sym):
+                    did2 = False
+                    try:
+                        did2 = self._try_close_from_positions(sym, prefer="MKT")
+                    except Exception as _e2:
+                        LOG.warning("Pre-close: secondary positions-based close failed for %s: %s", sym, _e2)
+
+                    if did2:
+                        self._attempt(symbol=sym, action="close", status="submitted",
+                                      reason="preclose_positions_secondary", source="dcm-preclose")
+                    else:
+                        # Still nothing to do: record that delegation occurred but no actionable position found to flatten.
+                        self._attempt(symbol=sym, action="close", status="submitted",
+                                      reason="preclose_delegated_no_working_close", source="dcm-preclose")
+                else:
+                    # A working close order exists after delegation
+                    self._attempt(symbol=sym, action="close", status="submitted",
+                                  reason="preclose_delegated_working_close", source="dcm-preclose")
+
             except Exception as e:
                 LOG.warning("Pre-close: submit failed for %s: %s", sym, e)
                 try:
