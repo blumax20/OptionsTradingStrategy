@@ -232,7 +232,7 @@ def record_attempt(symbol: str, action: str, status: str, reason: str, **fields)
         row.update(fields)
     ATTEMPTS.append(row)
     log_decision("attempt", symbol, reason, action=action, status=status, **fields)
-        # Best-effort immediate append so mid-run actions survive early exits
+    # Best-effort immediate append so mid-run actions survive early exits
     try:
         _attempts_append([row])
     except Exception:
@@ -1435,9 +1435,11 @@ def run_from_csv():
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', lv2, quantity=args.quantity)
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
+                                used_exp = new_exp if 'new_exp' in locals() and new_exp else expiration
+                                used_limit = lv2 if 'lv2' in locals() and lv2 is not None else lv
                                 record_attempt(symbol, "open_call", "placed", "success",
-                                               exp=(new_exp if 'new_exp' in locals() and new_exp else expiration),
-                                               atm=float(atm), oth=float(k_call), limit=(theo_call if 'theo_call' in locals() else None))
+                                               exp=(used_exp),
+                                               atm=float(atm), oth=float(k_call), limit=used_limit)
                                 break
                 if allow_call and not attempted:
                     record_attempt(symbol, "open_call", "skipped", "no_viable_limit_or_conditions",
@@ -1495,36 +1497,41 @@ def run_from_csv():
                     elif theo_put is not None:
                         chosen_open_limit = theo_put
                 if chosen_open_limit is not None:
-                    vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {live_open_limit}")
+                    vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {chosen_open_limit}")
                     if args.dry_run:
-                        vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {live_open_limit} x{args.quantity}")
+                        vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {chosen_open_limit} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyP); placed += 1
                         record_attempt(symbol, "open_put", "placed", "success",
-                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=live_open_limit)
+                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
                     else:
-                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', live_open_limit, quantity=args.quantity)
+                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
                             record_attempt(symbol, "open_put", "placed", "success",
-                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=live_open_limit)
+                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
                         else:
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                             if new_exp and new_exp != expiration:
                                 vprint(args.verbose, f"[{symbol}] PUT OPEN retry with refreshed expiration {new_exp}")
-                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_open_limit, quantity=args.quantity)
+                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
                                     record_attempt(symbol, "open_put", "placed", "success",
-                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=live_open_limit)
+                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     if live is not None:
                                         live_limit = enforce_min_limit(live)
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_limit, quantity=args.quantity)
                                         if tr is not None:
-                                            OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
-                                            record_attempt(symbol, "open_put", "placed", "success",
-                                                           exp=new_exp, atm=float(atm), oth=float(k_put), limit=live_limit)
+                                            OPEN_SEEN_KEYS.add(_combo_key(symbol, 'P', new_exp, float(atm), float(k_put)))
+                                            placed += 1
+                                            attempted = True
+                                            used_exp = new_exp if new_exp else expiration
+                                            record_attempt(
+                                                symbol, "open_put", "placed", "success",
+                                                exp=used_exp, atm=float(atm), oth=float(k_put), limit=live_limit
+                                            )
                 # 2) Fallback to debit_limit only when both legs have OI ≥ 100
                 if not attempted:
                     oi_ok = False
@@ -1559,10 +1566,14 @@ def run_from_csv():
                                     if lv2 is not None:
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', lv2, quantity=args.quantity)
                             if tr:
-                                OPEN_SEEN_KEYS.add(keyP); placed += 1
-                                record_attempt(symbol, "open_put", "placed", "success",
-                                               exp=(new_exp if 'new_exp' in locals() and new_exp else expiration),
-                                               atm=float(atm), oth=float(k_put), limit=(theo_put if 'theo_put' in locals() else None))
+                                used_exp = new_exp if 'new_exp' in locals() and new_exp else expiration
+                                used_limit = lv2 if 'lv2' in locals() and lv2 is not None else lv
+                                OPEN_SEEN_KEYS.add(keyP)
+                                placed += 1
+                                record_attempt(
+                                    symbol, "open_put", "placed", "success",
+                                    exp=used_exp, atm=float(atm), oth=float(k_put), limit=used_limit
+                                )
                                 break
                 if allow_put and not attempted:
                     record_attempt(symbol, "open_put", "skipped", "no_viable_limit_or_conditions",
