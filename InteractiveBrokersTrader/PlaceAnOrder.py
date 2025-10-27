@@ -6,6 +6,53 @@ import pandas as pd
 from zoneinfo import ZoneInfo
 import json
 import csv
+# --- Riskless-combo handling ---
+# Epsilon used to "nudge" the net limit when IB rejects a combo as riskless.
+# Can be overridden via env var RISKLESS_EPSILON (e.g., 0.01 or 0.02)
+RISKLESS_EPSILON = float(os.getenv("RISKLESS_EPSILON", "0.01"))
+
+def _was_riskless_reject(trade) -> bool:
+    """
+    Inspect a Trade object's logs/status for IB error 201 'Riskless combination orders are not allowed.'
+    Returns True if such a rejection is detected.
+    """
+    try:
+        # Check orderStatus and log messages for the riskless-combo text
+        msg = ""
+        try:
+            st = getattr(trade, "orderStatus", None)
+            if st and getattr(st, "status", "") in ("Cancelled", "Inactive"):
+                msg = getattr(st, "whyHeld", "") or ""
+        except Exception:
+            pass
+        # Trade.log contains TradeLogEntry with 'message'
+        for le in getattr(trade, "log", []) or []:
+            txt = (getattr(le, "message", "") or "")
+            if "Riskless combination orders are not allowed" in txt:
+                return True
+        # also check msg (rarely present)
+        return "Riskless combination orders are not allowed" in msg
+    except Exception:
+        return False
+
+def _nudge_limit_for_riskless(limit_price: float | None, action: str, eps: float = None) -> float | None:
+    """
+    Return a nudged limit to avoid IB's 'riskless combination' classification.
+    Convention: for SELL(CLOSE) we add +eps; for BUY(OPEN) we subtract eps (but never sub-0.01).
+    """
+    if limit_price is None:
+        return None
+    if eps is None:
+        eps = RISKLESS_EPSILON
+    try:
+        lp = float(limit_price)
+    except Exception:
+        return None
+    if action.upper() == "SELL":
+        return round(max(lp + float(eps), 0.01), 2)
+    else:
+        # BUY
+        return round(max(lp - float(eps), 0.01), 2)
 # --- Normalize symbols (strip exchange prefixes/timeframes/trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     if not raw or not isinstance(raw, str):
@@ -70,8 +117,10 @@ def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
             k_call = row.get("otm_strike_call")
             k_put  = row.get("otm_strike_put")
             # Choose reasonable close limits
-            call_close_limit = best_close_limit(row, 'C')
-            put_close_limit  = best_close_limit(row, 'P')
+            w_call = _spread_width_from_strikes(atm, k_call)
+            w_put  = _spread_width_from_strikes(atm, k_put)
+            call_close_limit = width_aligned_close_limit(row, 'C', w_call)
+            put_close_limit  = width_aligned_close_limit(row, 'P', w_put)
             # Enforce min limit
             def _enforce_min(x):
                 if x is None or (isinstance(x, float) and (math.isnan(x) or x in (float('inf'), float('-inf')))):
@@ -374,6 +423,71 @@ def best_close_limit(row: pd.Series, right: str) -> float | None:
                     pass
     return None
 
+def _spread_width_from_strikes(atm: float | None, oth: float | None) -> float | None:
+    try:
+        if atm is None or oth is None or pd.isna(atm) or pd.isna(oth):
+            return None
+        return float(abs(float(oth) - float(atm)))
+    except Exception:
+        return None
+
+def _width_bucket(width: float | None) -> str | None:
+    """
+    Map a numeric width to the nearest known bucket label used by CSV columns:
+    returns one of {"1","2_5","5"} or None if width is invalid.
+    """
+    if width is None:
+        return None
+    buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0)]
+    lab, _ = min(buckets, key=lambda t: abs(width - t[1]))
+    return lab
+
+def _limit_key_prefix(right: str, kind: str) -> str:
+    """
+    right: 'C' or 'P'
+    kind : 'limit' or 'theo'
+    Returns CSV column prefix, e.g., 'call_debit_limit' or 'put_debit_theo'
+    """
+    base = "call" if right.upper() == "C" else "put"
+    mid  = "debit_limit" if kind == "limit" else "debit_theo"
+    return f"{base}_{mid}"
+
+def _width_aligned_value(row: pd.Series, right: str, kind: str, width_bucket: str) -> float | None:
+    """
+    Try width-aligned column first (e.g., call_debit_limit_2_5), then fall back
+    to the other widths by proximity (nearest 1/2.5/5).
+    """
+    prefix = _limit_key_prefix(right, kind)
+    order = ["1","2_5","5"]
+    order.sort(key=lambda x: abs((1.0 if x=="1" else 2.5 if x=="2_5" else 5.0) -
+                                 (1.0 if width_bucket=="1" else 2.5 if width_bucket=="2_5" else 5.0)))
+    for lab in order:
+        col = f"{prefix}_{lab}"
+        if col in row and row[col] is not None:
+            try:
+                v = float(row[col])
+                if isinstance(v, float) and not (math.isnan(v) or v in (float('inf'), float('-inf'))) and v > 0:
+                    return round(v, 2)
+            except Exception:
+                continue
+    return None
+
+def width_aligned_close_limit(row: pd.Series, right: str, width: float | None) -> float | None:
+    """Close (SELL) price: prefer width-aligned *limit* column; fall back to width-aligned *theo*."""
+    wb = _width_bucket(width)
+    if wb is None:
+        return None
+    v = _width_aligned_value(row, right, "limit", wb)
+    if v is not None:
+        return v
+    return _width_aligned_value(row, right, "theo", wb)
+
+def width_aligned_theoretical(row: pd.Series, right: str, width: float | None) -> float | None:
+    """OPEN (BUY) theoretical debit for a given width bucket."""
+    wb = _width_bucket(width)
+    if wb is None:
+        return None
+    return _width_aligned_value(row, right, "theo", wb)
 
 def qualify_option(ib: IB, symbol: str, expiration: str, strike: float, right: str) -> Option | None:
     try:
@@ -632,8 +746,42 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                                longK=float(long_strike), shortK=float(short_strike),
                                order_type="MKT", limit=None,
                                qty=int(quantity), order_action=action.upper())
+                # Note: a second record is logged if riskless-combo retry is triggered below
             except Exception:
-                pass       
+                pass
+            # If IB classifies the combo as riskless and cancels it instantly, switch to a small-limit with epsilon nudge
+            try:
+                ib.sleep(0.3)
+            except Exception:
+                pass
+            if _was_riskless_reject(trade):
+                # For SELL(CLOSE) nudge up; for BUY(OPEN) nudge down from a tiny anchor
+                anchor = 0.05
+                nudged = _nudge_limit_for_riskless(anchor, action)
+                try:
+                    # Create a new LMT order with the nudged limit
+                    order2 = LimitOrder(action.upper(), quantity, float(nudged))
+                    trade2 = ib.placeOrder(combo, order2)
+                    logger.info(f"[{symbol}] Riskless-combo MKT rejected; resubmitting as LMT @{nudged:.2f} with epsilon nudge ({RISKLESS_EPSILON:.2f})")
+                    try:
+                        record_attempt(symbol,
+                                       ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                                        "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                                        "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                                        "open_put"),
+                                       "placed", "riskless_retry",
+                                       exp=str(expiration), right=right.upper(),
+                                       longK=float(long_strike), shortK=float(short_strike),
+                                       order_type="LMT", prev_order_type="MKT",
+                                       prev_limit=None, limit=float(nudged),
+                                       epsilon=float(RISKLESS_EPSILON),
+                                       qty=int(quantity), order_action=action.upper())
+                    except Exception:
+                        pass
+                    return trade2
+                except Exception as _re:
+                    logger.warning(f"[{symbol}] Riskless-combo retry (MKT→LMT) failed: {_re}")
+            return trade
         else:
             order = LimitOrder(action.upper(), quantity, float(limit_price))
             trade = ib.placeOrder(combo, order)
@@ -648,9 +796,39 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                                longK=float(long_strike), shortK=float(short_strike),
                                order_type="LMT", limit=float(limit_price) if limit_price is not None else None,
                                qty=int(quantity), order_action=action.upper())
+                # Note: a second record is logged if riskless-combo retry is triggered below
             except Exception:
-                pass        
-        return trade
+                pass
+            # Briefly wait and check for IB riskless-combo cancellation; if detected, nudge and resubmit once
+            try:
+                ib.sleep(0.3)
+            except Exception:
+                pass
+            if _was_riskless_reject(trade):
+                nudged = _nudge_limit_for_riskless(float(limit_price), action)
+                try:
+                    order2 = LimitOrder(action.upper(), quantity, float(nudged))
+                    trade2 = ib.placeOrder(combo, order2)
+                    logger.info(f"[{symbol}] Riskless-combo LMT rejected @{float(limit_price):.2f}; resubmitting LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})")
+                    try:
+                        record_attempt(symbol,
+                                       ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                                        "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                                        "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                                        "open_put"),
+                                       "placed", "riskless_retry",
+                                       exp=str(expiration), right=right.upper(),
+                                       longK=float(long_strike), shortK=float(short_strike),
+                                       order_type="LMT", prev_order_type="LMT",
+                                       prev_limit=float(limit_price), limit=float(nudged),
+                                       epsilon=float(RISKLESS_EPSILON),
+                                       qty=int(quantity), order_action=action.upper())
+                    except Exception:
+                        pass
+                    return trade2
+                except Exception as _re:
+                    logger.warning(f"[{symbol}] Riskless-combo retry (LMT→LMT) failed: {_re}")
+            return trade
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
         try:
@@ -1125,7 +1303,10 @@ def run_from_csv():
                     if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm) and not pd.isna(k_call):
                         live_close_limit_c = live_spread_price(ib, symbol, expiration, 'C', float(atm), float(k_call),
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
-                    call_close_limit = (live_close_limit_c if (live_close_limit_c is not None) else enforce_min_limit(best_close_limit(row, 'C')))
+                    w_call = _spread_width_from_strikes(atm, k_call)
+                    call_close_raw = width_aligned_close_limit(row, 'C', w_call)
+                    call_close_limit = (live_close_limit_c if (live_close_limit_c is not None)
+                                        else enforce_min_limit(call_close_raw))
                     if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
@@ -1147,7 +1328,10 @@ def run_from_csv():
                     if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm) and not pd.isna(k_put):
                         live_close_limit_p = live_spread_price(ib, symbol, expiration, 'P', float(atm), float(k_put),
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
-                    put_close_limit = (live_close_limit_p if (live_close_limit_p is not None) else enforce_min_limit(best_close_limit(row, 'P')))
+                    w_put = _spread_width_from_strikes(atm, k_put)
+                    put_close_raw = width_aligned_close_limit(row, 'P', w_put)
+                    put_close_limit = (live_close_limit_p if (live_close_limit_p is not None)
+                                    else enforce_min_limit(put_close_raw))
                     if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
@@ -1234,7 +1418,8 @@ def run_from_csv():
                                                           float(atm), float(hint),
                                                           action='SELL', scheme=args.use_live_close, timeout=3.0)
                         if limit is None:
-                            limit = enforce_min_limit(best_close_limit(row, ('C' if side=='call' else 'P')))
+                            w_call = _spread_width_from_strikes(atm, k_call)
+                            limit = enforce_min_limit(width_aligned_close_limit(row, 'C', w_call))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE CALL skipped; limit below min or missing")
                         else:
@@ -1274,7 +1459,8 @@ def run_from_csv():
                                                           float(atm), float(hint),
                                                           action='SELL', scheme=args.use_live_close, timeout=3.0)
                         if limit is None:
-                            limit = enforce_min_limit(best_close_limit(row, ('C' if side=='call' else 'P')))
+                            w_put = _spread_width_from_strikes(atm, k_put)
+                            limit = enforce_min_limit(width_aligned_close_limit(row, 'P', w_put))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE PUT skipped; limit below min or missing")
                         else:
@@ -1339,8 +1525,10 @@ def run_from_csv():
                     if args.verbose and live_open_limit is not None:
                         vprint(args.verbose, f"[{symbol}] CALL OPEN live({args.use_live_open}) {atm}/{k_call} exp {expiration} @ {live_open_limit}")
                 
-                _raw_theo_call = best_theoretical_limit(row, 'C')
-                _raw_theo_put  = best_theoretical_limit(row, 'P')
+                w_call_open = _spread_width_from_strikes(atm, k_call)
+                w_put_open  = _spread_width_from_strikes(atm, k_put)
+                _raw_theo_call = width_aligned_theoretical(row, 'C', w_call_open)
+                _raw_theo_put  = width_aligned_theoretical(row, 'P', w_put_open)
                 theo_call = enforce_min_limit(_raw_theo_call)
                 theo_put  = enforce_min_limit(_raw_theo_put)
                 keyC = _combo_key(symbol, 'C', expiration, float(atm), float(k_call))
@@ -1415,7 +1603,13 @@ def run_from_csv():
                                        exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
                                        oth=float(k_call) if not pd.isna(k_call) else None)
                     if oi_ok:
-                        for kk in ("call_debit_limit_2_5","call_debit_limit_1","call_debit_limit_5"):
+                        wb = _width_bucket(w_call_open)
+                        ordered = [f"call_debit_limit_{wb}"] if wb else []
+                        for alt in ("1","2_5","5"):
+                            col = f"call_debit_limit_{alt}"
+                            if col not in ordered:
+                                ordered.append(col)
+                        for kk in ordered:
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue
@@ -1467,8 +1661,10 @@ def run_from_csv():
                                                         action='BUY', scheme=args.use_live_open, timeout=3.0)
                     if args.verbose and live_open_limit is not None:
                         vprint(args.verbose, f"[{symbol}] PUT OPEN live({args.use_live_open}) {atm}/{k_put} exp {expiration} @ {live_open_limit}")
-                _raw_theo_call = best_theoretical_limit(row, 'C')
-                _raw_theo_put  = best_theoretical_limit(row, 'P')
+                w_call_open = _spread_width_from_strikes(atm, k_call)
+                w_put_open  = _spread_width_from_strikes(atm, k_put)
+                _raw_theo_call = width_aligned_theoretical(row, 'C', w_call_open)
+                _raw_theo_put  = width_aligned_theoretical(row, 'P', w_put_open)
                 theo_call = enforce_min_limit(_raw_theo_call)
                 theo_put  = enforce_min_limit(_raw_theo_put)
                 keyP = _combo_key(symbol, 'P', expiration, float(atm), float(k_put))
@@ -1547,7 +1743,13 @@ def run_from_csv():
                                        exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
                                        oth=float(k_put) if not pd.isna(k_put) else None)
                     if oi_ok:
-                        for kk in ("put_debit_limit_2_5","put_debit_limit_1","put_debit_limit_5"):
+                        wb = _width_bucket(w_put_open)
+                        ordered = [f"put_debit_limit_{wb}"] if wb else []
+                        for alt in ("1","2_5","5"):
+                            col = f"put_debit_limit_{alt}"
+                            if col not in ordered:
+                                ordered.append(col)
+                        for kk in ordered:
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue

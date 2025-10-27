@@ -108,6 +108,8 @@ def _ny_csv_path() -> str:
 # ----- External runner for PlaceAnOrder.py (used as a fallback/orchestration hook) -----
 # Resolve script path relative to this file
 PLACE_AN_ORDER_PATH = Path(__file__).with_name("PlaceAnOrder.py")
+# Liquidity filter/enricher (used to populate OI into today's combined CSV)
+LIQUIDITY_FILTER_PATH = Path(__file__).with_name("LiquidityFilter.py")
 # Try to use repo-local venv on Windows; otherwise fall back to current interpreter
 VENV_PY_WIN = Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
@@ -457,6 +459,72 @@ class DailyCycleManagementMixin:
             pass
         return sys.executable
 
+    def _run_liquidity_filter_for_folder(self, folder_yy_mm_dd: str, only_rth: bool = True, timeout: int = 600) -> None:
+        """
+        Launch LiquidityFilter.py for a specific C:\OptionsHistory\<yy_mm_dd> folder.
+        """
+        python = self._python_executable()
+        script = str(LIQUIDITY_FILTER_PATH)
+        argv = [python, script, "--day-dir", fr"C:\OptionsHistory\{folder_yy_mm_dd}"]
+        if only_rth:
+            argv.append("--only-rth")
+        LOG.info("Launching LiquidityFilter for %s%s", folder_yy_mm_dd, " (only_rth)" if only_rth else "")
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            if proc.stdout:
+                LOG.info("[LiquidityFilter stdout]\n%s", proc.stdout.strip())
+            if proc.stderr:
+                LOG.warning("[LiquidityFilter stderr]\n%s", proc.stderr.strip())
+            if proc.returncode != 0:
+                LOG.error("LiquidityFilter exited with code %s for %s", proc.returncode, folder_yy_mm_dd)
+        except subprocess.TimeoutExpired:
+            LOG.error("LiquidityFilter timed out after %ss for %s", timeout, folder_yy_mm_dd)
+        except FileNotFoundError:
+            LOG.error("LiquidityFilter.py not found at %s", script)
+        except Exception as e:
+            LOG.exception("Failed to launch LiquidityFilter for %s: %s", folder_yy_mm_dd, e)
+
+    def _prev_trading_day_folder(self, ref_dt: datetime | None = None) -> str:
+        """
+        Return YY_MM_DD string for the previous *trading* day (skips Sat/Sun).
+        If ref_dt is Monday, this returns the prior Friday.
+        """
+        dt = (ref_dt or self._now_ny()).date()
+        from datetime import timedelta
+        d = dt - timedelta(days=1)
+        # Skip weekend days
+        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+            d -= timedelta(days=1)
+        return d.strftime("%y_%m_%d")
+
+    def _enrich_today_and_prev_trading_day(self, only_rth: bool = True) -> None:
+        """
+        Run LiquidityFilter for today's folder and the previous trading day's folder.
+        """
+        try:
+            today_folder = self._now_ny().strftime("%y_%m_%d")
+        except Exception:
+            from datetime import datetime
+            today_folder = datetime.now(NY).strftime("%y_%m_%d")
+        prev_folder = self._prev_trading_day_folder()
+        self._run_liquidity_filter_for_folder(today_folder, only_rth=only_rth)
+        # Avoid duplicate run if prev == today (shouldn't happen, but safe)
+        if prev_folder != today_folder:
+            self._run_liquidity_filter_for_folder(prev_folder, only_rth=only_rth)
+
+    def _run_liquidity_filter(self, only_rth: bool = True, timeout: int = 600) -> None:
+        """
+        Best-effort launcher for LiquidityFilter.py to enrich today's combined CSV with OI (and other fields).
+        When `only_rth` is True, the script will no-op outside RTH.
+        """
+        try:
+            ny_now = self._now_ny()
+        except Exception:
+            from datetime import datetime
+            ny_now = datetime.now(NY)
+        folder = ny_now.strftime("%y_%m_%d")
+        self._run_liquidity_filter_for_folder(folder, only_rth=only_rth, timeout=timeout)
+
     def _has_working_close_order(self, sym: str) -> bool:
         """
         Return True if there is an existing working CLOSE order (SELL combo) for the given symbol.
@@ -489,6 +557,58 @@ class DailyCycleManagementMixin:
                     if st not in ("filled", "cancelled", "apicancelled"):
                         return True
             return False
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    def _flatten_stock_if_present(self, sym: str) -> bool:
+        """
+        If there is an open STOCK (STK) position for `sym`, flatten it with a MARKET order.
+        Returns True if a stock order was submitted.
+        """
+        try:
+            from ib_insync import IB, Contract, MarketOrder
+        except Exception as e:
+            LOG.warning("flatten-stock: ib_insync unavailable: %s", e)
+            return False
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=881, timeout=6)
+        except Exception as e:
+            LOG.warning("flatten-stock: connect failed: %s", e)
+            return False
+
+        submitted = False
+        up = (sym or "").upper()
+        try:
+            for p in ib.positions() or []:
+                c = getattr(p, "contract", None)
+                if getattr(c, "secType", "") != "STK":
+                    continue
+                if (getattr(c, "symbol", "") or "").upper() != up:
+                    continue
+                qty = float(getattr(p, "position", 0.0) or 0.0)
+                if abs(qty) < 1e-9:
+                    continue
+                try:
+                    action = "SELL" if qty > 0 else "BUY"
+                    ord_qty = int(abs(qty))
+                    order = MarketOrder(action, ord_qty)
+                    ib.placeOrder(c, order)
+                    submitted = True
+                    LOG.info("flatten-stock: submitted %s %s x%d via MKT (weekly/reconcile path)", up, action, ord_qty)
+                    try:
+                        _AttemptLogger.write(symbol=up, action="close_stock", status="submitted",
+                                             reason="reconcile_close_signal",
+                                             exp="", right="STK", source="dcm-reconcile")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    LOG.warning("flatten-stock: failed to place stock close for %s: %s", up, e)
+            return submitted
         finally:
             try:
                 ib.disconnect()
@@ -1239,6 +1359,12 @@ class DailyCycleManagementMixin:
                                          source="dcm-reconcile")
                 except Exception:
                     pass
+                # Also flatten any STOCK position for this symbol when the latest signal is CLOSE
+                try:
+                    if self._flatten_stock_if_present(sym):
+                        LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
+                except Exception as _e_stk:
+                    LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
                 continue
 
             try:
@@ -1469,6 +1595,11 @@ class DailyCycleManagementMixin:
         live open interest (from IB market data) greater than MIN_OI_FOR_RTH. This uses generic tick 101
         (OPTION_OPEN_INTEREST) to fetch current OI for each leg.
         """
+        # Ensure today's and previous trading day's CSVs have fresh OI before any OI-based cleanup logic
+        try:
+            self._enrich_today_and_prev_trading_day(only_rth=True)
+        except Exception:
+            LOG.warning("RTH cleanup: failed to run LiquidityFilter pre-hook (today+prev); continuing with live OI checks.")
         try:
             from ib_insync import IB, Contract, ContractDetails, Ticker
         except Exception as e:
@@ -1586,6 +1717,33 @@ class DailyCycleManagementMixin:
         an OI guard. We only cancel when we can positively read OI for both legs from the CSV.
         Preference order for OI data: today first, then yesterday (… up to `lookback_days`).
         """
+        # Populate OI in combined CSVs first (today and previous trading day)
+        try:
+            self._enrich_today_and_prev_trading_day(only_rth=True)
+        except Exception:
+            LOG.warning("CSV OI cancel: failed to run LiquidityFilter pre-hook (today+prev); CSV may lack OI columns.")
+    def run_rth_open_cleanup(self) -> None:
+        """
+        Call this once shortly after the market opens (~09:35 ET).
+        Ensures OI is enriched for today and previous trading day, then cancels low-OI working orders
+        using both CSV-based and live-OI checks.
+        """
+        now = self._now_ny()
+        if not self._is_trading_day(now):
+            LOG.info("09:35 cleanup skipped: not a trading day.")
+            return
+        t = now.time()
+        if t < time(9, 35):
+            LOG.info("09:35 cleanup skipped: current time %s is before 09:35 ET.", t.strftime("%H:%M"))
+            return
+        # Enrich and cleanup
+        self._enrich_today_and_prev_trading_day(only_rth=True)
+        self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=2)
+        self._rth_liquidity_cleanup()
+        try:
+            self._summarize_latest_attempts()
+        except Exception as e:
+            LOG.warning("Attempts summary failed after 09:35 cleanup: %s", e)
         try:
             from ib_insync import IB, Contract
         except Exception as e:
