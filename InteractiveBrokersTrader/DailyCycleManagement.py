@@ -795,6 +795,69 @@ class DailyCycleManagementMixin:
                     continue
             return False
 
+        def _latest_open_sign(sym: str, days: int = lookback_days) -> int | None:
+            """
+            Return +1 if the latest signal within `days` is CALL_OPEN, -1 if PUT_OPEN, or the
+            integer value of strategy_position when side not explicit. Returns None if not found.
+            Newest to oldest scan; stops at the first match for the symbol.
+            """
+            sym = (sym or '').upper()
+            now = self._now_ny()
+            def _csv_path_for(dt: datetime) -> str:
+                folder = dt.astimezone(NY).strftime('%y_%m_%d')
+                return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
+            for d in range(0, max(1, days)):
+                fp = _csv_path_for(now - timedelta(days=d))
+                if not os.path.exists(fp):
+                    continue
+                try:
+                    last_row = None
+                    with open(fp, newline='', encoding='utf-8') as fh:
+                        rdr = csv.DictReader(fh)
+                        for row in rdr:
+                            if (row.get('symbol', '') or '').strip().upper() == sym:
+                                last_row = row
+                    if last_row is None:
+                        continue
+                    side_raw = (last_row.get('signal_type') or last_row.get('signal_side') or '').strip().lower()
+                    if 'open' in side_raw:
+                        # try to infer by explicit right columns if present
+                        r = (last_row.get('right') or last_row.get('signal_right') or '').strip().upper()
+                        if r == 'C':
+                            return +1
+                        if r == 'P':
+                            return -1
+                        # otherwise map common field hints
+                        if 'call' in side_raw:
+                            return +1
+                        if 'put' in side_raw:
+                            return -1
+                        # final fallback: strategy_position column if present
+                        sp = (last_row.get('strategy_position') or '').strip()
+                        try:
+                            sp_i = int(sp)
+                            if sp_i in (1, -1):
+                                return sp_i
+                        except Exception:
+                            pass
+                        return None
+                    elif 'close' in side_raw:
+                        # explicit close -> no open sign
+                        return None
+                    else:
+                        # ambiguous -> try strategy_position as a weak hint
+                        sp = (last_row.get('strategy_position') or '').strip()
+                        try:
+                            sp_i = int(sp)
+                            if sp_i in (1, -1):
+                                return sp_i
+                        except Exception:
+                            pass
+                except Exception as e:
+                    LOG.warning("Pre-close: error reading %s for %s: %s", fp, sym, e)
+                    continue
+            return None
+
         # Check if today's combined CSV exists (used to decide fallback behavior)
         try:
             csv_today_path = _csv_path_for(self._now_ny())
@@ -836,42 +899,70 @@ class DailyCycleManagementMixin:
         # Merge sources: (A) working close LMT symbols, (B) held symbols with latest signal=CLOSE
         work_syms = set(syms)
 
-        # Collect currently held symbols from positions (OPT only)
+        # Collect currently held symbols from positions (OPT only) and infer orientation (+1 CALL debit, -1 PUT debit, None unknown)
         held_syms = set()
+        held_signs: dict[str, int | None] = {}
         try:
             ib2 = IB()
             ib2.connect('127.0.0.1', 7497, clientId=889, timeout=6)
+            legs_by_sym: dict[str, list[tuple[str, float, float]]] = {}
             for p in ib2.positions() or []:
                 c = getattr(p, 'contract', None)
                 if getattr(c, 'secType', '') != 'OPT':
                     continue
                 s = (getattr(c, 'symbol', '') or '').upper()
-                if s:
-                    held_syms.add(s)
+                if not s:
+                    continue
+                held_syms.add(s)
+                r = (getattr(c, 'right', '') or '').upper()  # 'C' or 'P'
+                k = float(getattr(c, 'strike', 0.0))
+                q = float(getattr(p, 'position', 0.0) or 0.0)
+                legs_by_sym.setdefault(s, []).append((r, k, q))
+            # Infer per-symbol orientation
+            for s, legs in legs_by_sym.items():
+                sign: int | None = None
+                calls = sorted([(k, q) for r, k, q in legs if r == 'C'])
+                puts  = sorted([(k, q) for r, k, q in legs if r == 'P'])
+                call_debit = any(k1 < k2 and q1 > 0 and q2 < 0 for (k1, q1) in calls for (k2, q2) in calls if k1 < k2)
+                put_debit  = any(k1 > k2 and q1 > 0 and q2 < 0 for (k1, q1) in puts  for (k2, q2) in puts  if k1 > k2)
+                if call_debit and not put_debit:
+                    sign = +1
+                elif put_debit and not call_debit:
+                    sign = -1
+                else:
+                    sign = None
+                held_signs[s] = sign
         except Exception as e:
-            LOG.warning("Pre-close: failed to load held symbols: %s", e)
+            LOG.warning("Pre-close: failed to load held symbols/signs: %s", e)
         finally:
             try:
                 ib2.disconnect()
             except Exception:
                 pass
 
-        # Symbols that should be closed because latest signal is CLOSE
+        # Symbols that should be closed because latest signal is CLOSE **or** orientation-mismatch with latest OPEN
         close_candidates = set()
+        non_candidates = []
         for s in sorted(work_syms | held_syms):
             try:
                 if _latest_signal_is_close(s, lookback_days):
                     close_candidates.add(s)
+                    continue
+                # orientation-mismatch path
+                open_sign = _latest_open_sign(s, lookback_days)
+                cur_sign  = held_signs.get(s)
+                if (open_sign is not None) and (cur_sign is not None) and (open_sign != cur_sign):
+                    close_candidates.add(s)
+                else:
+                    non_candidates.append(s)
             except Exception as e:
-                LOG.warning("Pre-close: latest-close check failed for %s: %s", s, e)
+                LOG.warning("Pre-close: candidate eval failed for %s: %s", s, e)
 
-        # Log and split those that were skipped due to latest signal not being CLOSE
-        not_close = sorted(list((work_syms | held_syms) - close_candidates))
-        if not_close:
-            LOG.info("Pre-close: skipping (latest signal is not CLOSE): %s", ", ".join(not_close))
+        if non_candidates:
+            LOG.info("Pre-close: skipping (no close or no mismatch): %s", ", ".join(sorted(non_candidates)))
 
         if not close_candidates:
-            LOG.info("Pre-close: no symbols passed latest-CLOSE/held filter; nothing to convert/place.")
+            LOG.info("Pre-close: no symbols passed latest-CLOSE/mismatch filter; nothing to convert/place.")
             try:
                 self._attempt(action="preclose", status="skipped", reason="no_candidates", source="dcm-preclose")
                 self._summarize_latest_attempts()
@@ -927,8 +1018,16 @@ class DailyCycleManagementMixin:
                                       reason="preclose_delegated_no_working_close", source="dcm-preclose")
                 else:
                     # A working close order exists after delegation
+                    reason = "preclose_delegated_working_close"
+                    try:
+                        osign = _latest_open_sign(sym, lookback_days)
+                        csign = held_signs.get(sym)
+                        if (osign is not None) and (csign is not None) and (osign != csign):
+                            reason = "preclose_delegated_working_close_mismatch"
+                    except Exception:
+                        pass
                     self._attempt(symbol=sym, action="close", status="submitted",
-                                  reason="preclose_delegated_working_close", source="dcm-preclose")
+                                  reason=reason, source="dcm-preclose")
 
             except Exception as e:
                 LOG.warning("Pre-close: submit failed for %s: %s", sym, e)
