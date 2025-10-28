@@ -246,7 +246,7 @@ def find_latest_combined_csv() -> Path | None:
     return candidates[0][1]
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("PlaceAnOrder")
 
 # ---- Structured health/decision logging (machine-readable) ----
@@ -1100,6 +1100,101 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
         # cleanup any zeroed entries (not strictly necessary)
     return placed
 
+def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = None, max_qty: int = 1):
+    """
+    Yield (exp, right, longK, shortK, qty) for each detectable vertical debit spread
+    in current positions for `symbol`. If `side` is 'call' or 'put', restrict to that right.
+    """
+    from collections import defaultdict
+    symbol_u = (symbol or "").upper()
+    side_set = {"call", "put"} if not side else {side.lower()}
+    buckets = defaultdict(lambda: {"longs": defaultdict(float), "shorts": defaultdict(float)})  # key=(exp,right)
+
+    for p in ib.positions():
+        c = getattr(p, "contract", None)
+        if not c or getattr(c, "secType", "") != "OPT":
+            continue
+        if getattr(c, "symbol", "").upper() != symbol_u:
+            continue
+        exp = getattr(c, "lastTradeDateOrContractMonth", "")
+        right = getattr(c, "right", "").upper()
+        if right not in ("C", "P"):
+            continue
+        if (right == "C" and "call" not in side_set) or (right == "P" and "put" not in side_set):
+            continue
+        strike = float(getattr(c, "strike", 0.0))
+        qty = float(getattr(p, "position", 0.0))
+        key = (exp, right)
+        if qty > 0:
+            buckets[key]["longs"][strike] += qty
+        elif qty < 0:
+            buckets[key]["shorts"][strike] += abs(qty)
+
+    # Pair by closest compatible strike: calls short>long, puts short<long
+    for (exp, right), d in buckets.items():
+        longs = sorted(d["longs"].items())
+        shorts = sorted(d["shorts"].items())
+        if not longs or not shorts:
+            continue
+        for ls, lq in longs:
+            cands = [(ss, sq) for ss, sq in shorts if ((ss > ls) if right == "C" else (ss < ls)) and sq > 0]
+            if not cands:
+                continue
+            ss, sq = min(cands, key=lambda t: abs(t[0] - ls))
+            qty = int(min(lq, sq, max_qty))
+            if qty > 0:
+                yield (exp, right, float(ls), float(ss), int(qty))
+
+def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
+    """
+    Close any detectable vertical debit spread(s) for `symbol` directly from positions,
+    even if `symbol` isn't in today's CSV. Returns number of orders submitted.
+
+    Pricing preference:
+      1) If --use-live-close in {'join','mid'} => compute a limit via live_spread_price and place LMT.
+      2) Else => place MARKET order.
+    Respects --min-limit (and --bump-to-min) when a live price exists.
+    Always records an attempts row so attempts CSV is created.
+    """
+    submitted = 0
+    side_opt = None if getattr(args, "force_close_side", "both") == "both" else getattr(args, "force_close_side")
+
+    any_pair = False
+    for exp, right, longK, shortK, qty in _iter_spread_pairs_from_positions(ib, symbol, side=side_opt, max_qty=args.quantity):
+        any_pair = True
+        limit = None
+        scheme = getattr(args, "use_live_close", "off")
+        if scheme in ("join", "mid"):
+            lim = live_spread_price(ib, symbol, exp, right, longK, shortK,
+                                    action="SELL", scheme=scheme, timeout=3.0)
+            if lim is not None:
+                try:
+                    v = float(lim)
+                    limit = args.min_limit if (v < args.min_limit and getattr(args, "bump_to_min", False)) else (v if v >= args.min_limit else None)
+                except Exception:
+                    limit = None
+
+        order_type = "LMT" if (limit is not None) else "MKT"
+        tr = place_debit_spread(ib, symbol, exp, longK, shortK, right, limit,
+                                quantity=qty, action="SELL", order_type=order_type)
+        if tr is not None:
+            submitted += 1
+            record_attempt(symbol, "force_close", "placed", "positions_fallback",
+                           exp=str(exp), right=right, longK=float(longK), shortK=float(shortK),
+                           order_type=order_type, limit=(float(limit) if limit is not None else None),
+                           qty=int(qty), scheme=scheme)
+        else:
+            record_attempt(symbol, "force_close", "error", "place_failed_positions",
+                           exp=str(exp), right=right, longK=float(longK), shortK=float(shortK),
+                           order_type=order_type, limit=(float(limit) if limit is not None else None),
+                           qty=int(qty))
+
+    if not any_pair:
+        # Ensure attempts CSV exists and tell you why nothing fired
+        record_attempt(symbol, "force_close", "skipped", "no_spread_in_positions")
+
+    return submitted
+
 def run_from_csv():
     args = parse_args()
     if args.verbose:
@@ -1107,9 +1202,14 @@ def run_from_csv():
     # Quiet console noise if requested
     if getattr(args, "quiet", False) and not getattr(args, "verbose", False):
         try:
-            logging.getLogger("ib_insync").setLevel(logging.WARNING)
-            logging.getLogger("ib_insync.wrapper").setLevel(logging.WARNING)
-            logging.getLogger("ib_insync.client").setLevel(logging.WARNING)
+            # Quiet our root logger
+            logging.getLogger().setLevel(logging.WARNING)
+            # Silence ib_insync chatter (positions/updatePortfolio are INFO on wrapper)
+            logging.getLogger("ib_insync").setLevel(logging.ERROR)
+            logging.getLogger("ib_insync.wrapper").setLevel(logging.ERROR)
+            logging.getLogger("ib_insync.client").setLevel(logging.ERROR)
+            # Also mute the 'ibapi' package if present
+            logging.getLogger("ibapi").setLevel(logging.ERROR)
             # turn off ib_insync's console log mirroring
             try:
                 _ibutil.logToConsole(False)
@@ -1194,6 +1294,19 @@ def run_from_csv():
     except Exception as e:
         logger.error(f"Failed to connect to IB: {e}")
         return
+
+    # --- Positions-driven force-close for explicitly requested symbols (CSV-independent) ---
+    # This runs even if today's CSV has ZERO rows for the requested tickers (e.g., ABR missing).
+    if args.mode == "force-close" and args.symbols:
+        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
+        for _sym in sorted(_syms_req):
+            if args.dry_run:
+                # still write a diagnostic attempt so attempts CSV is created
+                record_attempt(_sym, "force_close", "skipped", "dry_run_positions_only")
+            else:
+                n_fc = force_close_symbol_via_positions(ib, _sym, args)
+                if n_fc > 0:
+                    logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
 
     # If this batch contains CLOSE signals, proactively cancel any pending BUY combo orders for those tickers
     if 'close_set' in locals() or 'close_mask' in locals():
@@ -1408,6 +1521,7 @@ def run_from_csv():
                 allow_put = True
             # --- force-close mode ---
             if args.mode == "force-close":
+                # Note: explicit --symbols were already handled above (CSV-independent).
                 sides = ["call","put"] if args.force_close_side == "both" else [args.force_close_side]
                 for side in sides:
                     if side == "call":
