@@ -341,7 +341,7 @@ def parse_args():
     p.add_argument("--close-tol", type=float, default=25.0,
                    help="Strike tolerance for approximate close matching (e.g., 0.5 for $0.50).")
     p.add_argument("--close-tol-scale", type=float, default=None,
-               help="Fraction of underlying spot used to derive tolerance (e.g. 0.015 for 1.5%). Overrides --close-tol when set.")
+               help="Fraction of underlying spot used to derive tolerance (e.g. 0.015 for 1.5%%). Overrides --close-tol when set.")
     p.add_argument("--close-tol-min", type=float, default=2.0,
                help="Floor for computed tolerance (strike units).")
     p.add_argument("--close-tol-max", type=float, default=50.0,
