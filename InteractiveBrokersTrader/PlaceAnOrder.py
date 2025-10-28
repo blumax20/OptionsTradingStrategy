@@ -152,14 +152,18 @@ def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
                 if call_close_limit is not None:
                     a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'C', float(atm) if not pd.isna(atm) else None, float(k_call) if not pd.isna(k_call) else None, tol=args.close_tol, max_qty=args.quantity)
                     if qty > 0:
-                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'C', call_close_limit, quantity=qty, action='SELL')
-                        logger.info(f"[{symbol}] Weekly-enforce CLOSE CALL(approx) {a_atm}/{a_oth} exp {expiration} @ {call_close_limit}")
-                        closed_any = True
+                        tr = place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'C', call_close_limit, quantity=qty, action='SELL')
+                        if tr is not None:
+                            CLOSE_SEEN_KEYS.add(_close_key(symbol, 'C', expiration))
+                            logger.info(f"[{symbol}] Weekly-enforce CLOSE CALL(approx) {a_atm}/{a_oth} exp {expiration} @ {call_close_limit}")
+                            closed_any = True
                 if not closed_any and put_close_limit is not None:
                     a_atm, a_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P', float(atm) if not pd.isna(atm) else None, float(k_put) if not pd.isna(k_put) else None, tol=args.close_tol, max_qty=args.quantity)
                     if qty > 0:
-                        place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', put_close_limit, quantity=qty, action='SELL')
-                        logger.info(f"[{symbol}] Weekly-enforce CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {put_close_limit}")
+                        tr = place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', put_close_limit, quantity=qty, action='SELL')
+                        if tr is not None:
+                            CLOSE_SEEN_KEYS.add(_close_key(symbol, 'P', expiration))
+                            logger.info(f"[{symbol}] Weekly-enforce CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {put_close_limit}")
             # Final market fallback if nothing closed (mandated closure within window)
             if not closed_any and not pd.isna(atm):
                 if not pd.isna(k_call):
@@ -622,9 +626,19 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
         except Exception: pass
 # --- De-duplication helpers for opens (idempotency per run) ---
 OPEN_SEEN_KEYS: set[str] = set()
+# Prevent duplicate CLOSE submissions per (symbol, exp, right) in a single run
+CLOSE_SEEN_KEYS: set[str] = set()
+# Prevent more than one OPEN per (symbol, side) per run
+OPEN_PLACED_THIS_RUN: set[str] = set()
 
+def _open_side_key(symbol: str, right: str) -> str:
+    return f"{(symbol or '').upper()}|{right.upper()}"
+def _close_key(symbol: str, right: str, exp: str) -> str:
+    return f"{(symbol or '').upper()}|{right.upper()}|{exp}"
 def _combo_key(symbol: str, right: str, exp: str, longK: float, shortK: float) -> str:
-    return f"{symbol.upper()}|{right.upper()}|{exp}|{float(longK):.4f}|{float(shortK):.4f}"
+    lk = round(float(longK), 2)
+    sk = round(float(shortK), 2)
+    return f"{symbol.upper()}|{right.upper()}|{exp}|{lk:.2f}|{sk:.2f}"
 
 def has_working_open_order(ib: IB, symbol: str, exp: str, right: str, longK: float, shortK: float) -> bool:
     """
@@ -861,7 +875,13 @@ def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: 
     if n <= 0:
         logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
         return False
+    ckey = _close_key(symbol, right, expiration)
+    if ckey in CLOSE_SEEN_KEYS:
+        logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {expiration}; skipping")
+        return False
     trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, None, quantity=n, action='SELL', order_type='MKT')
+    if trade is not None:
+        CLOSE_SEEN_KEYS.add(ckey)
     return trade is not None
 
 # --- Cancel any pending/working OPEN (BUY) combo orders for a symbol ---
@@ -979,10 +999,16 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, at
     if n <= 0:
         logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
         return False
-
+    ckey = _close_key(symbol, right, expiration)
+    if ckey in CLOSE_SEEN_KEYS:
+        logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {expiration}; skipping")
+        return False
     # SELL the combo to close
     trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, limit_price, quantity=n, action='SELL')
+    if trade is not None:
+        CLOSE_SEEN_KEYS.add(ckey)
     return trade is not None
+
 
 # --- Approximate spread finder for closing ---
 def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str,
@@ -1091,12 +1117,18 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
             if n <= 0:
                 continue
             # Place MARKET SELL combo using the actual expiration from the position legs
+            ckey = _close_key(symbol, right, exp)
+            if ckey in CLOSE_SEEN_KEYS:
+                logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
+                continue
             tr = place_debit_spread(ib, symbol, exp, float(ls), float(ss), right, None, quantity=n, action='SELL', order_type='MKT')
             if tr is not None:
                 placed += 1
                 # decrement used qty
                 d['longs'][ls] -= n
                 d['shorts'][ss] -= n
+            if tr is not None:
+                CLOSE_SEEN_KEYS.add(ckey)      
         # cleanup any zeroed entries (not strictly necessary)
     return placed
 
@@ -1175,9 +1207,14 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     limit = None
 
         order_type = "LMT" if (limit is not None) else "MKT"
+        ckey = _close_key(symbol, right, exp)
+        if ckey in CLOSE_SEEN_KEYS:
+            logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
+            continue
         tr = place_debit_spread(ib, symbol, exp, longK, shortK, right, limit,
                                 quantity=qty, action="SELL", order_type=order_type)
         if tr is not None:
+            CLOSE_SEEN_KEYS.add(ckey)
             submitted += 1
             record_attempt(symbol, "force_close", "placed", "positions_fallback",
                            exp=str(exp), right=right, longK=float(longK), shortK=float(shortK),
@@ -1284,6 +1321,14 @@ def run_from_csv():
         # Reset per-run open de-dup set
         try:
             OPEN_SEEN_KEYS.clear()
+        except Exception:
+            pass
+        try:
+            CLOSE_SEEN_KEYS.clear()
+        except Exception:
+            pass
+        try:
+            OPEN_PLACED_THIS_RUN.clear()
         except Exception:
             pass
         # Enforce that recent CLOSE signals (last 7 days) have been acted on before opening new risk
@@ -1474,11 +1519,14 @@ def run_from_csv():
                                     closed_any = True
                                     placed += 1
                                 else:
-                                    if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'C',
-                                                          call_close_limit, quantity=qty, action='SELL'):
-                                        logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
-                                        closed_any = True
-                                        placed += 1
+                                    if qty > 0:
+                                        tr = place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'C',
+                                                          call_close_limit, quantity=qty, action='SELL')
+                                        if tr is not None:
+                                            CLOSE_SEEN_KEYS.add(_close_key(symbol, 'C', expiration))
+                                            logger.info(f"[{symbol}] Submitted CLOSE CALL(approx) {approx_atm}/{approx_oth} exp {expiration} @ {call_close_limit}")
+                                            closed_any = True
+                                            placed += 1
                         if not closed_any and not pd.isna(k_put) and not pd.isna(atm):
                             vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT(approx) around atm={atm}, other_hint={k_put} tol={args.close_tol} @ {put_close_limit}")
                             approx_atm, approx_oth, qty = find_approx_spread_to_close(ib, symbol, expiration, 'P',
@@ -1489,11 +1537,14 @@ def run_from_csv():
                                     closed_any = True
                                     placed += 1
                                 else:
-                                    if place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'P',
-                                                          put_close_limit, quantity=qty, action='SELL'):
-                                        logger.info(f"[{symbol}] Submitted CLOSE PUT(approx) {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit}")
-                                        closed_any = True
-                                        placed += 1
+                                    if qty > 0:
+                                        tr = place_debit_spread(ib, symbol, expiration, approx_atm, approx_oth, 'P',
+                                                          put_close_limit, quantity=qty, action='SELL')
+                                        if tr is not None:
+                                            CLOSE_SEEN_KEYS.add(_close_key(symbol, 'P', expiration))
+                                            logger.info(f"[{symbol}] Submitted CLOSE PUT(approx) {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit}")
+                                            closed_any = True
+                                            placed += 1
                     if not closed_any:
                         # Final fallback: close any detected spread(s) for this symbol via MARKET orders,
                         # even if expiration/ATM are missing or mismatched.
@@ -1618,6 +1669,11 @@ def run_from_csv():
 
             # --- CALL debit spread (ATM long / OTM short) ---
             if allow_call and not pd.isna(k_call):
+                # One-open-per-(symbol,side) guard for this run
+                _side_key_c = _open_side_key(symbol, 'C')
+                if _side_key_c in OPEN_PLACED_THIS_RUN:
+                    record_attempt(symbol, "open_call", "skipped", "dup_symbol_side_in_run", exp=expiration)
+                    continue
                 # Early OI gate for CALL opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
                 if _need_oi and not _oi_ok(row, 'C', args.oi_threshold):
@@ -1678,12 +1734,14 @@ def run_from_csv():
                         attempted = True; OPEN_SEEN_KEYS.add(keyC); placed += 1
                         record_attempt(symbol, "open_call", "placed", "success",
                                        exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
+                        OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                     else:
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyC); placed += 1; attempted = True
                             record_attempt(symbol, "open_call", "placed", "success",
                                            exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
+                            OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                         else:
                             # Retry once with refreshed expiration; then derive live limit
                             new_exp = nearest_valid_expiration(ib, symbol, 'C', float(atm), expiration)
@@ -1694,6 +1752,7 @@ def run_from_csv():
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
                                     record_attempt(symbol, "open_call", "placed", "success",
                                                    exp=new_exp, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
+                                    OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
                                     if live is not None:
@@ -1703,6 +1762,7 @@ def run_from_csv():
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
                                             record_attempt(symbol, "open_call", "placed", "success",
                                                            exp=new_exp, atm=float(atm), oth=float(k_call), limit=live_limit)
+                                            OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                 # 2) Fallback to debit_limit only when both legs have OI ≥ 100
                 if not attempted:
                     oi_ok = False
@@ -1733,6 +1793,7 @@ def run_from_csv():
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
                                 record_attempt(symbol, "open_call", "placed", "success",
                                                exp=expiration, atm=float(atm), oth=float(k_call), limit=lv)
+                                OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 break
                             tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', lv, quantity=args.quantity)
                             if tr is None:
@@ -1749,12 +1810,18 @@ def run_from_csv():
                                 record_attempt(symbol, "open_call", "placed", "success",
                                                exp=(used_exp),
                                                atm=float(atm), oth=float(k_call), limit=used_limit)
+                                OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 break
                 if allow_call and not attempted:
                     record_attempt(symbol, "open_call", "skipped", "no_viable_limit_or_conditions",
                                    exp=expiration, atm=float(atm), oth=float(k_call))
             # --- PUT debit spread (ATM long / lower strike short) ---
             if allow_put and not pd.isna(k_put):
+                # One-open-per-(symbol,side) guard for this run
+                _side_key_p = _open_side_key(symbol, 'P')
+                if _side_key_p in OPEN_PLACED_THIS_RUN:
+                    record_attempt(symbol, "open_put", "skipped", "dup_symbol_side_in_run", exp=expiration)
+                    continue
                 # Early OI gate for PUT opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
                 if _need_oi and not _oi_ok(row, 'P', args.oi_threshold):
@@ -1814,12 +1881,14 @@ def run_from_csv():
                         attempted = True; OPEN_SEEN_KEYS.add(keyP); placed += 1
                         record_attempt(symbol, "open_put", "placed", "success",
                                        exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
+                        OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                     else:
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
                             record_attempt(symbol, "open_put", "placed", "success",
                                            exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
+                            OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                         else:
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                             if new_exp and new_exp != expiration:
@@ -1829,6 +1898,7 @@ def run_from_csv():
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
                                     record_attempt(symbol, "open_put", "placed", "success",
                                                    exp=new_exp, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
+                                    OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     if live is not None:
@@ -1843,6 +1913,7 @@ def run_from_csv():
                                                 symbol, "open_put", "placed", "success",
                                                 exp=used_exp, atm=float(atm), oth=float(k_put), limit=live_limit
                                             )
+                                            OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                 # 2) Fallback to debit_limit only when both legs have OI ≥ 100
                 if not attempted:
                     oi_ok = False
@@ -1873,6 +1944,7 @@ def run_from_csv():
                                 OPEN_SEEN_KEYS.add(keyP); placed += 1
                                 record_attempt(symbol, "open_put", "placed", "success",
                                                exp=expiration, atm=float(atm), oth=float(k_put), limit=lv)
+                                OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 break
                             tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', lv, quantity=args.quantity)
                             if tr is None:
@@ -1891,6 +1963,7 @@ def run_from_csv():
                                     symbol, "open_put", "placed", "success",
                                     exp=used_exp, atm=float(atm), oth=float(k_put), limit=used_limit
                                 )
+                                OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 break
                 if allow_put and not attempted:
                     record_attempt(symbol, "open_put", "skipped", "no_viable_limit_or_conditions",
