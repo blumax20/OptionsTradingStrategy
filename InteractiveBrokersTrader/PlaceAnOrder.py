@@ -879,7 +879,9 @@ def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: 
     if ckey in CLOSE_SEEN_KEYS:
         logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {expiration}; skipping")
         return False
-    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, None, quantity=n, action='SELL', order_type='MKT')
+
+    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right,
+                               None, quantity=n, action='SELL', order_type='MKT')
     if trade is not None:
         CLOSE_SEEN_KEYS.add(ckey)
     return trade is not None
@@ -1352,7 +1354,25 @@ def run_from_csv():
                 n_fc = force_close_symbol_via_positions(ib, _sym, args)
                 if n_fc > 0:
                     logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
+        # --- Positions-driven force-close for explicitly requested symbols (CSV-independent) ---
+    if args.mode == "force-close" and args.symbols:
+        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
+        for _sym in sorted(_syms_req):
+            if args.dry_run:
+                record_attempt(_sym, "force_close", "skipped", "dry_run_positions_only")
+            else:
+                n_fc = force_close_symbol_via_positions(ib, _sym, args)
+                if n_fc > 0:
+                    logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
 
+        # >>> ADD THIS BLOCK (early finalize & return) <<<
+        try:
+            _attempts_append(ATTEMPTS)
+        except Exception:
+            pass
+        ib.disconnect()
+        return
+    # <<< END ADD >>>
     # If this batch contains CLOSE signals, proactively cancel any pending BUY combo orders for those tickers
     if 'close_set' in locals() or 'close_mask' in locals():
         # Defensive: try to find the set of tickers flagged for CLOSE
