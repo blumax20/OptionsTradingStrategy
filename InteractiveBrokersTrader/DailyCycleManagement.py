@@ -531,12 +531,20 @@ class DailyCycleManagementMixin:
             "--use-live-close", "join",
             "--quiet"
         ]
+        picked_syms = ",".join(sorted(set(pick)))
         try:
-            self._attempt(action="close", status="queued",
-                          reason=f"close_within_{days}d", source="dcm-close",
-                          symbol=",".join(sorted(set(pick))))
-        except Exception:
-            pass
+            self._attempt(
+                action="close",
+                status="queued",
+                reason=f"close_within_{days}d",
+                source="dcm-close",
+                symbol=picked_syms,
+            )
+        except Exception as e:
+            try:
+                LOG.debug("Close-delegate attempt log failed: %s", e)
+            except Exception:
+                pass
 
         self._run_place_an_order(argv)
 
