@@ -1426,7 +1426,19 @@ def run_from_csv():
                 if v < args.min_limit:
                     return args.min_limit if args.bump_to_min else None
                 return v
-
+            # For CLOSE orders we prefer to always submit a limit (not skip due to min).
+            def enforce_close_limit(x: float | None) -> float | None:
+                """
+                Return a usable CLOSE limit. If x is None or below --min-limit,
+                bump to args.min_limit so we actually submit a limit order.
+                """
+                try:
+                    if x is None:
+                        return args.min_limit
+                    v = float(x)
+                    return v if v >= args.min_limit else args.min_limit
+                except Exception:
+                    return args.min_limit
             # Decide which legs to place
             allow_call = allow_put = False
             stype = str(row.get("signal_type") or "").upper()
@@ -1458,12 +1470,28 @@ def run_from_csv():
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
+                    # NEW: proactively unwind existing PUT spreads (opposite side)
+                    try:
+                        n_unw = close_any_spread_for_symbol(ib, symbol, side="put", max_qty=args.quantity)
+                        if n_unw > 0:
+                            logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN")
+                            record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open", exp=None, right="P", qty=n_unw)
+                    except Exception as _e:
+                        logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
                     allow_call = True
                 elif stype == "PUT_OPEN":
                     # Latest-signal-wins: cancel any working CLOSE orders before we open
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
+                    # NEW: proactively unwind existing CALL spreads (opposite side)
+                    try:
+                        n_unw = close_any_spread_for_symbol(ib, symbol, side="call", max_qty=args.quantity)
+                        if n_unw > 0:
+                            logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN")
+                            record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open", exp=None, right="C", qty=n_unw)
+                    except Exception as _e:
+                        logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
                     allow_put = True
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
@@ -1479,8 +1507,8 @@ def run_from_csv():
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
                     w_call = _spread_width_from_strikes(atm, k_call)
                     call_close_raw = width_aligned_close_limit(row, 'C', w_call)
-                    call_close_limit = (live_close_limit_c if (live_close_limit_c is not None)
-                                        else enforce_min_limit(call_close_raw))
+                    _raw_close_c = live_close_limit_c if (live_close_limit_c is not None) else call_close_raw
+                    call_close_limit = enforce_close_limit(_raw_close_c)
                     if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
@@ -1504,8 +1532,8 @@ def run_from_csv():
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
                     w_put = _spread_width_from_strikes(atm, k_put)
                     put_close_raw = width_aligned_close_limit(row, 'P', w_put)
-                    put_close_limit = (live_close_limit_p if (live_close_limit_p is not None)
-                                    else enforce_min_limit(put_close_raw))
+                    _raw_close_p = live_close_limit_p if (live_close_limit_p is not None) else put_close_raw
+                    put_close_limit = enforce_close_limit(_raw_close_p)
                     if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
@@ -1688,6 +1716,7 @@ def run_from_csv():
                 _side_key_c = _open_side_key(symbol, 'C')
                 if _side_key_c in OPEN_PLACED_THIS_RUN:
                     record_attempt(symbol, "open_call", "skipped", "dup_symbol_side_in_run", exp=expiration)
+                    allow_call = False
                     continue
                 # Early OI gate for CALL opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
@@ -1836,6 +1865,7 @@ def run_from_csv():
                 _side_key_p = _open_side_key(symbol, 'P')
                 if _side_key_p in OPEN_PLACED_THIS_RUN:
                     record_attempt(symbol, "open_put", "skipped", "dup_symbol_side_in_run", exp=expiration)
+                    allow_put = False
                     continue
                 # Early OI gate for PUT opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
