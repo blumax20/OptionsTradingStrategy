@@ -1666,11 +1666,12 @@ class DailyCycleManagementMixin:
             self._enrich_today_and_prev_trading_day(only_rth=True)
         except Exception:
             LOG.warning("CSV OI cancel: failed to run LiquidityFilter pre-hook (today+prev); CSV may lack OI columns.")
-    def run_rth_open_cleanup(self) -> None:
+    def run_rth_open_cleanup(self, lookback_days: int = 2) -> None:
         """
         Call this once shortly after the market opens (~09:35 ET).
         Ensures OI is enriched for today and previous trading day, then cancels low-OI working orders
         using both CSV-based and live-OI checks.
+        The `lookback_days` parameter controls how many recent combined_listener_spreads.csv files are scanned when canceling low‑OI working orders from CSV (default: 2).
         """
         now = self._now_ny()
         if not self._is_trading_day(now):
@@ -1682,7 +1683,7 @@ class DailyCycleManagementMixin:
             return
         # Enrich and cleanup
         self._enrich_today_and_prev_trading_day(only_rth=True)
-        self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=2)
+        self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=lookback_days)
         self._rth_liquidity_cleanup()
         try:
             self._summarize_latest_attempts()
