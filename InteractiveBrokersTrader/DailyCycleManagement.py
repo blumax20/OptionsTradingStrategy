@@ -294,6 +294,13 @@ class DailyCycleManagementMixin:
         else:
             self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_working_close", source=f"dcm-{context}")
 
+        # if latest is CLOSE, also flatten STK leg during preclose
+        try:
+            if self._latest_signal_is_close(sym, lookback_days):
+                self._flatten_stock_if_present(sym)
+        except Exception:
+            pass
+
         # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
         try:
             if self._latest_signal_is_close(sym, lookback_days):
