@@ -294,6 +294,19 @@ class DailyCycleManagementMixin:
         else:
             self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_working_close", source=f"dcm-{context}")
 
+        # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
+        try:
+            if self._latest_signal_is_close(sym, lookback_days):
+                if self._flatten_stock_if_present(sym):
+                    self._attempt(symbol=sym,
+                                  action="close_stock",
+                                  status="submitted",
+                                  reason=f"{context}_latest_close_flatten",
+                                  source=f"dcm-{context}")
+        except Exception:
+            # best-effort; do not fail close submission if STK flatten throws
+            pass
+
     def _csv_paths_by_priority(days: int = 2) -> list[str]:
         """
         Return a list of combined_listener_spreads.csv paths ordered newest->older
@@ -547,6 +560,23 @@ class DailyCycleManagementMixin:
                 pass
 
         self._run_place_an_order(argv)
+
+        # After delegating CLOSEs, also flatten STK legs for any picked symbols whose newest row was CLOSE
+        try:
+            for s in sorted(set(pick)):
+                try:
+                    if self._latest_signal_is_close(s, days):
+                        if self._flatten_stock_if_present(s):
+                            self._attempt(symbol=s,
+                                          action="close_stock",
+                                          status="submitted",
+                                          reason=f"close_within_{days}d_flatten",
+                                          source="dcm-close")
+                except Exception:
+                    # continue best-effort for other symbols
+                    pass
+        except Exception:
+            pass
 
         try:
             self._attempt(action="close", status="submitted",
