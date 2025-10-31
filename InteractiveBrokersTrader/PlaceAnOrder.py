@@ -1333,11 +1333,12 @@ def run_from_csv():
             OPEN_PLACED_THIS_RUN.clear()
         except Exception:
             pass
-        # Enforce that recent CLOSE signals (last 7 days) have been acted on before opening new risk
-        try:
-            enforce_weekly_closures(ib, df.copy(), args, days=7)
-        except Exception as _e:
-            logger.warning(f"Weekly closure enforcement skipped due to error: {_e}")
+        # Enforce recent CLOSE signals only when running from-signal mode
+        if args.mode == "from-signal":
+            try:
+                enforce_weekly_closures(ib, df.copy(), args, days=7)
+            except Exception as _e:
+                logger.warning(f"Weekly closure enforcement skipped due to error: {_e}")
     except Exception as e:
         logger.error(f"Failed to connect to IB: {e}")
         return
@@ -1354,25 +1355,13 @@ def run_from_csv():
                 n_fc = force_close_symbol_via_positions(ib, _sym, args)
                 if n_fc > 0:
                     logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
-        # --- Positions-driven force-close for explicitly requested symbols (CSV-independent) ---
-    if args.mode == "force-close" and args.symbols:
-        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
-        for _sym in sorted(_syms_req):
-            if args.dry_run:
-                record_attempt(_sym, "force_close", "skipped", "dry_run_positions_only")
-            else:
-                n_fc = force_close_symbol_via_positions(ib, _sym, args)
-                if n_fc > 0:
-                    logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
-
-        # >>> ADD THIS BLOCK (early finalize & return) <<<
+        # Early finalize & return for force-close runs (prevents any opens/extra scanning)
         try:
             _attempts_append(ATTEMPTS)
         except Exception:
             pass
         ib.disconnect()
         return
-    # <<< END ADD >>>
     # If this batch contains CLOSE signals, proactively cancel any pending BUY combo orders for those tickers
     if 'close_set' in locals() or 'close_mask' in locals():
         # Defensive: try to find the set of tickers flagged for CLOSE
@@ -1441,6 +1430,12 @@ def run_from_csv():
             # Decide which legs to place
             allow_call = allow_put = False
             stype = str(row.get("signal_type") or "").upper()
+
+            # Defensive per-run guard: if we've already opened this side for this symbol, skip any other open paths
+            if allow_call and _open_side_key(symbol, 'C') in OPEN_PLACED_THIS_RUN:
+                allow_call = False
+            if allow_put and _open_side_key(symbol, 'P') in OPEN_PLACED_THIS_RUN:
+                allow_put = False
 
             # Fallback: infer signal_type from strategy_position if stype missing
             if not stype:
