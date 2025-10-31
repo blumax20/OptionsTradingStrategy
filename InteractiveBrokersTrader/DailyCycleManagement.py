@@ -407,44 +407,143 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
+    def _diagnose_close_symbols_in_csvs(self, days: int = 7) -> None:
+        """
+        Log which symbols would be considered CLOSE within the last `days` sessions,
+        grouped by CSV day (newest→older). This does not place orders.
+        """
+        paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
+        if not paths:
+            LOG.info("Diagnose-close: no CSVs within %d day(s).", days)
+            return
+
+        latest_by_sym: dict[str, tuple[dict, str, str]] = {}
+        for path in paths:
+            label = Path(path).parent.name
+            try:
+                with open(path, newline="", encoding="utf-8") as fh:
+                    rdr = csv.DictReader(fh)
+                    for r in rdr:
+                        sym = (r.get("symbol") or "").strip().upper()
+                        if not sym:
+                            continue
+                        if sym not in latest_by_sym:
+                            latest_by_sym[sym] = (r, label, path)
+            except Exception as e:
+                LOG.warning("Diagnose-close: failed reading %s: %s", path, e)
+
+        def _is_close(row: dict) -> bool:
+            side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
+            if "close" in side_raw:
+                return True
+            sp = (row.get("strategy_position") or "").strip()
+            try:
+                if sp and int(sp) == 0:
+                    return True
+            except Exception:
+                pass
+            side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
+            return "close" in side_col
+
+        buckets: dict[str, list[str]] = {}
+        for sym, (row, label, _) in latest_by_sym.items():
+            if _is_close(row):
+                buckets.setdefault(label, []).append(sym)
+
+        if not buckets:
+            LOG.info("Diagnose-close: none found in last %d day(s).", days)
+            return
+
+        for label in sorted(buckets.keys(), reverse=True):
+            LOG.info("Diagnose-close: %s → %d symbols: %s",
+                     label, len(buckets[label]), ", ".join(sorted(buckets[label])))
+
     def _delegate_close_from_csvs_within(self, days: int) -> None:
         """
-        Delegate CLOSE placements to PlaceAnOrder.py for symbols whose latest rows within `days` indicate CLOSE.
-        DCM only reads CSVs and invokes PlaceAnOrder; no direct broker interaction here.
+        Delegate CLOSE placements to PlaceAnOrder.py for symbols whose *latest* row
+        within `days` (today + previous sessions) indicates a CLOSE.
+        This scans newest→older CSVs once and keeps the first (newest) row per symbol
+        across the whole window to avoid double-submitting per day.
         """
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
         if not paths:
             LOG.info("Close-delegate: no CSVs within %d day(s); skipping.", days)
             return
-        syms: set[str] = set()
+
+        # Newest→older map: sym -> (row, folder_label, file_path)
+        latest_by_sym: dict[str, tuple[dict, str, str]] = {}
+
         for path in paths:
+            label = Path(path).parent.name  # YY_MM_DD
             try:
                 with open(path, newline="", encoding="utf-8") as fh:
                     rdr = csv.DictReader(fh)
-                    last_by_sym: dict[str, dict] = {}
                     for r in rdr:
                         sym = (r.get("symbol") or "").strip().upper()
                         if not sym:
                             continue
-                        last_by_sym[sym] = r  # last row encountered for symbol within this file
-                    for sym, r in last_by_sym.items():
-                        side_raw = (r.get("signal_type") or r.get("signal_side") or "").strip().lower()
-                        if "close" in side_raw:
-                            syms.add(sym)
+                        # Keep the first time we see a symbol while iterating newest→older => newest row wins
+                        if sym not in latest_by_sym:
+                            latest_by_sym[sym] = (r, label, path)
             except Exception as e:
                 LOG.warning("Close-delegate: failed reading %s: %s", path, e)
                 continue
-        if not syms:
-            LOG.info("Close-delegate: no CLOSE symbols found within %d day(s).", days)
+
+        def _is_close(row: dict) -> bool:
+            side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
+            if "close" in side_raw:
+                return True
+            # Fallbacks: treat strategy_position == 0 as a close-like signal if present
+            sp = (row.get("strategy_position") or "").strip()
+            try:
+                if sp and int(sp) == 0:
+                    return True
+            except Exception:
+                pass
+            # Some listener variants encode as 'sell,CLOSE' in a generic 'side' column
+            side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
+            return "close" in side_col
+
+        # Pick only those symbols whose newest row within the window is CLOSE
+        pick: list[str] = []
+        per_day_counts: dict[str, int] = {}
+        for sym, (row, label, _) in latest_by_sym.items():
+            if _is_close(row):
+                pick.append(sym)
+                per_day_counts[label] = per_day_counts.get(label, 0) + 1
+
+        if not pick:
+            LOG.info("Close-delegate: no CLOSE symbols found in the last %d day(s).", days)
             return
-        argv = ["--mode","force-close","--symbols", ",".join(sorted(syms)), "--min-limit","0.05","--use-live-close","join","--quiet"]
+
+        # Log diagnostic breakdown by CSV day so you can verify older sessions are included
         try:
-            self._attempt(action="close", status="queued", reason=f"close_within_{days}d", source="dcm-close")
+            breakdown = ", ".join(f"{d}:{n}" for d, n in sorted(per_day_counts.items(), reverse=True))
+            LOG.info("Close-delegate: %d CLOSE symbol(s) across %d day(s) [%s].",
+                     len(pick), len(paths), breakdown)
         except Exception:
             pass
-        self._run_place_an_order(argv)
+
+        argv = [
+            "--mode", "force-close",
+            "--symbols", ",".join(sorted(set(pick))),
+            "--min-limit", "0.05",
+            "--use-live-close", "join",
+            "--quiet"
+        ]
         try:
-            self._attempt(action="close", status="submitted", reason=f"close_within_{days}d", source="dcm-close")
+            self._attempt(action="close", status="queued",
+                          reason=f"close_within_{days}d", source="dcm-close",
+                          symbol=",".join(sorted(set(pick))))
+        except Exception:
+            pass
+
+        self._run_place_an_order(argv)
+
+        try:
+            self._attempt(action="close", status="submitted",
+                          reason=f"close_within_{days}d", source="dcm-close",
+                          symbol=",".join(sorted(set(pick))))
         except Exception:
             pass
 
