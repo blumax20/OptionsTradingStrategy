@@ -2222,3 +2222,55 @@ if __name__ == "__main__":
     except Exception:
         LOG.exception("DailyCycleManagement runner failed.")
         sys.exit(1)
+if __name__ == "__main__":
+    """
+    Minimal CLI so this module can be run directly (the PS menu calls this file).
+    Safe by default; actions are opt-in via flags.
+    """
+    import argparse, os, sys, logging
+
+    parser = argparse.ArgumentParser(description="DailyCycleManagement runner")
+    parser.add_argument("--place-opens", action="store_true",
+                        help="Place OPEN orders from the most recent CSVs (today & yesterday).")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="(Outside RTH) Reconcile held positions vs latest signals (close/flip).")
+    parser.add_argument("--preclose", action="store_true",
+                        help="Pre-close sweep (≈15:00 ET): convert CLOSE LMTs & mismatches.")
+    parser.add_argument("--after-hours", action="store_true",
+                        help="After-hours batch: delegate opens and enforce CLOSE signals.")
+    parser.add_argument("--enforce-closes", type=int, default=0,
+                        help="If >0: enforce recent CLOSE signals for last N days (fallback path).")
+    parser.add_argument("--verbose", action="store_true", help="Enable INFO logging.")
+    args = parser.parse_args()
+
+    # Basic logger
+    logging.basicConfig(level=(logging.INFO if args.verbose else logging.WARNING),
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    class _Host(DailyCycleManagementMixin):
+        pass
+
+    host = _Host()
+
+    try:
+        if args.place_opens:
+            # Today & yesterday, DTE ≥ 20; delegated to PlaceAnOrder (robust pricing/idempotency)
+            host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=2)
+
+        if args.preclose:
+            host._pre_close_market_conversion()
+
+        if args.after_hours:
+            host._after_hours_batch_placement()
+
+        if args.reconcile:
+            host._reconcile_positions_with_signals_lookback(days=21)
+
+        if args.enforce_closes and args.enforce_closes > 0:
+            host._enforce_recent_closes(days=args.enforce_closes)
+
+        # Always summarize at the end
+        host._summarize_latest_attempts()
+    except Exception as e:
+        LOG.exception("DailyCycleManagement top-level error: %s", e)
+        sys.exit(2)
