@@ -874,7 +874,8 @@ class DailyCycleManagementMixin:
     def _has_working_close_order(self, sym: str) -> bool:
         """
         Return True if there is an existing working CLOSE order (SELL combo) for the given symbol.
-        This prevents DCM from submitting duplicate CLOSE orders for the same symbol during a run.
+        Treats active working states as working, and also treats GTC orders that show as 'Inactive'
+        (because exchange is closed) as working/held-overnight.
         """
         try:
             from ib_insync import IB
@@ -889,19 +890,31 @@ class DailyCycleManagementMixin:
 
         try:
             trades = ib.openTrades() or []
-            up = sym.upper()
+            up = (sym or "").upper()
+            # states that indicate an order is still alive/working
+            working_states = {"presubmitted", "submitted", "pendingsubmit", "apipending"}
+
             for tr in trades:
                 c = getattr(tr, "contract", None)
                 o = getattr(tr, "order", None)
                 s = getattr(tr, "orderStatus", None)
                 if not c or not o or not s:
                     continue
-                if (getattr(c, "secType", "") == "BAG"
-                    and (getattr(c, "symbol", "") or "").upper() == up
-                    and (getattr(o, "action", "") or "").upper() == "SELL"):
-                    st = (getattr(s, "status", "") or "").lower()
-                    if st not in ("filled", "cancelled", "apicancelled"):
-                        return True
+                if getattr(c, "secType", "") != "BAG":
+                    continue
+                if (getattr(c, "symbol", "") or "").upper() != up:
+                    continue
+                if (getattr(o, "action", "") or "").upper() != "SELL":
+                    continue
+
+                st = (getattr(s, "status", "") or "").lower()
+                if st in ("filled", "cancelled", "apicancelled"):
+                    continue
+
+                # consider GTC inactive as "working/held" after hours
+                is_gtc = (getattr(o, "tif", "") or "").upper() == "GTC"
+                if (st in working_states) or (st == "inactive" and is_gtc):
+                    return True
             return False
         finally:
             try:

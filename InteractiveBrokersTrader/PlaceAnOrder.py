@@ -54,6 +54,44 @@ def _nudge_limit_for_riskless(limit_price: float | None, action: str, eps: float
     else:
         # BUY
         return round(max(lp - float(eps), 0.01), 2)
+
+# add or ensure these imports exist
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
+
+def _now_ny_time():
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).time()
+    except Exception:
+        return datetime.now().time()
+
+def _next_trading_date_ny(start_dt=None):
+    dt = start_dt or datetime.now(ZoneInfo("America/New_York"))
+    d = dt.date() + timedelta(days=1)
+    # skip Sat/Sun
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+def _tag_after_hours_limit(order):
+    """
+    For after-hours placements, make the limit order acceptable & persistent until RTH:
+      - tif=GTC so TWS keeps it across sessions
+      - outsideRth=True so TWS accepts/holds it after close
+      - (optional) goodAfterTime to stage for next RTH open and avoid any premarket
+    """
+    try:
+        t = _now_ny_time()
+        # "after-hours" = after 16:00 ET (and also before 09:30 ET if you happen to run early)
+        if (t >= time(16, 0)) or (t < time(9, 30)):
+            order.tif = "GTC"
+            order.outsideRth = True
+            # If you prefer to *activate* at the next open (09:31) instead of holding overnight:
+            nxt = _next_trading_date_ny()
+            order.goodAfterTime = f"{nxt.strftime('%Y%m%d')} 09:31:00 US/Eastern"
+    except Exception:
+        pass
+
 # --- Normalize symbols (strip exchange prefixes/timeframes/trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     if not raw or not isinstance(raw, str):
@@ -799,6 +837,7 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             return trade
         else:
             order = LimitOrder(action.upper(), quantity, float(limit_price))
+            _tag_after_hours_limit(order)
             trade = ib.placeOrder(combo, order)
             logger.info(f"[{symbol}] Placed {right} {'LMT' if action.upper()=='BUY' else 'LMT CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
             try:
@@ -823,6 +862,7 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                 nudged = _nudge_limit_for_riskless(float(limit_price), action)
                 try:
                     order2 = LimitOrder(action.upper(), quantity, float(nudged))
+                    _tag_after_hours_limit(order2)
                     trade2 = ib.placeOrder(combo, order2)
                     logger.info(f"[{symbol}] Riskless-combo LMT rejected @{float(limit_price):.2f}; resubmitting LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})")
                     try:
