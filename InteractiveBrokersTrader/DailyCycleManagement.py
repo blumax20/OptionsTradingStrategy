@@ -271,35 +271,40 @@ class DailyCycleManagementMixin:
         Delegates to PlaceAnOrder first; if no working close order exists afterwards, falls back
         to a positions-based MARKET close.
         """
-        # delegate to PlaceAnOrder
-        self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegate", source=f"dcm-{context}")
+        # Stage 1: delegate using CSV-derived limits only (no live quotes)
+        self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_csv_limit", source=f"dcm-{context}")
         self._run_place_an_order([
             "--mode","force-close",
             "--symbols", sym,
             "--min-limit","0.01" if context == "preclose" else "0.05",
-            "--use-live-close","join",
+            "--use-live-close","off",
             "--quiet"
         ])
-        # if delegation didn't leave a working close, force via positions
-        if not self._has_working_close_order(sym):
-            did = False
-            try:
-                did = self._try_close_from_positions(sym, prefer="MKT")
-            except Exception:
-                did = False
-            if did:
-                self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_positions_fallback", source=f"dcm-{context}")
-            else:
-                self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_no_working_close", source=f"dcm-{context}")
+        if self._has_working_close_order(sym):
+            self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_csv_limit_working", source=f"dcm-{context}")
         else:
-            self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_working_close", source=f"dcm-{context}")
-
-        # if latest is CLOSE, also flatten STK leg during preclose
-        try:
-            if self._latest_signal_is_close(sym, lookback_days):
-                self._flatten_stock_if_present(sym)
-        except Exception:
-            pass
+            # Stage 2: delegate using live mid quotes as fallback
+            self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_live_mid", source=f"dcm-{context}")
+            self._run_place_an_order([
+                "--mode","force-close",
+                "--symbols", sym,
+                "--min-limit","0.01" if context == "preclose" else "0.05",
+                "--use-live-close","mid",
+                "--quiet"
+            ])
+            if self._has_working_close_order(sym):
+                self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_live_mid_working", source=f"dcm-{context}")
+            else:
+                # Stage 3: positions-based MARKET fallback
+                did = False
+                try:
+                    did = self._try_close_from_positions(sym, prefer="MKT")
+                except Exception:
+                    did = False
+                if did:
+                    self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_positions_fallback", source=f"dcm-{context}")
+                else:
+                    self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_no_working_close", source=f"dcm-{context}")
 
         # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
         try:
@@ -544,29 +549,47 @@ class DailyCycleManagementMixin:
         except Exception:
             pass
 
-        argv = [
+        syms_joined = ",".join(sorted(set(pick)))
+
+        # Stage 1: CSV-derived close limits (no live)
+        argv_csv = [
             "--mode", "force-close",
-            "--symbols", ",".join(sorted(set(pick))),
+            "--symbols", syms_joined,
             "--min-limit", "0.05",
-            "--use-live-close", "join",
+            "--use-live-close", "off",
             "--quiet"
         ]
-        picked_syms = ",".join(sorted(set(pick)))
         try:
             self._attempt(
                 action="close",
                 status="queued",
-                reason=f"close_within_{days}d",
+                reason=f"close_within_{days}d_csv_limit",
                 source="dcm-close",
-                symbol=picked_syms,
+                symbol=syms_joined,
             )
-        except Exception as e:
-            try:
-                LOG.debug("Close-delegate attempt log failed: %s", e)
-            except Exception:
-                pass
+        except Exception:
+            pass
+        self._run_place_an_order(argv_csv)
 
-        self._run_place_an_order(argv)
+        # Stage 2: live mid fallback for any symbols that still don't have a working close
+        argv_mid = [
+            "--mode", "force-close",
+            "--symbols", syms_joined,
+            "--min-limit", "0.05",
+            "--use-live-close", "mid",
+            "--quiet"
+        ]
+        try:
+            self._attempt(
+                action="close",
+                status="queued",
+                reason=f"close_within_{days}d_live_mid",
+                source="dcm-close",
+                symbol=syms_joined,
+            )
+        except Exception:
+            pass
+        self._run_place_an_order(argv_mid)
 
         # After delegating CLOSEs, also flatten STK legs for any picked symbols whose newest row was CLOSE
         try:
