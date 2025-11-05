@@ -764,6 +764,16 @@ def has_open_position_for_spread(ib: IB, symbol: str, exp: str, right: str, long
             qty_short += float(p.position)
     return (qty_long > 0) and (qty_short < 0)
 
+# If we're outside RTH and this is a BAG option combo, convert MKT -> LMT at min/epsilon
+def _is_after_hours():
+    try:
+        from zoneinfo import ZoneInfo
+        n = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        n = datetime.now()
+    wd, hh, mm = n.weekday(), n.hour, n.minute
+    return (wd >= 5) or not ((hh > 9 or (hh == 9 and mm >= 30)) and (hh < 16))
+
 def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str,limit_price: float | None, quantity: int = 1, action: str = 'BUY', order_type: str = 'LMT'):
     """
     Place a vertical debit spread (combo BAG). If order_type == 'MKT' or limit_price is None, a MarketOrder is used.
@@ -819,10 +829,24 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
 
     # Build and place order
     try:
+        is_bag = getattr(combo, 'secType', '') == 'BAG'
+        actual_order_type = None
+        actual_limit = None
         if order_type.upper() == 'MKT' or limit_price is None:
-            order = MarketOrder(action.upper(), quantity)
-            trade = ib.placeOrder(combo, order)
-            logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            if _is_after_hours() and is_bag:
+                # convert to LMT at least at min price (use args.min_limit if you have it; otherwise 0.05)
+                safe_min = 0.05
+                order = LimitOrder(action.upper(), quantity, float(safe_min))
+                _tag_after_hours_limit(order)
+                trade = ib.placeOrder(combo, order)
+                actual_order_type = "LMT"
+                actual_limit = float(safe_min)
+            else:
+                order = MarketOrder(action.upper(), quantity)
+                trade = ib.placeOrder(combo, order)
+                actual_order_type = "MKT"
+                actual_limit = None
+            logger.info(f"[{symbol}] Placed {right} {'LMT' if (actual_order_type=='LMT') else 'MKT'}{'' if action.upper()=='BUY' else ' CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
             ok, why = _await_working(trade, timeout=3.0)
             reason = "success" if ok else f"not_working:{why}"
             try:
@@ -835,8 +859,8 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                             reason,
                             exp=str(expiration), right=right.upper(),
                             longK=float(long_strike), shortK=float(short_strike),
-                            order_type=("MKT" if (order_type.upper()=='MKT' or limit_price is None) else "LMT"),
-                            limit=(None if (order_type.upper()=='MKT' or limit_price is None) else float(limit_price)),
+                            order_type=actual_order_type,
+                            limit=actual_limit,
                             qty=int(quantity), order_action=action.upper())
             except Exception:
                 pass
@@ -881,7 +905,9 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             order = LimitOrder(action.upper(), quantity, float(limit_price))
             _tag_after_hours_limit(order)
             trade = ib.placeOrder(combo, order)
-            logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            actual_order_type = "LMT"
+            actual_limit = float(limit_price)
+            logger.info(f"[{symbol}] Placed {right} LMT{'' if action.upper()=='BUY' else ' CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
             ok, why = _await_working(trade, timeout=3.0)
             reason = "success" if ok else f"not_working:{why}"
             try:
@@ -894,8 +920,8 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                             reason,
                             exp=str(expiration), right=right.upper(),
                             longK=float(long_strike), shortK=float(short_strike),
-                            order_type=("MKT" if (order_type.upper()=='MKT' or limit_price is None) else "LMT"),
-                            limit=(None if (order_type.upper()=='MKT' or limit_price is None) else float(limit_price)),
+                            order_type=actual_order_type,
+                            limit=actual_limit,
                             qty=int(quantity), order_action=action.upper())
             except Exception:
                 pass
