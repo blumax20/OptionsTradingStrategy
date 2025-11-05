@@ -87,8 +87,8 @@ def _tag_after_hours_limit(order):
             order.tif = "GTC"
             order.outsideRth = True
             # If you prefer to *activate* at the next open (09:31) instead of holding overnight:
-            nxt = _next_trading_date_ny()
-            order.goodAfterTime = f"{nxt.strftime('%Y%m%d')} 09:31:00 US/Eastern"
+            # nxt = _next_trading_date_ny()
+            # order.goodAfterTime = f"{nxt.strftime('%Y%m%d')} 09:31:00 US/Eastern"
     except Exception:
         pass
 
@@ -286,6 +286,40 @@ def find_latest_combined_csv() -> Path | None:
         return None
     candidates.sort(reverse=True)
     return candidates[0][1]
+
+# --- add near the top, with other helpers ---
+def _await_working(trade, timeout=3.0) -> tuple[bool, str]:
+    """
+    Wait briefly for a Trade to become working/held. Returns (ok, reason).
+    ok=True if status in working set or (Inactive+GTC) after-hours; else False with reason.
+    """
+    import time
+    working = {"PreSubmitted","Submitted","PendingSubmit","ApiPending"}
+    start = time.time()
+    # snapshot order fields we need
+    try:
+        order = trade.order
+    except Exception:
+        order = None
+    tif = (getattr(order, "tif", "") or "").upper()
+    while time.time() - start < timeout:
+        st = (getattr(trade.orderStatus, "status", "") or "")
+        # IB path sometimes lowercases in logs; keep raw here
+        if st in working:
+            return True, st
+        # treat after-hours held GTC as "working"
+        if st == "Inactive" and tif == "GTC":
+            return True, "Inactive(GTC)"
+        # riskless-combo detection is handled elsewhere, but bail early if we see it
+        try:
+            for le in getattr(trade, "log", []) or []:
+                if "Riskless combination orders are not allowed" in (getattr(le, "message", "") or ""):
+                    return False, "riskless"
+        except Exception:
+            pass
+        time.sleep(0.15)
+    st = (getattr(trade.orderStatus, "status", "") or "")
+    return False, (st or "no_status")
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -789,17 +823,21 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             order = MarketOrder(action.upper(), quantity)
             trade = ib.placeOrder(combo, order)
             logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            ok, why = _await_working(trade, timeout=3.0)
+            reason = "success" if ok else f"not_working:{why}"
             try:
                 rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                              "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                              "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                              "open_put")
-                record_attempt(symbol, rec_action, "placed", "success",
-                               exp=str(expiration), right=right.upper(),
-                               longK=float(long_strike), shortK=float(short_strike),
-                               order_type="MKT", limit=None,
-                               qty=int(quantity), order_action=action.upper())
-                # Note: a second record is logged if riskless-combo retry is triggered below
+                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                            "open_put")
+                record_attempt(symbol, rec_action,
+                            ("placed" if ok else "submitted"),
+                            reason,
+                            exp=str(expiration), right=right.upper(),
+                            longK=float(long_strike), shortK=float(short_strike),
+                            order_type=("MKT" if (order_type.upper()=='MKT' or limit_price is None) else "LMT"),
+                            limit=(None if (order_type.upper()=='MKT' or limit_price is None) else float(limit_price)),
+                            qty=int(quantity), order_action=action.upper())
             except Exception:
                 pass
             # If IB classifies the combo as riskless and cancels it instantly, switch to a small-limit with epsilon nudge
@@ -817,18 +855,22 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                     trade2 = ib.placeOrder(combo, order2)
                     logger.info(f"[{symbol}] Riskless-combo MKT rejected; resubmitting as LMT @{nudged:.2f} with epsilon nudge ({RISKLESS_EPSILON:.2f})")
                     try:
-                        record_attempt(symbol,
-                                       ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                                        "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                                        "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                                        "open_put"),
-                                       "placed", "riskless_retry",
-                                       exp=str(expiration), right=right.upper(),
-                                       longK=float(long_strike), shortK=float(short_strike),
-                                       order_type="LMT", prev_order_type="MKT",
-                                       prev_limit=None, limit=float(nudged),
-                                       epsilon=float(RISKLESS_EPSILON),
-                                       qty=int(quantity), order_action=action.upper())
+                        ok2, why2 = _await_working(trade2, timeout=3.0)
+                        reason2 = ("riskless_retry_ok" if ok2 else f"riskless_retry_not_working:{why2}")
+                        record_attempt(
+                            symbol,
+                            ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                            "open_put"),
+                            ("placed" if ok2 else "submitted"),
+                            reason2,
+                            exp=str(expiration), right=right.upper(),
+                            longK=float(long_strike), shortK=float(short_strike),
+                            order_type="LMT", prev_order_type="MKT",
+                            prev_limit=None, limit=float(nudged),
+                            epsilon=float(RISKLESS_EPSILON),
+                            qty=int(quantity), order_action=action.upper())
                     except Exception:
                         pass
                     return trade2
@@ -839,18 +881,22 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             order = LimitOrder(action.upper(), quantity, float(limit_price))
             _tag_after_hours_limit(order)
             trade = ib.placeOrder(combo, order)
-            logger.info(f"[{symbol}] Placed {right} {'LMT' if action.upper()=='BUY' else 'LMT CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
+            logger.info(f"[{symbol}] Placed {right} {'MKT' if action.upper()=='BUY' else 'MKT CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            ok, why = _await_working(trade, timeout=3.0)
+            reason = "success" if ok else f"not_working:{why}"
             try:
                 rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                              "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                              "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                              "open_put")
-                record_attempt(symbol, rec_action, "placed", "success",
-                               exp=str(expiration), right=right.upper(),
-                               longK=float(long_strike), shortK=float(short_strike),
-                               order_type="LMT", limit=float(limit_price) if limit_price is not None else None,
-                               qty=int(quantity), order_action=action.upper())
-                # Note: a second record is logged if riskless-combo retry is triggered below
+                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                            "open_put")
+                record_attempt(symbol, rec_action,
+                            ("placed" if ok else "submitted"),
+                            reason,
+                            exp=str(expiration), right=right.upper(),
+                            longK=float(long_strike), shortK=float(short_strike),
+                            order_type=("MKT" if (order_type.upper()=='MKT' or limit_price is None) else "LMT"),
+                            limit=(None if (order_type.upper()=='MKT' or limit_price is None) else float(limit_price)),
+                            qty=int(quantity), order_action=action.upper())
             except Exception:
                 pass
             # Briefly wait and check for IB riskless-combo cancellation; if detected, nudge and resubmit once
@@ -866,18 +912,22 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                     trade2 = ib.placeOrder(combo, order2)
                     logger.info(f"[{symbol}] Riskless-combo LMT rejected @{float(limit_price):.2f}; resubmitting LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})")
                     try:
-                        record_attempt(symbol,
-                                       ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                                        "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                                        "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                                        "open_put"),
-                                       "placed", "riskless_retry",
-                                       exp=str(expiration), right=right.upper(),
-                                       longK=float(long_strike), shortK=float(short_strike),
-                                       order_type="LMT", prev_order_type="LMT",
-                                       prev_limit=float(limit_price), limit=float(nudged),
-                                       epsilon=float(RISKLESS_EPSILON),
-                                       qty=int(quantity), order_action=action.upper())
+                        ok2, why2 = _await_working(trade2, timeout=3.0)
+                        reason2 = ("riskless_retry_ok" if ok2 else f"riskless_retry_not_working:{why2}")
+                        record_attempt(
+                            symbol,
+                            ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
+                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
+                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
+                            "open_put"),
+                            ("placed" if ok2 else "submitted"),
+                            reason2,
+                            exp=str(expiration), right=right.upper(),
+                            longK=float(long_strike), shortK=float(short_strike),
+                            order_type="LMT", prev_order_type="LMT",
+                            prev_limit=float(limit_price), limit=float(nudged),
+                            epsilon=float(RISKLESS_EPSILON),
+                            qty=int(quantity), order_action=action.upper())
                     except Exception:
                         pass
                     return trade2
@@ -1668,7 +1718,7 @@ def run_from_csv():
                                                           action='SELL', scheme=args.use_live_close, timeout=3.0)
                         if limit is None:
                             w_call = _spread_width_from_strikes(atm, k_call)
-                            limit = enforce_min_limit(width_aligned_close_limit(row, 'C', w_call))
+                            limit = enforce_close_limit(width_aligned_close_limit(row, 'C', w_call))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE CALL skipped; limit below min or missing")
                         else:
@@ -1709,7 +1759,7 @@ def run_from_csv():
                                                           action='SELL', scheme=args.use_live_close, timeout=3.0)
                         if limit is None:
                             w_put = _spread_width_from_strikes(atm, k_put)
-                            limit = enforce_min_limit(width_aligned_close_limit(row, 'P', w_put))
+                            limit = enforce_close_limit(width_aligned_close_limit(row, 'P', w_put))
                         if limit is None:
                             vprint(args.verbose, f"[{symbol}] FORCE-CLOSE PUT skipped; limit below min or missing")
                         else:
