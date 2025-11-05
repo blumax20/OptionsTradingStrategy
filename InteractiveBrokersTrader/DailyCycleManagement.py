@@ -489,6 +489,7 @@ class DailyCycleManagementMixin:
         within `days` (today + previous sessions) indicates a CLOSE.
         This scans newest→older CSVs once and keeps the first (newest) row per symbol
         across the whole window to avoid double-submitting per day.
+        Implementation: only delegates to PlaceAnOrder.py (no direct IB order placement).
         """
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
         if not paths:
@@ -497,7 +498,6 @@ class DailyCycleManagementMixin:
 
         # Newest→older map: sym -> (row, folder_label, file_path)
         latest_by_sym: dict[str, tuple[dict, str, str]] = {}
-
         for path in paths:
             label = Path(path).parent.name  # YY_MM_DD
             try:
@@ -549,49 +549,90 @@ class DailyCycleManagementMixin:
         except Exception:
             pass
 
-        syms_joined = ",".join(sorted(set(pick)))
+        # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
+        # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
+        by_day: dict[str, list[str]] = {}
+        for sym, (row, day_lbl, _) in latest_by_sym.items():
+            if sym in pick:
+                by_day.setdefault(day_lbl, []).append(sym)
 
-        # Stage 1: CSV-derived close limits (no live)
-        argv_csv = [
-            "--mode", "force-close",
-            "--symbols", syms_joined,
-            "--min-limit", "0.05",
-            "--use-live-close", "off",
-            "--quiet"
-        ]
-        try:
-            self._attempt(
-                action="close",
-                status="queued",
-                reason=f"close_within_{days}d_csv_limit",
-                source="dcm-close",
-                symbol=syms_joined,
-            )
-        except Exception:
-            pass
-        self._run_place_an_order(argv_csv)
+        for day_lbl, syms in sorted(by_day.items(), reverse=True):
+            if not syms:
+                continue
+            argv_csv = [
+                "--mode", "from-signal",
+                "--date", day_lbl,
+                "--symbols", ",".join(sorted(set(syms))),
+                "--min-limit", "0.05",
+                "--use-live-close", "off",
+                "--quiet"
+            ]
+            try:
+                self._attempt(
+                    action="close",
+                    status="queued",
+                    reason=f"close_from_csv_limits_{day_lbl}",
+                    source="dcm-close",
+                    symbol=",".join(sorted(set(syms))),
+                )
+            except Exception:
+                pass
+            self._run_place_an_order(argv_csv)
 
-        # Stage 2: live mid fallback for any symbols that still don't have a working close
-        argv_mid = [
-            "--mode", "force-close",
-            "--symbols", syms_joined,
-            "--min-limit", "0.05",
-            "--use-live-close", "mid",
-            "--quiet"
-        ]
-        try:
-            self._attempt(
-                action="close",
-                status="queued",
-                reason=f"close_within_{days}d_live_mid",
-                source="dcm-close",
-                symbol=syms_joined,
-            )
-        except Exception:
-            pass
-        self._run_place_an_order(argv_mid)
+        # --- Stage 1.5: live-mid fallback via PlaceAnOrder for any symbols still lacking a working close ---
+        still_open: list[str] = []
+        for s in sorted(set(pick)):
+            if not self._has_working_close_order(s):
+                still_open.append(s)
 
-        # After delegating CLOSEs, also flatten STK legs for any picked symbols whose newest row was CLOSE
+        if still_open:
+            syms_joined = ",".join(still_open)
+            argv_mid = [
+                "--mode", "force-close",
+                "--symbols", syms_joined,
+                "--min-limit", "0.05",
+                "--use-live-close", "mid",
+                "--quiet"
+            ]
+            try:
+                self._attempt(
+                    action="close",
+                    status="queued",
+                    reason=f"close_live_mid_fallback_within_{days}d",
+                    source="dcm-close",
+                    symbol=syms_joined,
+                )
+            except Exception:
+                pass
+            self._run_place_an_order(argv_mid)
+
+        # --- Stage 2: final market fallback for anything still without a working close (positions-based in PlaceAnOrder) ---
+        still_open2: list[str] = []
+        for s in sorted(set(pick)):
+            if not self._has_working_close_order(s):
+                still_open2.append(s)
+        if still_open2:
+            syms_joined2 = ",".join(still_open2)
+            argv_mkt = [
+                "--mode", "force-close",
+                "--symbols", syms_joined2,
+                "--min-limit", "0.05",
+                "--use-live-close", "off",
+                "--quiet"
+            ]
+            try:
+                self._attempt(
+                    action="close",
+                    status="queued",
+                    reason=f"close_market_fallback_within_{days}d",
+                    source="dcm-close",
+                    symbol=syms_joined2,
+                )
+            except Exception:
+                pass
+            self._run_place_an_order(argv_mkt)
+
+        # Flatten STK legs if newest signal is CLOSE (delegated CLOSE was just submitted)
         try:
             for s in sorted(set(pick)):
                 try:
@@ -603,7 +644,6 @@ class DailyCycleManagementMixin:
                                           reason=f"close_within_{days}d_flatten",
                                           source="dcm-close")
                 except Exception:
-                    # continue best-effort for other symbols
                     pass
         except Exception:
             pass
