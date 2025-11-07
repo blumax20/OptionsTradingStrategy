@@ -278,6 +278,7 @@ class DailyCycleManagementMixin:
             "--symbols", sym,
             "--min-limit","0.01" if context == "preclose" else "0.05",
             "--use-live-close","off",
+            "--quantity","50",
             "--quiet"
         ])
         if self._has_working_close_order(sym):
@@ -290,6 +291,7 @@ class DailyCycleManagementMixin:
                 "--symbols", sym,
                 "--min-limit","0.01" if context == "preclose" else "0.05",
                 "--use-live-close","mid",
+                "--quantity","50",
                 "--quiet"
             ])
             if self._has_working_close_order(sym):
@@ -565,6 +567,7 @@ class DailyCycleManagementMixin:
                 "--symbols", ",".join(sorted(set(syms))),
                 "--min-limit", "0.05",
                 "--use-live-close", "off",
+                "--quantity","50",
                 "--quiet"
             ]
             try:
@@ -592,6 +595,7 @@ class DailyCycleManagementMixin:
                 "--symbols", syms_joined,
                 "--min-limit", "0.05",
                 "--use-live-close", "mid",
+                "--quantity","50",
                 "--quiet"
             ]
             try:
@@ -618,6 +622,7 @@ class DailyCycleManagementMixin:
                 "--symbols", syms_joined2,
                 "--min-limit", "0.05",
                 "--use-live-close", "off",
+                "--quantity","50",
                 "--quiet"
             ]
             try:
@@ -1094,7 +1099,8 @@ class DailyCycleManagementMixin:
         argv = ["--mode", "force-close",
                 "--symbols", ",".join(syms),
                 "--min-limit", f"{min_limit:.2f}",
-                "--use-live-close", (use_live_close or "off")]
+                "--use-live-close", (use_live_close or "off"),
+                "--quantity","50"]
         if quiet:
             argv.append("--quiet")
 
@@ -1394,6 +1400,7 @@ class DailyCycleManagementMixin:
             "--mode", "force-close",
             "--min-limit", "0.05",
             "--use-live-close", "join",
+            "--quantity","50",
             "--quiet"
         ])
         self._summarize_latest_attempts()
@@ -1719,6 +1726,7 @@ class DailyCycleManagementMixin:
                     self._run_place_an_order([
                         "--mode", "force-close",
                         "--symbols", sym,
+                        "--quantity","50",
                         "--quiet"
                     ])
                     submitted += 1

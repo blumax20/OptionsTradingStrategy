@@ -1089,7 +1089,7 @@ def cancel_close_orders_for_symbol(ib: IB, symbol: str) -> int:
             continue
     return n_cancel
 
-def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, limit_price: float, max_qty: int = 1):
+def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, limit_price: float, max_qty: int = 50):
     """
     Attempt to close an existing long debit spread by SELLing the combo if we find +1 long @ ATM and -1 short @ OTM (for calls),
     or +1 long put @ ATM and -1 short put @ lower strike (for puts). Returns True if an order was sent.
@@ -1131,7 +1131,7 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, at
 # --- Approximate spread finder for closing ---
 def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str,
                                 atm_hint: float | None, oth_hint: float | None,
-                                tol: float, max_qty: int = 1):
+                                tol: float, max_qty: int = 50):
     """
     Find a pair of legs (+long, -short) for the given symbol/right/expiration within a strike tolerance.
     Returns (atm_strike, oth_strike, qty) or (None, None, 0) if not found.
@@ -1182,7 +1182,7 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
 
 
 # --- Fallback: scan positions for any spread for this symbol and close via MARKET order ---
-def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, max_qty: int = 1) -> int:
+def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, max_qty: int = 50) -> int:
     """
     Fallback: scan positions for this symbol and close any vertical debit spread(s) we can detect
     using MARKET SELL combo orders. This ignores CSV expiration/ATM hints and uses the actual
@@ -1250,7 +1250,7 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
         # cleanup any zeroed entries (not strictly necessary)
     return placed
 
-def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = None, max_qty: int = 1):
+def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = None, max_qty: int = 10):
     """
     Yield (exp, right, longK, shortK, qty) for each detectable vertical debit spread
     in current positions for `symbol`. If `side` is 'call' or 'put', restrict to that right.
