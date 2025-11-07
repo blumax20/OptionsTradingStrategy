@@ -1512,6 +1512,7 @@ def run_from_csv():
             k_call = row.get("otm_strike_call")
             k_put = row.get("otm_strike_put")
 
+
             # If put OTM is missing but call OTM exists, infer symmetric width as a fallback
             if (pd.isna(k_put) or k_put is None) and not pd.isna(k_call) and not pd.isna(atm):
                 try:
@@ -1521,6 +1522,26 @@ def run_from_csv():
                         vprint(args.verbose, f"[{symbol}] Inferred put OTM strike = {k_put} from call width {width}")
                 except Exception:
                     pass
+
+            # --- Normalize strike ordering to ensure correct debit spread shape ---
+            # Calls: long lower (ATM), short higher (OTM)
+            # Puts : long higher (ATM), short lower (OTM)
+            try:
+                if not pd.isna(atm) and not pd.isna(k_call):
+                    _a = float(atm); _oc = float(k_call)
+                    # For CALL_OPEN signals, ensure OTM > ATM; otherwise swap
+                    if str(stype).upper() == "CALL_OPEN" and _oc <= _a:
+                        atm, k_call = _oc, _a
+                        vprint(args.verbose, f"[{symbol}] Normalized CALL legs -> ATM={atm}, OTM(call)={k_call}")
+                if not pd.isna(atm) and not pd.isna(k_put):
+                    _a = float(atm); _op = float(k_put)
+                    # For PUT_OPEN signals, ensure OTM < ATM; otherwise swap
+                    if str(stype).upper() == "PUT_OPEN" and _op >= _a:
+                        atm, k_put = _op, _a
+                        vprint(args.verbose, f"[{symbol}] Normalized PUT legs -> ATM={atm}, OTM(put)={k_put}")
+            except Exception:
+                # Non-fatal: leave legs as-is if casting fails
+                pass
 
             # Skip opens if essentials are missing; for CLOSE flows we will fall back to positions scan
             if symbol in (None, "nan", "NaN"):
