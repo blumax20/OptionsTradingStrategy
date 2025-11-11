@@ -82,13 +82,13 @@ def _tag_after_hours_limit(order):
     """
     try:
         t = _now_ny_time()
-        # "after-hours" = after 16:00 ET (and also before 09:30 ET if you happen to run early)
         if (t >= time(16, 0)) or (t < time(9, 30)):
-            order.tif = "GTC"
-            order.outsideRth = True
-            # If you prefer to *activate* at the next open (09:31) instead of holding overnight:
-            # nxt = _next_trading_date_ny()
-            # order.goodAfterTime = f"{nxt.strftime('%Y%m%d')} 09:31:00 US/Eastern"
+            if getattr(order, "action", "").upper() == "BUY":
+                # Let *opens* rest as GTC outside RTH
+                order.tif = "GTC"
+                order.outsideRth = True
+            # For SELL(CLOSE) we do NOT force GTC; if market is closed,
+            # a MKT close will be rejected (201) and your 15:00 preclose will send a real MKT during RTH.
     except Exception:
         pass
 
@@ -347,23 +347,40 @@ def log_decision(evt: str, symbol: str | None, reason: str, **fields):
     except Exception:
         logger.info(f"HEALTH_EVT {{'evt':'{evt}','symbol':'{symbol}','reason':'{reason}'}}")
 
+ATTEMPT_FIELDS = [
+    "ts","symbol","action","status","reason",
+    "exp","right","atm","oth",
+    "order_type","order_action","qty","order_id","prev_status",
+    "raw_theo","oi_atm","oi_otm","threshold",
+]
+
 def record_attempt(symbol: str, action: str, status: str, reason: str, **fields):
     """
     Accumulate a row for this run and also emit a HEALTH_EVT line.
     status: 'placed' | 'skipped' | 'error'
     action: 'open_call' | 'open_put' | 'close' | 'force_close' | etc.
     """
-    row = {"ts": _now_ny_iso(), "symbol": symbol or "", "action": action, "status": status, "reason": reason}
-    if fields:
-        row.update(fields)
+    row = {
+        "ts": _now_ny_iso(),
+        "symbol": symbol or "",
+        "action": action,
+        "status": status,
+        "reason": reason,
+    }
+
+    # only include valid keys from ATTEMPT_FIELDS
+    for k in ATTEMPT_FIELDS:
+        if k not in row and k in fields:
+            row[k] = fields[k]
+
     ATTEMPTS.append(row)
     log_decision("attempt", symbol, reason, action=action, status=status, **fields)
-    # Best-effort immediate append so mid-run actions survive early exits
+
     try:
         _attempts_append([row])
     except Exception:
         pass
-
+    
 # --- OI gating and RTH detection helpers ---
 def _is_rth(now: datetime | None = None) -> bool:
     """Return True if now is Regular Trading Hours (Mon-Fri, 09:30–16:00 America/New_York)."""
@@ -1569,13 +1586,13 @@ def run_from_csv():
                 Return a usable CLOSE limit. If x is None or below --min-limit,
                 bump to args.min_limit so we actually submit a limit order.
                 """
+                if x is None:
+                    return None                      # let caller fall through to MKT or next stage
                 try:
-                    if x is None:
-                        return args.min_limit
                     v = float(x)
-                    return v if v >= args.min_limit else args.min_limit
                 except Exception:
-                    return args.min_limit
+                    return None
+                return v if v >= args.min_limit else args.min_limit
             # Decide which legs to place
             allow_call = allow_put = False
             stype = str(row.get("signal_type") or "").upper()

@@ -567,7 +567,7 @@ class DailyCycleManagementMixin:
                 "--symbols", ",".join(sorted(set(syms))),
                 "--min-limit", "0.05",
                 "--use-live-close", "off",
-                "--quantity","50",
+                "--quantity","1",
                 "--quiet"
             ]
             try:
