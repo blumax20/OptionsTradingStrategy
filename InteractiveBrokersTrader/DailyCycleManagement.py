@@ -1491,62 +1491,136 @@ class DailyCycleManagementMixin:
             LOG.info("Reconcile: no open option positions detected.")
             return
 
-        # 2) Use the same candidate rules as pre-close (without adding working LMTs) and submit closes
+        # 2) Use only the single latest signal per held symbol within `days`, then compare to current orientation.
+        #    This avoids older-day OPEN rows taking precedence over a newer CLOSE and prevents misordered scans.
+        import csv as _csv, os as _os
+        from datetime import datetime as _dt
+
+        def _parse_ts_ny_safe(s):
+            try:
+                s = (s or "").strip()
+                if not s:
+                    return None
+                # common formats from listener
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                    try:
+                        return _dt.strptime(s, fmt)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return None
+
+        # Load rows from newest->older across the last `days` and compute the latest row per symbol
+        rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=max(1, days)) or []
+        # Build an order key: primary = parsed timestamp_ny, secondary = folder label (YY_MM_DD) as date
+        def _daylbl_to_dt(lbl):
+            try:
+                return _dt.strptime((lbl or "").strip(), "%y_%m_%d")
+            except Exception:
+                return _dt.min
+
+        latest_row_by_sym: dict[str, dict] = {}
+        for r in rows:
+            sym = (str(r.get("symbol", "")).strip().upper())
+            if not sym or sym not in held_info:
+                continue
+            ts = _parse_ts_ny_safe(r.get("timestamp_ny"))
+            day_lbl = str(r.get("_csv_src") or "").strip()
+            order_key = (ts or _daylbl_to_dt(day_lbl), _daylbl_to_dt(day_lbl))
+            prev = latest_row_by_sym.get(sym)
+            if prev is None:
+                latest_row_by_sym[sym] = {"row": r, "okey": order_key}
+            else:
+                if order_key > prev["okey"]:
+                    latest_row_by_sym[sym] = {"row": r, "okey": order_key}
+
         looked = 0
         submitted = 0
+
         for sym, cur_sign in sorted(held_info.items()):
             looked += 1
-            # decide using shared rules
+            if sym not in latest_row_by_sym:
+                LOG.info("Reconcile: no recent signal row for %s within %dd; leaving as-is.", sym, days)
+                try:
+                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                         reason="no_recent_signal", exp="", right="", source="dcm-reconcile")
+                except Exception:
+                    pass
+                continue
+
+            r = latest_row_by_sym[sym]["row"]
+            # Normalize the latest signal type into {CALL_OPEN, PUT_OPEN, CLOSE}
+            side_raw = (str(r.get("signal_type") or r.get("signal_side") or r.get("side") or "")).strip().upper()
+            # Fall-backs
+            if not side_raw:
+                try:
+                    sp = r.get("strategy_position")
+                    side_raw = "CLOSE" if (sp is not None and int(sp) == 0) else side_raw
+                except Exception:
+                    pass
+            if "CLOSE" in side_raw:
+                latest_is_close = True
+                latest_open_sign = None
+            elif "CALL" in side_raw and "OPEN" in side_raw:
+                latest_is_close = False
+                latest_open_sign = +1
+            elif "PUT" in side_raw and "OPEN" in side_raw:
+                latest_is_close = False
+                latest_open_sign = -1
+            else:
+                # Unknown row encoding; leave position unchanged
+                LOG.info("Reconcile: unknown signal encoding for %s; skipping. row_side=%s", sym, side_raw)
+                try:
+                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                         reason="unknown_signal_encoding", exp="", right="", source="dcm-reconcile")
+                except Exception:
+                    pass
+                continue
+
             should_close = False
             reason = None
-            if self._latest_signal_is_close(sym, days):
+            if latest_is_close:
                 should_close = True
                 reason = "reconcile_close_signal"
             else:
-                open_sign = self._latest_open_sign(sym, days)
-                if (open_sign is not None) and (cur_sign is not None) and (open_sign != cur_sign):
+                # If we have a clear current orientation and it mismatches the latest OPEN side, close to realign
+                if cur_sign is not None and latest_open_sign is not None and cur_sign != latest_open_sign:
                     should_close = True
                     reason = "reconcile_mismatch"
-                elif cur_sign is None and (open_sign is not None):
-                    # ambiguous position vs explicit latest open side -> close to realign
-                    should_close = True
-                    reason = "reconcile_ambiguous"
+                else:
+                    LOG.info("Reconcile: latest signal for %s is OPEN and matches current orientation; holding.", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                             reason="latest_open_matches", exp="", right="", source="dcm-reconcile")
+                    except Exception:
+                        pass
 
-            if not should_close:
-                LOG.info("Reconcile: latest signal for %s does not require action; leaving as-is.", sym)
-                try:
-                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
-                                         reason="latest_open_matches_or_ambiguous",
-                                         exp="", right="", source="dcm-reconcile")
-                except Exception:
-                    pass
-                continue
+            # Duplicate guard
+            if should_close:
+                if not hasattr(self, "_submitted_close_syms"):
+                    self._submitted_close_syms = set()
+                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                             reason="working_close_order", exp="", right="", source="dcm-reconcile")
+                    except Exception:
+                        pass
+                    continue
 
-            # avoid duplicates
-            if not hasattr(self, "_submitted_close_syms"):
-                self._submitted_close_syms = set()
-            if sym in self._submitted_close_syms or self._has_working_close_order(sym):
-                LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
-                try:
-                    _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-                                         reason="working_close_order",
-                                         exp="", right="", source="dcm-reconcile")
-                except Exception:
-                    pass
-                continue
+                # Delegate the close using the standard shared path
+                self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
+                self._submitted_close_syms.add(sym)
+                submitted += 1
 
-            # submit using the same shared path
-            self._submit_close_shared(sym, os.path.exists(_ny_csv_path()), days, context="reconcile")
-            self._submitted_close_syms.add(sym)
-            submitted += 1
-
-            # if the latest signal was CLOSE, also flatten any stock leg
-            try:
-                if self._latest_signal_is_close(sym, days):
-                    if self._flatten_stock_if_present(sym):
-                        LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
-            except Exception as _e_stk:
-                LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
+                # If the latest signal was CLOSE, also flatten any stock leg
+                if latest_is_close:
+                    try:
+                        if self._flatten_stock_if_present(sym):
+                            LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
+                    except Exception as _e_stk:
+                        LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
