@@ -271,55 +271,60 @@ class DailyCycleManagementMixin:
         Delegates to PlaceAnOrder first; if no working close order exists afterwards, falls back
         to a positions-based MARKET close.
         """
-        # Stage 1: delegate using CSV-derived limits only (no live quotes)
-        self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_csv_limit", source=f"dcm-{context}")
-        self._run_place_an_order([
-            "--mode","force-close",
-            "--symbols", sym,
-            "--min-limit","0.01" if context == "preclose" else "0.05",
-            "--use-live-close","off",
-            "--quantity","50",
-            "--quiet"
-        ])
-        if self._has_working_close_order(sym):
-            self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_csv_limit_working", source=f"dcm-{context}")
-        else:
-            # Stage 2: delegate using live mid quotes as fallback
-            self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_live_mid", source=f"dcm-{context}")
+        _prev_phase = getattr(self, "_in_close_phase", False)
+        self._in_close_phase = True
+        try:
+            # Stage 1: delegate using CSV-derived limits only (no live quotes)
+            self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_csv_limit", source=f"dcm-{context}")
             self._run_place_an_order([
                 "--mode","force-close",
                 "--symbols", sym,
                 "--min-limit","0.01" if context == "preclose" else "0.05",
-                "--use-live-close","mid",
+                "--use-live-close","off",
                 "--quantity","50",
                 "--quiet"
             ])
             if self._has_working_close_order(sym):
-                self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_live_mid_working", source=f"dcm-{context}")
+                self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_csv_limit_working", source=f"dcm-{context}")
             else:
-                # Stage 3: positions-based MARKET fallback
-                did = False
-                try:
-                    did = self._try_close_from_positions(sym, prefer="MKT")
-                except Exception:
-                    did = False
-                if did:
-                    self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_positions_fallback", source=f"dcm-{context}")
+                # Stage 2: delegate using live mid quotes as fallback
+                self._attempt(symbol=sym, action="close", status="queued", reason=f"{context}_delegated_live_mid", source=f"dcm-{context}")
+                self._run_place_an_order([
+                    "--mode","force-close",
+                    "--symbols", sym,
+                    "--min-limit","0.01" if context == "preclose" else "0.05",
+                    "--use-live-close","mid",
+                    "--quantity","50",
+                    "--quiet"
+                ])
+                if self._has_working_close_order(sym):
+                    self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_live_mid_working", source=f"dcm-{context}")
                 else:
-                    self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_no_working_close", source=f"dcm-{context}")
+                    # Stage 3: positions-based MARKET fallback
+                    did = False
+                    try:
+                        did = self._try_close_from_positions(sym, prefer="MKT")
+                    except Exception:
+                        did = False
+                    if did:
+                        self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_positions_fallback", source=f"dcm-{context}")
+                    else:
+                        self._attempt(symbol=sym, action="close", status="submitted", reason=f"{context}_delegated_no_working_close", source=f"dcm-{context}")
 
-        # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
-        try:
-            if self._latest_signal_is_close(sym, lookback_days):
-                if self._flatten_stock_if_present(sym):
-                    self._attempt(symbol=sym,
-                                  action="close_stock",
-                                  status="submitted",
-                                  reason=f"{context}_latest_close_flatten",
-                                  source=f"dcm-{context}")
-        except Exception:
-            # best-effort; do not fail close submission if STK flatten throws
-            pass
+            # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
+            try:
+                if self._latest_signal_is_close(sym, lookback_days):
+                    if self._flatten_stock_if_present(sym):
+                        self._attempt(symbol=sym,
+                                    action="close_stock",
+                                    status="submitted",
+                                    reason=f"{context}_latest_close_flatten",
+                                    source=f"dcm-{context}")
+            except Exception:
+                # best-effort; do not fail close submission if STK flatten throws
+                pass
+        finally:
+            self._in_close_phase = _prev_phase
 
     def _csv_paths_by_priority(days: int = 2) -> list[str]:
         """
@@ -385,6 +390,10 @@ class DailyCycleManagementMixin:
         Delegate OPEN placements to PlaceAnOrder.py using only the most recent CSVs (default: today & yesterday).
         Filters to rows with OPEN signals and expiration DTE >= min_dte. DCM does not talk to broker here.
         """
+        # Suppress OPEN delegation if a CLOSE phase is active
+        if getattr(self, "_in_close_phase", False):
+            LOG.info("Open-delegate suppressed (close phase active).")
+            return
         now_d = self._now_ny().date()
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, last_n_csvs))
         if not paths:
@@ -493,172 +502,177 @@ class DailyCycleManagementMixin:
         across the whole window to avoid double-submitting per day.
         Implementation: only delegates to PlaceAnOrder.py (no direct IB order placement).
         """
-        paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
-        if not paths:
-            LOG.info("Close-delegate: no CSVs within %d day(s); skipping.", days)
-            return
-
-        # Newest→older map: sym -> (row, folder_label, file_path)
-        latest_by_sym: dict[str, tuple[dict, str, str]] = {}
-        for path in paths:
-            label = Path(path).parent.name  # YY_MM_DD
-            try:
-                with open(path, newline="", encoding="utf-8") as fh:
-                    rdr = csv.DictReader(fh)
-                    for r in rdr:
-                        sym = (r.get("symbol") or "").strip().upper()
-                        if not sym:
-                            continue
-                        # Keep the first time we see a symbol while iterating newest→older => newest row wins
-                        if sym not in latest_by_sym:
-                            latest_by_sym[sym] = (r, label, path)
-            except Exception as e:
-                LOG.warning("Close-delegate: failed reading %s: %s", path, e)
-                continue
-
-        def _is_close(row: dict) -> bool:
-            side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
-            if "close" in side_raw:
-                return True
-            # Fallbacks: treat strategy_position == 0 as a close-like signal if present
-            sp = (row.get("strategy_position") or "").strip()
-            try:
-                if sp and int(sp) == 0:
-                    return True
-            except Exception:
-                pass
-            # Some listener variants encode as 'sell,CLOSE' in a generic 'side' column
-            side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
-            return "close" in side_col
-
-        # Pick only those symbols whose newest row within the window is CLOSE
-        pick: list[str] = []
-        per_day_counts: dict[str, int] = {}
-        for sym, (row, label, _) in latest_by_sym.items():
-            if _is_close(row):
-                pick.append(sym)
-                per_day_counts[label] = per_day_counts.get(label, 0) + 1
-
-        if not pick:
-            LOG.info("Close-delegate: no CLOSE symbols found in the last %d day(s).", days)
-            return
-
-        # Log diagnostic breakdown by CSV day so you can verify older sessions are included
+        _prev_phase = getattr(self, "_in_close_phase", False)
+        self._in_close_phase = True
         try:
-            breakdown = ", ".join(f"{d}:{n}" for d, n in sorted(per_day_counts.items(), reverse=True))
-            LOG.info("Close-delegate: %d CLOSE symbol(s) across %d day(s) [%s].",
-                     len(pick), len(paths), breakdown)
-        except Exception:
-            pass
+            paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
+            if not paths:
+                LOG.info("Close-delegate: no CSVs within %d day(s); skipping.", days)
+                return
 
-        # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
-        # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
-        by_day: dict[str, list[str]] = {}
-        for sym, (row, day_lbl, _) in latest_by_sym.items():
-            if sym in pick:
-                by_day.setdefault(day_lbl, []).append(sym)
-
-        for day_lbl, syms in sorted(by_day.items(), reverse=True):
-            if not syms:
-                continue
-            argv_csv = [
-                "--mode", "from-signal",
-                "--date", day_lbl,
-                "--symbols", ",".join(sorted(set(syms))),
-                "--min-limit", "0.05",
-                "--use-live-close", "off",
-                "--quantity","1",
-                "--quiet"
-            ]
-            try:
-                self._attempt(
-                    action="close",
-                    status="queued",
-                    reason=f"close_from_csv_limits_{day_lbl}",
-                    source="dcm-close",
-                    symbol=",".join(sorted(set(syms))),
-                )
-            except Exception:
-                pass
-            self._run_place_an_order(argv_csv)
-
-        # --- Stage 1.5: live-mid fallback via PlaceAnOrder for any symbols still lacking a working close ---
-        still_open: list[str] = []
-        for s in sorted(set(pick)):
-            if not self._has_working_close_order(s):
-                still_open.append(s)
-
-        if still_open:
-            syms_joined = ",".join(still_open)
-            argv_mid = [
-                "--mode", "force-close",
-                "--symbols", syms_joined,
-                "--min-limit", "0.05",
-                "--use-live-close", "mid",
-                "--quantity","50",
-                "--quiet"
-            ]
-            try:
-                self._attempt(
-                    action="close",
-                    status="queued",
-                    reason=f"close_live_mid_fallback_within_{days}d",
-                    source="dcm-close",
-                    symbol=syms_joined,
-                )
-            except Exception:
-                pass
-            self._run_place_an_order(argv_mid)
-
-        # --- Stage 2: final market fallback for anything still without a working close (positions-based in PlaceAnOrder) ---
-        still_open2: list[str] = []
-        for s in sorted(set(pick)):
-            if not self._has_working_close_order(s):
-                still_open2.append(s)
-        if still_open2:
-            syms_joined2 = ",".join(still_open2)
-            argv_mkt = [
-                "--mode", "force-close",
-                "--symbols", syms_joined2,
-                "--min-limit", "0.05",
-                "--use-live-close", "off",
-                "--quantity","50",
-                "--quiet"
-            ]
-            try:
-                self._attempt(
-                    action="close",
-                    status="queued",
-                    reason=f"close_market_fallback_within_{days}d",
-                    source="dcm-close",
-                    symbol=syms_joined2,
-                )
-            except Exception:
-                pass
-            self._run_place_an_order(argv_mkt)
-
-        # Flatten STK legs if newest signal is CLOSE (delegated CLOSE was just submitted)
-        try:
-            for s in sorted(set(pick)):
+            # Newest→older map: sym -> (row, folder_label, file_path)
+            latest_by_sym: dict[str, tuple[dict, str, str]] = {}
+            for path in paths:
+                label = Path(path).parent.name  # YY_MM_DD
                 try:
-                    if self._latest_signal_is_close(s, days):
-                        if self._flatten_stock_if_present(s):
-                            self._attempt(symbol=s,
-                                          action="close_stock",
-                                          status="submitted",
-                                          reason=f"close_within_{days}d_flatten",
-                                          source="dcm-close")
+                    with open(path, newline="", encoding="utf-8") as fh:
+                        rdr = csv.DictReader(fh)
+                        for r in rdr:
+                            sym = (r.get("symbol") or "").strip().upper()
+                            if not sym:
+                                continue
+                            # Keep the first time we see a symbol while iterating newest→older => newest row wins
+                            if sym not in latest_by_sym:
+                                latest_by_sym[sym] = (r, label, path)
+                except Exception as e:
+                    LOG.warning("Close-delegate: failed reading %s: %s", path, e)
+                    continue
+
+            def _is_close(row: dict) -> bool:
+                side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
+                if "close" in side_raw:
+                    return True
+                # Fallbacks: treat strategy_position == 0 as a close-like signal if present
+                sp = (row.get("strategy_position") or "").strip()
+                try:
+                    if sp and int(sp) == 0:
+                        return True
                 except Exception:
                     pass
-        except Exception:
-            pass
+                # Some listener variants encode as 'sell,CLOSE' in a generic 'side' column
+                side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
+                return "close" in side_col
 
-        try:
-            self._attempt(action="close", status="submitted",
-                          reason=f"close_within_{days}d", source="dcm-close",
-                          symbol=",".join(sorted(set(pick))))
-        except Exception:
-            pass
+            # Pick only those symbols whose newest row within the window is CLOSE
+            pick: list[str] = []
+            per_day_counts: dict[str, int] = {}
+            for sym, (row, label, _) in latest_by_sym.items():
+                if _is_close(row):
+                    pick.append(sym)
+                    per_day_counts[label] = per_day_counts.get(label, 0) + 1
+
+            if not pick:
+                LOG.info("Close-delegate: no CLOSE symbols found in the last %d day(s).", days)
+                return
+
+            # Log diagnostic breakdown by CSV day so you can verify older sessions are included
+            try:
+                breakdown = ", ".join(f"{d}:{n}" for d, n in sorted(per_day_counts.items(), reverse=True))
+                LOG.info("Close-delegate: %d CLOSE symbol(s) across %d day(s) [%s].",
+                        len(pick), len(paths), breakdown)
+            except Exception:
+                pass
+
+            # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
+            # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
+            by_day: dict[str, list[str]] = {}
+            for sym, (row, day_lbl, _) in latest_by_sym.items():
+                if sym in pick:
+                    by_day.setdefault(day_lbl, []).append(sym)
+
+            for day_lbl, syms in sorted(by_day.items(), reverse=True):
+                if not syms:
+                    continue
+                argv_csv = [
+                    "--mode", "from-signal",
+                    "--date", day_lbl,
+                    "--symbols", ",".join(sorted(set(syms))),
+                    "--min-limit", "0.05",
+                    "--use-live-close", "off",
+                    "--quantity","1",
+                    "--quiet"
+                ]
+                try:
+                    self._attempt(
+                        action="close",
+                        status="queued",
+                        reason=f"close_from_csv_limits_{day_lbl}",
+                        source="dcm-close",
+                        symbol=",".join(sorted(set(syms))),
+                    )
+                except Exception:
+                    pass
+                self._run_place_an_order(argv_csv)
+
+            # --- Stage 1.5: live-mid fallback via PlaceAnOrder for any symbols still lacking a working close ---
+            still_open: list[str] = []
+            for s in sorted(set(pick)):
+                if not self._has_working_close_order(s):
+                    still_open.append(s)
+
+            if still_open:
+                syms_joined = ",".join(still_open)
+                argv_mid = [
+                    "--mode", "force-close",
+                    "--symbols", syms_joined,
+                    "--min-limit", "0.05",
+                    "--use-live-close", "mid",
+                    "--quantity","50",
+                    "--quiet"
+                ]
+                try:
+                    self._attempt(
+                        action="close",
+                        status="queued",
+                        reason=f"close_live_mid_fallback_within_{days}d",
+                        source="dcm-close",
+                        symbol=syms_joined,
+                    )
+                except Exception:
+                    pass
+                self._run_place_an_order(argv_mid)
+
+            # --- Stage 2: final market fallback for anything still without a working close (positions-based in PlaceAnOrder) ---
+            still_open2: list[str] = []
+            for s in sorted(set(pick)):
+                if not self._has_working_close_order(s):
+                    still_open2.append(s)
+            if still_open2:
+                syms_joined2 = ",".join(still_open2)
+                argv_mkt = [
+                    "--mode", "force-close",
+                    "--symbols", syms_joined2,
+                    "--min-limit", "0.05",
+                    "--use-live-close", "off",
+                    "--quantity","50",
+                    "--quiet"
+                ]
+                try:
+                    self._attempt(
+                        action="close",
+                        status="queued",
+                        reason=f"close_market_fallback_within_{days}d",
+                        source="dcm-close",
+                        symbol=syms_joined2,
+                    )
+                except Exception:
+                    pass
+                self._run_place_an_order(argv_mkt)
+
+            # Flatten STK legs if newest signal is CLOSE (delegated CLOSE was just submitted)
+            try:
+                for s in sorted(set(pick)):
+                    try:
+                        if self._latest_signal_is_close(s, days):
+                            if self._flatten_stock_if_present(s):
+                                self._attempt(symbol=s,
+                                            action="close_stock",
+                                            status="submitted",
+                                            reason=f"close_within_{days}d_flatten",
+                                            source="dcm-close")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                self._attempt(action="close", status="submitted",
+                            reason=f"close_within_{days}d", source="dcm-close",
+                            symbol=",".join(sorted(set(pick))))
+            except Exception:
+                pass
+        finally:
+            self._in_close_phase = _prev_phase
 
     def _try_close_from_positions(self, sym: str, prefer: str = "MKT") -> bool:
         """
@@ -1261,10 +1275,8 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
             return
-
         for sym in sorted(close_candidates):
             self._submit_close_shared(sym, csv_exists_today, lookback_days, context="preclose")
-
         try:
             self._summarize_latest_attempts()
         except Exception as e:
@@ -1608,12 +1620,15 @@ class DailyCycleManagementMixin:
                     except Exception:
                         pass
                     continue
-
-                # Delegate the close using the standard shared path
-                self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
-                self._submitted_close_syms.add(sym)
-                submitted += 1
-
+                _prev_phase = getattr(self, "_in_close_phase", False)
+                self._in_close_phase = True
+                try:
+                    # Delegate the close using the standard shared path
+                    self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
+                    self._submitted_close_syms.add(sym)
+                    submitted += 1
+                finally:
+                    self._in_close_phase = _prev_phase
                 # If the latest signal was CLOSE, also flatten any stock leg
                 if latest_is_close:
                     try:
