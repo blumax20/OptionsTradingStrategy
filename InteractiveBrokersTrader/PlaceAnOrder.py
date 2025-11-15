@@ -75,20 +75,35 @@ def _next_trading_date_ny(start_dt=None):
 
 def _tag_after_hours_limit(order):
     """
-    For after-hours placements, make the limit order acceptable & persistent until RTH:
-      - tif=GTC so TWS keeps it across sessions
-      - outsideRth=True so TWS accepts/holds it after close
-      - (optional) goodAfterTime to stage for next RTH open and avoid any premarket
+    For after-hours placements, optionally mark limit orders as GTC/outsideRth.
+
+    Policy:
+      - All orders are DAY by default (we set tif='DAY' when creating orders).
+      - Only Sunday weekly CLOSE orders (SELL combos placed on Sunday) should be GTC,
+        so they can work across sessions as part of weekly cleanup.
+      - No after-hours BUY (OPEN) orders should be forced to GTC.
     """
     try:
-        t = _now_ny_time()
+        try:
+            now_ny = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            now_ny = datetime.now()
+        t = now_ny.time()
+        wd = now_ny.weekday()  # Monday=0 .. Sunday=6
+        # Only consider adjustments outside RTH
         if (t >= time(16, 0)) or (t < time(9, 30)):
-            if getattr(order, "action", "").upper() == "BUY":
-                # Let *opens* rest as GTC outside RTH
-                order.tif = "GTC"
-                order.outsideRth = True
-            # For SELL(CLOSE) we do NOT force GTC; if market is closed,
-            # a MKT close will be rejected (201) and your 15:00 preclose will send a real MKT during RTH.
+            act = (getattr(order, "action", "") or "").upper()
+            # Only Sunday CLOSE (SELL) orders should be forced to GTC
+            if wd == 6 and act == "SELL":
+                try:
+                    order.tif = "GTC"
+                except Exception:
+                    pass
+                try:
+                    order.outsideRth = True
+                except Exception:
+                    pass
+        # All other orders keep their explicitly set TIF (usually 'DAY').
     except Exception:
         pass
 
@@ -854,12 +869,22 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                 # convert to LMT at least at min price (use args.min_limit if you have it; otherwise 0.05)
                 safe_min = 0.05
                 order = LimitOrder(action.upper(), quantity, float(safe_min))
+                # All orders default to DAY; Sunday CLOSEs may be promoted to GTC by _tag_after_hours_limit
+                try:
+                    order.tif = "DAY"
+                except Exception:
+                    pass
                 _tag_after_hours_limit(order)
                 trade = ib.placeOrder(combo, order)
                 actual_order_type = "LMT"
                 actual_limit = float(safe_min)
             else:
                 order = MarketOrder(action.upper(), quantity)
+                # Explicitly default to DAY for all other orders
+                try:
+                    order.tif = "DAY"
+                except Exception:
+                    pass
                 trade = ib.placeOrder(combo, order)
                 actual_order_type = "MKT"
                 actual_limit = None
@@ -920,6 +945,11 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             return trade
         else:
             order = LimitOrder(action.upper(), quantity, float(limit_price))
+            # Default all orders to DAY; Sunday CLOSEs may be promoted to GTC by _tag_after_hours_limit
+            try:
+                order.tif = "DAY"
+            except Exception:
+                pass
             _tag_after_hours_limit(order)
             trade = ib.placeOrder(combo, order)
             actual_order_type = "LMT"
