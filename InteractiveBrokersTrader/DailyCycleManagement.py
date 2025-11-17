@@ -1493,256 +1493,6 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("Attempts summary error: %s", e)
 
-def _enforce_recent_closes(self, days: int = 7) -> None:
-    """
-    Ensure any CLOSE signals from the last `days` are enforced (no lingering exposure).
-    Intended for short lookbacks (e.g., 7 days) so that if a CLOSE signal wasn't fully filled
-    on the next trading day, it is re-attempted — but only where no existing CLOSE order is working.
-    Run host hook if present; otherwise delegate via the same guarded CSV-based path used for
-    close sweeps, which honors _has_working_close_order per symbol.
-    """
-    if hasattr(self, "enforce_recent_closures"):
-        LOG.info("Enforcing recent CLOSE signals (host) for last %d days...", days)
-        try:
-            self.enforce_recent_closures(days=days)
-            LOG.info("Recent CLOSE enforcement (host) completed.")
-        except Exception as e:
-            LOG.exception("Recent CLOSE enforcement (host) failed: %s", e)
-    else:
-        LOG.info("Recent CLOSE enforcement host hook not implemented; using DCM CSV-based fallback.")
-        # Use the guarded CSV-based delegate, which skips symbols that already have working CLOSE orders.
-        try:
-            self._delegate_close_from_csvs_within(days=days)
-        except Exception as e:
-            LOG.exception("Recent CLOSE enforcement (fallback) failed: %s", e)
-
-    # Always summarize attempts after enforcement
-    try:
-        self._summarize_latest_attempts()
-    except Exception as e:
-        LOG.warning("Attempts summary error after recent close enforcement: %s", e)
-
-    def _reconcile_positions_with_signals_lookback(self, days: int = 21) -> None:
-        """
-        Outside RTH, reconcile current positions against the *latest* signal per symbol
-        by scanning only the symbols we currently hold. For each held symbol, walk the
-        last `days` of CSVs (newest -> oldest) and stop at the first matching row.
-        If that row's signal is OPEN (and matches orientation) -> log and skip; if CLOSE or mismatched OPEN -> submit a force-close.
-        """
-        # 1) Collect currently held option symbols and their orientation
-        try:
-            from ib_insync import IB
-        except Exception as e:
-            LOG.warning("Reconcile: ib_insync unavailable; skipping IB position check: %s", e)
-            return
-
-        ib = IB()
-        try:
-            ib.connect('127.0.0.1', 7497, clientId=882, timeout=6)
-        except Exception as e:
-            LOG.warning("Reconcile: could not connect to IB: %s", e)
-            return
-
-        held_info: dict[str, int | None] = {}
-        try:
-            poss = ib.positions()
-            legs_by_sym: dict[str, list[tuple[str, float, float, float]]] = {}
-            for p in poss:
-                c = p.contract
-                if getattr(c, 'secType', '') != 'OPT':
-                    continue
-                q = float(p.position or 0.0)
-                if abs(q) < 1e-9:
-                    continue
-                sym = (getattr(c, 'symbol', '') or '').upper()
-                right = (getattr(c, 'right', '') or '').upper()   # 'C' or 'P'
-                strike = float(getattr(c, 'strike', 0.0))
-                avg = float(p.avgCost or 0.0)
-                legs_by_sym.setdefault(sym, []).append((right, strike, q, avg))
-            for sym, legs in legs_by_sym.items():
-                sign: int | None = None
-                if len(legs) >= 2:
-                    calls = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "C"]
-                    puts  = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "P"]
-                    call_debit = False
-                    put_debit = False
-                    for i in range(len(calls)):
-                        for j in range(len(calls)):
-                            if i == j: continue
-                            s1, q1, _ = calls[i]
-                            s2, q2, _ = calls[j]
-                            if s1 < s2 and q1 > 0 and q2 < 0:
-                                call_debit = True
-                    for i in range(len(puts)):
-                        for j in range(len(puts)):
-                            if i == j: continue
-                            s1, q1, _ = puts[i]
-                            s2, q2, _ = puts[j]
-                            if s1 > s2 and q1 > 0 and q2 < 0:
-                                put_debit = True
-                    if call_debit and not put_debit:
-                        sign = +1
-                    elif put_debit and not call_debit:
-                        sign = -1
-                    elif call_debit and put_debit:
-                        call_notional = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in calls)
-                        put_notional  = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in puts)
-                        if call_notional > put_notional:
-                            sign = +1
-                        elif put_notional > call_notional:
-                            sign = -1
-                        else:
-                            sign = None
-                    else:
-                        sign = None
-                held_info[sym] = sign
-        except Exception as e:
-            LOG.warning("Reconcile: error fetching positions: %s", e)
-        finally:
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
-
-        if not held_info:
-            LOG.info("Reconcile: no open option positions detected.")
-            return
-
-        # 2) Use only the single latest signal per held symbol within `days`, then compare to current orientation.
-        #    This avoids older-day OPEN rows taking precedence over a newer CLOSE and prevents misordered scans.
-        import csv as _csv, os as _os
-        from datetime import datetime as _dt
-
-        def _parse_ts_ny_safe(s):
-            try:
-                s = (s or "").strip()
-                if not s:
-                    return None
-                # common formats from listener
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
-                    try:
-                        return _dt.strptime(s, fmt)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            return None
-
-        # Load rows from newest->older across the last `days` and compute the latest row per symbol
-        rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=max(1, days)) or []
-        # Build an order key: primary = parsed timestamp_ny, secondary = folder label (YY_MM_DD) as date
-        def _daylbl_to_dt(lbl):
-            try:
-                return _dt.strptime((lbl or "").strip(), "%y_%m_%d")
-            except Exception:
-                return _dt.min
-
-        latest_row_by_sym: dict[str, dict] = {}
-        for r in rows:
-            sym = (str(r.get("symbol", "")).strip().upper())
-            if not sym or sym not in held_info:
-                continue
-            ts = _parse_ts_ny_safe(r.get("timestamp_ny"))
-            day_lbl = str(r.get("_csv_src") or "").strip()
-            order_key = (ts or _daylbl_to_dt(day_lbl), _daylbl_to_dt(day_lbl))
-            prev = latest_row_by_sym.get(sym)
-            if prev is None:
-                latest_row_by_sym[sym] = {"row": r, "okey": order_key}
-            else:
-                if order_key > prev["okey"]:
-                    latest_row_by_sym[sym] = {"row": r, "okey": order_key}
-
-        looked = 0
-        submitted = 0
-
-        for sym, cur_sign in sorted(held_info.items()):
-            looked += 1
-            if sym not in latest_row_by_sym:
-                LOG.info("Reconcile: no recent signal row for %s within %dd; leaving as-is.", sym, days)
-                try:
-                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
-                                         reason="no_recent_signal", exp="", right="", source="dcm-reconcile")
-                except Exception:
-                    pass
-                continue
-
-            r = latest_row_by_sym[sym]["row"]
-            # Normalize the latest signal type into {CALL_OPEN, PUT_OPEN, CLOSE}
-            side_raw = (str(r.get("signal_type") or r.get("signal_side") or r.get("side") or "")).strip().upper()
-            # Fall-backs
-            if not side_raw:
-                try:
-                    sp = r.get("strategy_position")
-                    side_raw = "CLOSE" if (sp is not None and int(sp) == 0) else side_raw
-                except Exception:
-                    pass
-            if "CLOSE" in side_raw:
-                latest_is_close = True
-                latest_open_sign = None
-            elif "CALL" in side_raw and "OPEN" in side_raw:
-                latest_is_close = False
-                latest_open_sign = +1
-            elif "PUT" in side_raw and "OPEN" in side_raw:
-                latest_is_close = False
-                latest_open_sign = -1
-            else:
-                # Unknown row encoding; leave position unchanged
-                LOG.info("Reconcile: unknown signal encoding for %s; skipping. row_side=%s", sym, side_raw)
-                try:
-                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
-                                         reason="unknown_signal_encoding", exp="", right="", source="dcm-reconcile")
-                except Exception:
-                    pass
-                continue
-
-            should_close = False
-            reason = None
-            if latest_is_close:
-                should_close = True
-                reason = "reconcile_close_signal"
-            else:
-                # If we have a clear current orientation and it mismatches the latest OPEN side, close to realign
-                if cur_sign is not None and latest_open_sign is not None and cur_sign != latest_open_sign:
-                    should_close = True
-                    reason = "reconcile_mismatch"
-                else:
-                    LOG.info("Reconcile: latest signal for %s is OPEN and matches current orientation; holding.", sym)
-                    try:
-                        _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
-                                             reason="latest_open_matches", exp="", right="", source="dcm-reconcile")
-                    except Exception:
-                        pass
-
-            # Duplicate guard
-            if should_close:
-                if not hasattr(self, "_submitted_close_syms"):
-                    self._submitted_close_syms = set()
-                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
-                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
-                    try:
-                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-                                             reason="working_close_order", exp="", right="", source="dcm-reconcile")
-                    except Exception:
-                        pass
-                    continue
-                _prev_phase = getattr(self, "_in_close_phase", False)
-                self._in_close_phase = True
-                try:
-                    # Delegate the close using the standard shared path
-                    self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
-                    self._submitted_close_syms.add(sym)
-                    submitted += 1
-                finally:
-                    self._in_close_phase = _prev_phase
-                # If the latest signal was CLOSE, also flatten any stock leg
-                if latest_is_close:
-                    try:
-                        if self._flatten_stock_if_present(sym):
-                            LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
-                    except Exception as _e_stk:
-                        LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
-
-        LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
     def _rth_risk_exits(self, days_old: int = 7, loss_frac: float = 0.5, gain_frac: float = 0.5) -> None:
         """
@@ -2552,3 +2302,244 @@ if __name__ == "__main__":
     except Exception as e:
         LOG.exception("DailyCycleManagement top-level error: %s", e)
         sys.exit(2)
+    def _enforce_recent_closes(self, days: int = 7) -> None:
+        """
+        Ensure any CLOSE signals from the last `days` are enforced (no lingering exposure).
+        Intended for short lookbacks (e.g., 7 days) so that if a CLOSE signal wasn't fully filled
+        on the next trading day, it is re-attempted — but only where no existing CLOSE order is working.
+        Run host hook if present; otherwise delegate via the same guarded CSV-based path used for
+        close sweeps, which honors _has_working_close_order per symbol.
+        """
+        if hasattr(self, "enforce_recent_closures"):
+            LOG.info("Enforcing recent CLOSE signals (host) for last %d days...", days)
+            try:
+                self.enforce_recent_closures(days=days)
+                LOG.info("Recent CLOSE enforcement (host) completed.")
+            except Exception as e:
+                LOG.exception("Recent CLOSE enforcement (host) failed: %s", e)
+        else:
+            LOG.info("Recent CLOSE enforcement host hook not implemented; using DCM CSV-based fallback.")
+            # Use the guarded CSV-based delegate, which skips symbols that already have working CLOSE orders.
+            try:
+                self._delegate_close_from_csvs_within(days=days)
+            except Exception as e:
+                LOG.exception("Recent CLOSE enforcement (fallback) failed: %s", e)
+
+        # Always summarize attempts after enforcement
+        try:
+            self._summarize_latest_attempts()
+        except Exception as e:
+            LOG.warning("Attempts summary error after recent close enforcement: %s", e)
+
+    def _reconcile_positions_with_signals_lookback(self, days: int = 21) -> None:
+        """
+        Outside RTH, reconcile current positions against the *latest* signal per symbol
+        by scanning only the symbols we currently hold. For each held symbol, walk the
+        last `days` of CSVs (newest -> oldest) and stop at the first matching row.
+        If that row's signal is OPEN (and matches orientation) -> log and skip; if CLOSE or mismatched OPEN -> submit a force-close.
+        """
+        # 1) Collect currently held option symbols and their orientation
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("Reconcile: ib_insync unavailable; skipping IB position check: %s", e)
+            return
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=882, timeout=6)
+        except Exception as e:
+            LOG.warning("Reconcile: could not connect to IB: %s", e)
+            return
+
+        held_info: dict[str, int | None] = {}
+        try:
+            poss = ib.positions()
+            legs_by_sym: dict[str, list[tuple[str, float, float, float]]] = {}
+            for p in poss:
+                c = p.contract
+                if getattr(c, 'secType', '') != 'OPT':
+                    continue
+                q = float(p.position or 0.0)
+                if abs(q) < 1e-9:
+                    continue
+                sym = (getattr(c, 'symbol', '') or '').upper()
+                right = (getattr(c, 'right', '') or '').upper()   # 'C' or 'P'
+                strike = float(getattr(c, 'strike', 0.0))
+                avg = float(p.avgCost or 0.0)
+                legs_by_sym.setdefault(sym, []).append((right, strike, q, avg))
+            for sym, legs in legs_by_sym.items():
+                sign: int | None = None
+                if len(legs) >= 2:
+                    calls = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "C"]
+                    puts  = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "P"]
+                    call_debit = False
+                    put_debit = False
+                    for i in range(len(calls)):
+                        for j in range(len(calls)):
+                            if i == j: 
+                                continue
+                            s1, q1, _ = calls[i]
+                            s2, q2, _ = calls[j]
+                            if s1 < s2 and q1 > 0 and q2 < 0:
+                                call_debit = True
+                    for i in range(len(puts)):
+                        for j in range(len(puts)):
+                            if i == j: 
+                                continue
+                            s1, q1, _ = puts[i]
+                            s2, q2, _ = puts[j]
+                            if s1 > s2 and q1 > 0 and q2 < 0:
+                                put_debit = True
+                    if call_debit and not put_debit:
+                        sign = +1
+                    elif put_debit and not call_debit:
+                        sign = -1
+                    elif call_debit and put_debit:
+                        call_notional = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in calls)
+                        put_notional  = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in puts)
+                        if call_notional > put_notional:
+                            sign = +1
+                        elif put_notional > call_notional:
+                            sign = -1
+                        else:
+                            sign = None
+                    else:
+                        sign = None
+                held_info[sym] = sign
+        except Exception as e:
+            LOG.warning("Reconcile: error fetching positions: %s", e)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        if not held_info:
+            LOG.info("Reconcile: no open option positions detected.")
+            return
+
+        # 2) Use only the single latest signal per held symbol within `days`, then compare to current orientation.
+        import csv as _csv, os as _os
+        from datetime import datetime as _dt
+
+        def _parse_ts_ny_safe(s):
+            try:
+                s = (s or "").strip()
+                if not s:
+                    return None
+                # common formats from listener
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                    try:
+                        return _dt.strptime(s, fmt)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return None
+
+        # Load rows from newest->older across the last `days` and compute the latest row per symbol
+        rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=max(1, days)) or []
+        def _daylbl_to_dt(lbl):
+            try:
+                return _dt.strptime((lbl or "").strip(), "%y_%m_%d")
+            except Exception:
+                return _dt.min
+
+        latest_row_by_sym: dict[str, dict] = {}
+        for r in rows:
+            sym = (str(r.get("symbol", "")).strip().upper())
+            if not sym or sym not in held_info:
+                continue
+            ts = _parse_ts_ny_safe(r.get("timestamp_ny"))
+            day_lbl = str(r.get("_csv_src") or "").strip()
+            order_key = (ts or _daylbl_to_dt(day_lbl), _daylbl_to_dt(day_lbl))
+            prev = latest_row_by_sym.get(sym)
+            if prev is None or order_key > prev["okey"]:
+                latest_row_by_sym[sym] = {"row": r, "okey": order_key}
+
+        looked = 0
+        submitted = 0
+
+        for sym, cur_sign in sorted(held_info.items()):
+            looked += 1
+            if sym not in latest_row_by_sym:
+                LOG.info("Reconcile: no recent signal row for %s within %dd; leaving as-is.", sym, days)
+                try:
+                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                         reason="no_recent_signal", exp="", right="", source="dcm-reconcile")
+                except Exception:
+                    pass
+                continue
+
+            r = latest_row_by_sym[sym]["row"]
+            side_raw = (str(r.get("signal_type") or r.get("signal_side") or r.get("side") or "")).strip().upper()
+            if not side_raw:
+                try:
+                    sp = r.get("strategy_position")
+                    side_raw = "CLOSE" if (sp is not None and int(sp) == 0) else side_raw
+                except Exception:
+                    pass
+
+            if "CLOSE" in side_raw:
+                latest_is_close = True
+                latest_open_sign = None
+            elif "CALL" in side_raw and "OPEN" in side_raw:
+                latest_is_close = False
+                latest_open_sign = +1
+            elif "PUT" in side_raw and "OPEN" in side_raw:
+                latest_is_close = False
+                latest_open_sign = -1
+            else:
+                LOG.info("Reconcile: unknown signal encoding for %s; skipping. row_side=%s", sym, side_raw)
+                try:
+                    _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                         reason="unknown_signal_encoding", exp="", right="", source="dcm-reconcile")
+                except Exception:
+                    pass
+                continue
+
+            should_close = False
+            reason = None
+            if latest_is_close:
+                should_close = True
+                reason = "reconcile_close_signal"
+            else:
+                if cur_sign is not None and latest_open_sign is not None and cur_sign != latest_open_sign:
+                    should_close = True
+                    reason = "reconcile_mismatch"
+                else:
+                    LOG.info("Reconcile: latest signal for %s is OPEN and matches current orientation; holding.", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="hold", status="skipped",
+                                             reason="latest_open_matches", exp="", right="", source="dcm-reconcile")
+                    except Exception:
+                        pass
+
+            if should_close:
+                if not hasattr(self, "_submitted_close_syms"):
+                    self._submitted_close_syms = set()
+                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                             reason="working_close_order", exp="", right="", source="dcm-reconcile")
+                    except Exception:
+                        pass
+                    continue
+                _prev_phase = getattr(self, "_in_close_phase", False)
+                self._in_close_phase = True
+                try:
+                    self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
+                    self._submitted_close_syms.add(sym)
+                    submitted += 1
+                finally:
+                    self._in_close_phase = _prev_phase
+                if latest_is_close:
+                    try:
+                        if self._flatten_stock_if_present(sym):
+                            LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
+                    except Exception as _e_stk:
+                        LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
+
+        LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
