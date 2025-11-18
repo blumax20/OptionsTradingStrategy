@@ -1528,8 +1528,9 @@ class DailyCycleManagementMixin:
         by scanning only the symbols we currently hold. For each held symbol, walk the
         last `days` of CSVs (newest -> oldest) and stop at the first matching row.
         If that row's signal is OPEN (and matches orientation) -> log and skip; if CLOSE or mismatched OPEN -> submit a force-close.
+        Enhanced: Detect side-specific (call/put) debit spreads for partial reconciliation.
         """
-        # 1) Collect currently held option symbols and their orientation
+        # 1) Collect currently held option symbols and their orientation AND side info
         try:
             from ib_insync import IB
         except Exception as e:
@@ -1544,6 +1545,7 @@ class DailyCycleManagementMixin:
             return
 
         held_info: dict[str, int | None] = {}
+        side_info: dict[str, dict[str, bool]] = {}
         try:
             poss = ib.positions()
             legs_by_sym: dict[str, list[tuple[str, float, float, float]]] = {}
@@ -1561,11 +1563,11 @@ class DailyCycleManagementMixin:
                 legs_by_sym.setdefault(sym, []).append((right, strike, q, avg))
             for sym, legs in legs_by_sym.items():
                 sign: int | None = None
+                call_debit = False
+                put_debit = False
                 if len(legs) >= 2:
                     calls = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "C"]
                     puts  = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "P"]
-                    call_debit = False
-                    put_debit = False
                     for i in range(len(calls)):
                         for j in range(len(calls)):
                             if i == j:
@@ -1582,6 +1584,11 @@ class DailyCycleManagementMixin:
                             s2, q2, _ = puts[j]
                             if s1 > s2 and q1 > 0 and q2 < 0:
                                 put_debit = True
+                    # Track which sides have detectable debit spreads
+                    side_info[sym] = {
+                        "call_debit": bool(call_debit),
+                        "put_debit": bool(put_debit),
+                    }
                     if call_debit and not put_debit:
                         sign = +1
                     elif put_debit and not call_debit:
@@ -1597,6 +1604,12 @@ class DailyCycleManagementMixin:
                             sign = None
                     else:
                         sign = None
+                else:
+                    # Ensure side_info has an entry even if no vertical detected
+                    side_info.setdefault(sym, {"call_debit": False, "put_debit": False})
+                    sign = None
+                # Always ensure side_info entry for all symbols
+                side_info.setdefault(sym, {"call_debit": bool(call_debit), "put_debit": bool(put_debit)})
                 held_info[sym] = sign
         except Exception as e:
             LOG.warning("Reconcile: error fetching positions: %s", e)
@@ -1691,13 +1704,31 @@ class DailyCycleManagementMixin:
 
             should_close = False
             reason = None
+            side_to_close: str | None = None
+
             if latest_is_close:
+                # Latest signal explicitly says "close" -> close both sides
                 should_close = True
                 reason = "reconcile_close_signal"
+                side_to_close = None  # both
             else:
-                if cur_sign is not None and latest_open_sign is not None and cur_sign != latest_open_sign:
+                # Flip logic: if latest OPEN is CALL_OPEN but we still have put debit(s), close PUT side only.
+                has_call_debit = bool(side_info.get(sym, {}).get("call_debit", False))
+                has_put_debit = bool(side_info.get(sym, {}).get("put_debit", False))
+
+                if latest_open_sign == +1 and has_put_debit:
+                    should_close = True
+                    reason = "reconcile_flip_put_to_call"
+                    side_to_close = "put"
+                elif latest_open_sign == -1 and has_call_debit:
+                    should_close = True
+                    reason = "reconcile_flip_call_to_put"
+                    side_to_close = "call"
+                elif cur_sign is not None and latest_open_sign is not None and cur_sign != latest_open_sign:
+                    # Net orientation mismatch (e.g., still net short puts vs latest CALL_OPEN)
                     should_close = True
                     reason = "reconcile_mismatch"
+                    side_to_close = None  # both
                 else:
                     LOG.info("Reconcile: latest signal for %s is OPEN and matches current orientation; holding.", sym)
                     try:
@@ -1717,20 +1748,45 @@ class DailyCycleManagementMixin:
                     except Exception:
                         pass
                     continue
+
                 _prev_phase = getattr(self, "_in_close_phase", False)
                 self._in_close_phase = True
                 try:
-                    self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
-                    self._submitted_close_syms.add(sym)
-                    submitted += 1
+                    # If side_to_close is specified, use a side-specific force-close; otherwise, use the generic shared close.
+                    if side_to_close in ("call", "put"):
+                        LOG.info("Reconcile: submitting side-specific CLOSE for %s side=%s reason=%s", sym, side_to_close, reason)
+                        try:
+                            # Delegate to PlaceAnOrder with a side filter so only the opposite spread is closed.
+                            argv = [
+                                "--mode", "force-close",
+                                "--symbols", sym,
+                                "--force-close-side", side_to_close,
+                                "--min-limit", "0.05",
+                                "--use-live-close", "mid",
+                                "--quantity", "50",
+                                "--quiet",
+                            ]
+                            self._run_place_an_order(argv)
+                            self._submitted_close_syms.add(sym)
+                            submitted += 1
+                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
+                                                 reason=reason, exp="", right=side_to_close.upper(), source="dcm-reconcile")
+                        except Exception as e:
+                            LOG.warning("Reconcile: side-specific force-close failed for %s side=%s: %s", sym, side_to_close, e)
+                    else:
+                        LOG.info("Reconcile: submitting CLOSE for %s (both sides) reason=%s", sym, reason)
+                        self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
+                        self._submitted_close_syms.add(sym)
+                        submitted += 1
+
+                    if latest_is_close:
+                        try:
+                            if self._flatten_stock_if_present(sym):
+                                LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
+                        except Exception as _e_stk:
+                            LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
                 finally:
                     self._in_close_phase = _prev_phase
-                if latest_is_close:
-                    try:
-                        if self._flatten_stock_if_present(sym):
-                            LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
-                    except Exception as _e_stk:
-                        LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
