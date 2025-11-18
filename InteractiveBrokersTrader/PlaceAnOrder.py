@@ -1948,6 +1948,9 @@ def run_from_csv():
                     record_attempt(symbol, "open_call", "skipped", "min_limit_reject",
                                    raw_theo=_raw_theo_call, min_limit=args.min_limit, bumped=False,
                                    exp=expiration, atm=float(atm), oth=float(k_call))
+                if skip:
+                    # We already recorded the specific reason(s) above; do not attempt any open.
+                    continue
                 # 1) Theo-first
                 chosen_open_limit = None
                 if not skip:
@@ -2096,6 +2099,9 @@ def run_from_csv():
                     record_attempt(symbol, "open_put", "skipped", "min_limit_reject",
                                    raw_theo=_raw_theo_put, min_limit=args.min_limit, bumped=False,
                                    exp=expiration, atm=float(atm), oth=float(k_put))
+                if skip:
+                    # We already recorded the specific reason(s) above; do not attempt any open.
+                    continue
                 # 1) Theo-first
                 chosen_open_limit = None
                 if not skip:
