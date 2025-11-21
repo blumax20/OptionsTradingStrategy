@@ -197,6 +197,89 @@ class DailyCycleManagementMixin:
             except Exception: pass
         return signs
 
+    def _detect_credit_or_inverted_spreads(self) -> set[str]:
+        """
+        Scan IB positions for symbols that currently have *credit or inverted* verticals
+        (short call vertical, short put vertical, or long/short legs oriented opposite to
+        the intended debit shape).
+        Returns a set of tickers (uppercased) that should be force-closed via DCM.
+        """
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("credit-scan: ib_insync unavailable: %s", e)
+            return set()
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=892, timeout=6)
+        except Exception as e:
+            LOG.warning("credit-scan: connect failed: %s", e)
+            return set()
+
+        bad_syms: set[str] = set()
+        try:
+            poss = ib.positions() or []
+
+            # Group positions by (symbol, expiry, right)
+            by_key: dict[tuple[str, str, str], dict[float, float]] = {}
+            for p in poss:
+                c = getattr(p, "contract", None)
+                if getattr(c, "secType", "") != "OPT":
+                    continue
+                sym = (getattr(c, "symbol", "") or "").upper()
+                exp = getattr(c, "lastTradeDateOrContractMonth", "")
+                right = (getattr(c, "right", "") or "").upper()  # 'C' or 'P'
+                qty = float(getattr(p, "position", 0.0) or 0.0)
+                if abs(qty) < 1e-9:
+                    continue
+                strike = float(getattr(c, "strike", 0.0))
+                by_key.setdefault((sym, exp, right), {})[strike] = qty
+
+            for (sym, exp, right), legs in by_key.items():
+                # long_strikes: strikes with +qty, short_strikes: strikes with -qty
+                long_strikes = [(k, v) for k, v in legs.items() if v > 0]
+                short_strikes = [(k, v) for k, v in legs.items() if v < 0]
+                if not long_strikes or not short_strikes:
+                    continue
+
+                is_bad = False
+                for L, qL in long_strikes:
+                    for S, qS in short_strikes:
+                        # We only look at L>0, S<0 pairs by construction
+                        if right == "C":
+                            # Proper CALL debit: long lower, short higher  -> L < S
+                            # If not (L < S), then shape is credit/inverted
+                            if not (L < S):
+                                is_bad = True
+                                break
+                        elif right == "P":
+                            # Proper PUT debit: long higher, short lower -> L > S
+                            if not (L > S):
+                                is_bad = True
+                                break
+                    if is_bad:
+                        break
+
+                if is_bad:
+                    bad_syms.add(sym)
+
+        except Exception as e:
+            LOG.warning("credit-scan: error while scanning positions: %s", e)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        if bad_syms:
+            LOG.info("credit-scan: detected credit/inverted verticals in: %s",
+                     ", ".join(sorted(bad_syms)))
+        else:
+            LOG.info("credit-scan: no credit/inverted verticals detected.")
+
+        return bad_syms
+
     def _latest_signal_is_close(self, sym: str, days: int = 21) -> bool:
         sym = (sym or '').upper()
         now = self._now_ny()
@@ -1399,7 +1482,15 @@ class DailyCycleManagementMixin:
 
         if non_candidates:
             LOG.info("Pre-close: skipping (no close/mismatch): %s", ", ".join(sorted(non_candidates)))
-
+        # Add any credit/inverted verticals to the close candidate set
+        try:
+            credit_syms = self._detect_credit_or_inverted_spreads()
+            if credit_syms:
+                LOG.info("Pre-close: adding credit/inverted symbols to close candidates: %s",
+                         ", ".join(sorted(credit_syms)))
+                close_candidates |= credit_syms
+        except Exception as e:
+            LOG.warning("Pre-close: credit-scan failed; continuing without it: %s", e)
         if not close_candidates:
             LOG.info("Pre-close: no symbols to convert/place.")
             try:
@@ -1447,6 +1538,21 @@ class DailyCycleManagementMixin:
             self._delegate_close_from_csvs_within(days=21)
         else:
             LOG.info("After-hours: skipping weekly CSV-based CLOSE sweeps (not Sunday).")
+        # NEW: after-hours credit/inverted sweep (daily)
+        try:
+            credit_syms = self._detect_credit_or_inverted_spreads()
+            if credit_syms:
+                LOG.info("After-hours: enforcing credit/inverted cleanup for: %s",
+                         ", ".join(sorted(credit_syms)))
+                # Use positions-based force-close path in PlaceAnOrder.py
+                self.submit_closes_via_place_anorder(
+                    symbols=credit_syms,
+                    use_live_close="join",
+                    min_limit=0.05,
+                    quiet=True,
+                )
+        except Exception as e:
+            LOG.warning("After-hours: credit-scan/cleanup failed: %s", e)
 
         self._summarize_latest_attempts()
 
