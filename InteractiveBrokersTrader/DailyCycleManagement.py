@@ -452,6 +452,9 @@ class DailyCycleManagementMixin:
         held_signs = self._collect_held_orientations()
         held_syms = set(held_signs.keys())
 
+        # Track symbols for which a CLOSE was already submitted in this run
+        submitted_close_syms = getattr(self, "_submitted_close_syms", set())
+
         now_d = self._now_ny().date()
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, last_n_csvs))
         if not paths:
@@ -475,7 +478,19 @@ class DailyCycleManagementMixin:
                                     symbol=sym,
                                     action="open",
                                     status="skipped",
-                                    reason="held_position_present",
+                                    reason="skip_open_any_position",
+                                    source="dcm-open",
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        if sym in submitted_close_syms:
+                            try:
+                                self._attempt(
+                                    symbol=sym,
+                                    action="open",
+                                    status="skipped",
+                                    reason="skip_open_reconcile_close_submitted",
                                     source="dcm-open",
                                 )
                             except Exception:
@@ -762,7 +777,7 @@ class DailyCycleManagementMixin:
         finally:
             self._in_close_phase = _prev_phase
 
-    def _try_close_from_positions(self, sym: str, prefer: str = "MKT") -> bool:
+    def _try_close_from_positions(self, sym: str, prefer: str = "MKT", side: str | None = None) -> bool:
         """
         Best-effort direct close using current IB positions for `sym`.
         - If a long vertical debit is detected (CALL or PUT), submit a combo close as a BAG:
@@ -837,23 +852,24 @@ class DailyCycleManagementMixin:
             puts  = sorted([l for l in opt_legs if l['right'] == 'P'], key=lambda x: x['strike'])
 
             # Detect CALL vertical: long + at lower strike and short - at higher strike
-            for i in range(len(calls)):
-                for j in range(i+1, len(calls)):
-                    lo, hi = calls[i], calls[j]
-                    if lo['qty'] > 0 and hi['qty'] < 0:
-                        if _place_combo('CALL', lo['strike'], hi['strike'], lo['conId'], hi['conId'], True):
-                            submitted = True
-                            break
-                    elif lo['qty'] < 0 and hi['qty'] > 0:
-                        # short call vertical (credit) -> close with BUY
-                        if _place_combo('CALL', lo['strike'], hi['strike'], hi['conId'], lo['conId'], False):
-                            submitted = True
-                            break
-                if submitted:
-                    break
+            if side is None or side.lower() == "call":
+                for i in range(len(calls)):
+                    for j in range(i+1, len(calls)):
+                        lo, hi = calls[i], calls[j]
+                        if lo['qty'] > 0 and hi['qty'] < 0:
+                            if _place_combo('CALL', lo['strike'], hi['strike'], lo['conId'], hi['conId'], True):
+                                submitted = True
+                                break
+                        elif lo['qty'] < 0 and hi['qty'] > 0:
+                            # short call vertical (credit) -> close with BUY
+                            if _place_combo('CALL', lo['strike'], hi['strike'], hi['conId'], lo['conId'], False):
+                                submitted = True
+                                break
+                    if submitted:
+                        break
 
             # Detect PUT vertical: long + at higher strike and short - at lower strike
-            if not submitted:
+            if not submitted and (side is None or side.lower() == "put"):
                 for i in range(len(puts)):
                     for j in range(i+1, len(puts)):
                         lo, hi = puts[i], puts[j]  # lo has lower strike, hi higher strike
@@ -870,9 +886,12 @@ class DailyCycleManagementMixin:
                     if submitted:
                         break
 
-            # If no vertical combo placed, flatten orphan option legs
+            # If no vertical combo placed, flatten orphan option legs (optionally side-filtered)
             if not submitted and opt_legs:
                 for leg in opt_legs:
+                    if side is not None and leg["right"] != side.upper()[0]:
+                        # Skip legs on the other side when we are asked to close only CALL or only PUT
+                        continue
                     try:
                         c = Contract(conId=leg['conId'])
                         action = 'SELL' if leg['qty'] > 0 else 'BUY'
@@ -1159,8 +1178,34 @@ class DailyCycleManagementMixin:
         """
         if not symbols:
             return
-        # Normalize & sort
-        syms = sorted({(s or "").strip().upper() for s in symbols if (s or "").strip()})
+        
+        #Guard: do not delegate new OPENs for symbols where we already hold any options exposure.
+        try:
+            held_signs = self._collect_held_orientations()
+            held_syms = set(held_signs.keys())
+        except Exception:
+            held_syms = set()
+
+        filtered: list[str] = []
+        for s in symbols:
+            sym_u = (s or "").strip().upper()
+            if not sym_u:
+                continue
+            if sym_u in held_syms:
+                # Skip opens for symbols where we already have any OPT position; log for diagnostics.
+                try:
+                    self._attempt(symbol=sym_u, action="open", status="skipped",
+                                    reason="skip_open_any_position_dcm", source="dcm")
+                except Exception:
+                    pass
+                continue
+            filtered.append(sym_u)
+
+        if not filtered:
+            # Nothing left to submit after filtering held symbols.
+            return
+        # Normalize & sort (use the filtered list, not the original symbols)
+        syms = sorted(set(filtered))
         argv = ["--mode", "from-signal",
                 "--symbols", ",".join(syms),
                 "--min-limit", f"{min_limit:.2f}",
@@ -1562,38 +1607,71 @@ class DailyCycleManagementMixin:
                 avg = float(p.avgCost or 0.0)
                 legs_by_sym.setdefault(sym, []).append((right, strike, q, avg))
             for sym, legs in legs_by_sym.items():
+                # Default: no clear net vertical orientation
                 sign: int | None = None
-                call_debit = False
-                put_debit = False
+                has_call_vert = False
+                has_put_vert = False
+
                 if len(legs) >= 2:
+                    # Split legs by right
                     calls = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "C"]
                     puts  = [(strike, qty, avg) for r, strike, qty, avg in legs if r == "P"]
-                    for i in range(len(calls)):
-                        for j in range(len(calls)):
-                            if i == j:
-                                continue
-                            s1, q1, _ = calls[i]
-                            s2, q2, _ = calls[j]
-                            if s1 < s2 and q1 > 0 and q2 < 0:
-                                call_debit = True
-                    for i in range(len(puts)):
-                        for j in range(len(puts)):
-                            if i == j:
-                                continue
-                            s1, q1, _ = puts[i]
-                            s2, q2, _ = puts[j]
-                            if s1 > s2 and q1 > 0 and q2 < 0:
-                                put_debit = True
-                    # Track which sides have detectable debit spreads
-                    side_info[sym] = {
-                        "call_debit": bool(call_debit),
-                        "put_debit": bool(put_debit),
-                    }
-                    if call_debit and not put_debit:
-                        sign = +1
-                    elif put_debit and not call_debit:
-                        sign = -1
-                    elif call_debit and put_debit:
+
+                    # Helper: detect ANY vertical (debit or credit) for a given side and compute a coarse net sign
+                    def _detect_vertical(side_legs, is_call: bool) -> tuple[bool, int | None]:
+                        """
+                        Return (has_vertical, side_sign) where:
+                          - has_vertical is True if we find at least one pair of strikes with opposite-signed qty.
+                          - side_sign is +1 for net long vertical, -1 for net short vertical, or None if ambiguous.
+                        We do NOT enforce a particular strike ordering here; debit vs credit is not important
+                        for deciding which *side* (call vs put) exists and needs to be flipped.
+                        """
+                        if len(side_legs) < 2:
+                            return False, None
+
+                        has_vert_local = False
+                        # Track simple notionals by long/short legs to infer overall orientation
+                        long_notional = 0.0
+                        short_notional = 0.0
+
+                        for i in range(len(side_legs)):
+                            s1, q1, avg1 = side_legs[i]
+                            for j in range(len(side_legs)):
+                                if i == j:
+                                    continue
+                                s2, q2, avg2 = side_legs[j]
+                                # Require opposite-signed quantities and different strikes
+                                if s1 == s2 or q1 == 0 or q2 == 0 or (q1 > 0 and q2 > 0) or (q1 < 0 and q2 < 0):
+                                    continue
+                                has_vert_local = True
+
+                        # Coarse orientation: sum notional by sign across all legs of this side
+                        for s, q, avg in side_legs:
+                            notional = abs(q) * (avg if avg > 0 else 1.0) * 100.0
+                            if q > 0:
+                                long_notional += notional
+                            elif q < 0:
+                                short_notional += notional
+
+                        side_sign: int | None = None
+                        if long_notional > short_notional:
+                            side_sign = +1
+                        elif short_notional > long_notional:
+                            side_sign = -1
+
+                        return has_vert_local, side_sign
+
+                    # Detect call and put verticals independently
+                    has_call_vert, call_sign = _detect_vertical(calls, is_call=True)
+                    has_put_vert, put_sign   = _detect_vertical(puts,  is_call=False)
+
+                    # Decide overall sign based on which side dominates by notional, if any
+                    if has_call_vert and not has_put_vert:
+                        sign = call_sign
+                    elif has_put_vert and not has_call_vert:
+                        sign = put_sign
+                    elif has_call_vert and has_put_vert:
+                        # If both sides exist, compare total notional to see which dominates
                         call_notional = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in calls)
                         put_notional  = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in puts)
                         if call_notional > put_notional:
@@ -1602,14 +1680,12 @@ class DailyCycleManagementMixin:
                             sign = -1
                         else:
                             sign = None
-                    else:
-                        sign = None
-                else:
-                    # Ensure side_info has an entry even if no vertical detected
-                    side_info.setdefault(sym, {"call_debit": False, "put_debit": False})
-                    sign = None
-                # Always ensure side_info entry for all symbols
-                side_info.setdefault(sym, {"call_debit": bool(call_debit), "put_debit": bool(put_debit)})
+
+                # Persist side-level information so reconcile logic can flip only the opposite side when needed.
+                side_info[sym] = {
+                    "call_vert": bool(has_call_vert),
+                    "put_vert":  bool(has_put_vert),
+                }
                 held_info[sym] = sign
         except Exception as e:
             LOG.warning("Reconcile: error fetching positions: %s", e)
@@ -1712,15 +1788,15 @@ class DailyCycleManagementMixin:
                 reason = "reconcile_close_signal"
                 side_to_close = None  # both
             else:
-                # Flip logic: if latest OPEN is CALL_OPEN but we still have put debit(s), close PUT side only.
-                has_call_debit = bool(side_info.get(sym, {}).get("call_debit", False))
-                has_put_debit = bool(side_info.get(sym, {}).get("put_debit", False))
+                # Flip logic: if latest OPEN is CALL_OPEN but we still have put vertical(s), close PUT side only.
+                has_call_vert = bool(side_info.get(sym, {}).get("call_vert", False))
+                has_put_vert  = bool(side_info.get(sym, {}).get("put_vert", False))
 
-                if latest_open_sign == +1 and has_put_debit:
+                if latest_open_sign == +1 and has_put_vert:
                     should_close = True
                     reason = "reconcile_flip_put_to_call"
                     side_to_close = "put"
-                elif latest_open_sign == -1 and has_call_debit:
+                elif latest_open_sign == -1 and has_call_vert:
                     should_close = True
                     reason = "reconcile_flip_call_to_put"
                     side_to_close = "call"
@@ -1744,7 +1820,7 @@ class DailyCycleManagementMixin:
                     LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
                     try:
                         _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-                                             reason="working_close_order", exp="", right="", source="dcm-reconcile")
+                                            reason="working_close_order", exp="", right="", source="dcm-reconcile")
                     except Exception:
                         pass
                     continue
@@ -1752,32 +1828,34 @@ class DailyCycleManagementMixin:
                 _prev_phase = getattr(self, "_in_close_phase", False)
                 self._in_close_phase = True
                 try:
-                    # If side_to_close is specified, use a side-specific force-close; otherwise, use the generic shared close.
-                    if side_to_close in ("call", "put"):
-                        LOG.info("Reconcile: submitting side-specific CLOSE for %s side=%s reason=%s", sym, side_to_close, reason)
-                        try:
-                            # Delegate to PlaceAnOrder with a side filter so only the opposite spread is closed.
-                            argv = [
-                                "--mode", "force-close",
-                                "--symbols", sym,
-                                "--force-close-side", side_to_close,
-                                "--min-limit", "0.05",
-                                "--use-live-close", "mid",
-                                "--quantity", "50",
-                                "--quiet",
-                            ]
-                            self._run_place_an_order(argv)
-                            self._submitted_close_syms.add(sym)
-                            submitted += 1
-                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
-                                                 reason=reason, exp="", right=side_to_close.upper(), source="dcm-reconcile")
-                        except Exception as e:
-                            LOG.warning("Reconcile: side-specific force-close failed for %s side=%s: %s", sym, side_to_close, e)
-                    else:
-                        LOG.info("Reconcile: submitting CLOSE for %s (both sides) reason=%s", sym, reason)
-                        self._submit_close_shared(sym, _os.path.exists(_ny_csv_path()), days, context="reconcile")
+                    # Use positions-based close so we can handle both long and short verticals (credits and debits).
+                    LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
+                            sym, (side_to_close or "both"), reason)
+                    try_side = side_to_close  # "call", "put", or None
+                    ok = self._try_close_from_positions(sym, prefer="MKT", side=try_side)
+
+                    if not ok and try_side is not None:
+                        # Fallback: if we couldn't close the requested side, try closing any verticals in this symbol.
+                        LOG.info("Reconcile: fallback CLOSE for %s (any side) after side=%s failure.", sym, try_side)
+                        ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
+
+                    if ok:
                         self._submitted_close_syms.add(sym)
                         submitted += 1
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
+                                                reason=reason, exp="", right=(try_side.upper() if try_side else ""),
+                                                source="dcm-reconcile")
+                        except Exception:
+                            pass
+                    else:
+                        LOG.info("Reconcile: no verticals closed for %s in positions-based CLOSE.", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                                reason="no_vertical_in_positions", exp="",
+                                                right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
+                        except Exception:
+                            pass
 
                     if latest_is_close:
                         try:
@@ -2579,7 +2657,7 @@ if __name__ == "__main__":
     try:
         if args.place_opens:
             # Today & yesterday, DTE ≥ 20; delegated to PlaceAnOrder (robust pricing/idempotency)
-            host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=2)
+            host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=1)
 
         if args.preclose:
             host._pre_close_market_conversion()

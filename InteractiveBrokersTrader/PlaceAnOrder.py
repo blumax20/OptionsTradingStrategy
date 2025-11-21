@@ -1480,6 +1480,9 @@ def run_from_csv():
         ib.sleep(0.5)
         try:
             ps = ib.positions()
+            position_syms = {getattr(p.contract, 'symbol', '').upper()
+                 for p in ps
+                 if getattr(p.contract, 'secType', '') == 'OPT' and abs(float(p.position or 0.0)) > 0}
             logger.info(f"Positions loaded: {len(ps)} entries")
         except Exception:
             pass
@@ -1598,6 +1601,19 @@ def run_from_csv():
                 record_attempt(symbol or "", "open", "skipped", "missing_symbol", row_index=int(idx))
                 continue
             missing_exp_or_atm = (not expiration) or pd.isna(atm)
+
+            # If this symbol already has ANY option position in the account, optionally skip all OPEN attempts.
+            # This protects against stacking new debit spreads on top of existing exposure (long or short).
+            if symbol and symbol.upper() in position_syms and args.mode in ("from-signal", "call", "put", "all"):
+                # Record a generic open skip; we don't yet know CALL/PUT side here.
+                record_attempt(
+                    symbol, "open", "skipped", "skip_open_any_position",
+                    exp=expiration,
+                    atm=float(atm) if not pd.isna(atm) else None,
+                    oth=None
+                )
+                # Do NOT set allow_call/allow_put; just skip this row entirely.
+                continue
 
             # Helper to enforce min limit
             def enforce_min_limit(x: float | None) -> float | None:
