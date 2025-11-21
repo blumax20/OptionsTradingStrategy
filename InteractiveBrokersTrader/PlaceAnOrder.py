@@ -1376,8 +1376,45 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
             continue
-        tr = place_debit_spread(ib, symbol, exp, longK, shortK, right, limit,
-                                quantity=qty, action="SELL", order_type=order_type)
+        # Decide whether this is a net long or net short vertical so we choose BUY vs SELL correctly.
+        # We can infer sign from actual legs in positions: +longK / -shortK => net long vertical,
+        # -longK / +shortK => net short vertical.
+        net_long = net_short = 0.0
+        for p in ib.positions():
+            c = getattr(p, "contract", None)
+            if not c or getattr(c, "secType", "") != "OPT":
+                continue
+            if getattr(c, "symbol", "").upper() != symbol.upper():
+                continue
+            if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
+                continue
+            if getattr(c, "right", "").upper() != right.upper():
+                continue
+            k = float(getattr(c, "strike", 0.0))
+            q = float(p.position or 0.0)
+            if abs(q) < 1e-9:
+                continue
+            # For our chosen pair, look only at those two strikes
+            if abs(k - longK) < 1e-9:
+                net_long += q
+            elif abs(k - shortK) < 1e-9:
+                net_short += q
+
+        # Default: assume long vertical if ambiguous
+        if net_long > 0 and net_short < 0:
+            # long vertical: close with SELL
+            action = "SELL"
+        elif net_long < 0 and net_short > 0:
+            # short vertical: close with BUY
+            action = "BUY"
+        else:
+            # Fallback: if both same sign or something odd, treat as long vertical
+            action = "SELL"
+
+        tr = place_debit_spread(
+            ib, symbol, exp, longK, shortK, right, limit,
+            quantity=qty, action=action, order_type=order_type
+        )
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
             submitted += 1
