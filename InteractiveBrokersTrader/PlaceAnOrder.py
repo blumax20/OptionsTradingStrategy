@@ -1264,16 +1264,16 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
             buckets[key]['longs'][strike] += qty
         elif qty < 0:
             buckets[key]['shorts'][strike] += abs(qty)
-    # For each (exp,right) try to pair long and short strikes into a vertical and SELL MKT
+    # For each (exp,right) try to pair long and short strikes into a vertical and close (BUY or SELL) based on orientation
     for (exp, right), d in buckets.items():
         longs = sorted(d['longs'].items())  # list of (strike, qty)
         shorts = sorted(d['shorts'].items())
         if not longs or not shorts:
             continue
-        # For calls, prefer shorts with higher strike than long; for puts, prefer lower
         for ls, lq in longs:
-            # find a compatible short
-            candidates = [(ss, sq) for ss, sq in shorts if (ss > ls if right == 'C' else ss < ls) and sq > 0]
+            # Any opposite-signed short is a candidate; orientation (debit vs credit)
+            # is handled via BUY vs SELL below.
+            candidates = [(ss, sq) for ss, sq in shorts if sq > 0]
             if not candidates:
                 continue
             # choose closest in strike distance
@@ -1281,20 +1281,41 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
             n = int(min(lq, sq, max_qty))
             if n <= 0:
                 continue
-            # Place MARKET SELL combo using the actual expiration from the position legs
+
+            # Decide whether this pair is a debit or credit vertical:
+            #   CALL debit  : long lower (ls < ss)  => SELL to close
+            #   CALL credit : long higher (ls > ss) => BUY to close
+            #   PUT  debit  : long higher (ls > ss) => SELL to close
+            #   PUT  credit : long lower (ls < ss)  => BUY to close
+            if right == "C":
+                is_debit = ls < ss
+            else:  # right == "P"
+                is_debit = ls > ss
+            action = "SELL" if is_debit else "BUY"
+
             ckey = _close_key(symbol, right, exp)
             if ckey in CLOSE_SEEN_KEYS:
                 logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
                 continue
-            tr = place_debit_spread(ib, symbol, exp, float(ls), float(ss), right, None, quantity=n, action='SELL', order_type='MKT')
+
+            tr = place_debit_spread(
+                ib,
+                symbol,
+                exp,
+                float(ls),
+                float(ss),
+                right,
+                None,
+                quantity=n,
+                action=action,
+                order_type="MKT",
+            )
             if tr is not None:
                 placed += 1
                 # decrement used qty
                 d['longs'][ls] -= n
                 d['shorts'][ss] -= n
-            if tr is not None:
-                CLOSE_SEEN_KEYS.add(ckey)      
-        # cleanup any zeroed entries (not strictly necessary)
+                CLOSE_SEEN_KEYS.add(ckey)
     return placed
 
 def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = None, max_qty: int = 10):
@@ -1327,14 +1348,16 @@ def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = No
         elif qty < 0:
             buckets[key]["shorts"][strike] += abs(qty)
 
-    # Pair by closest compatible strike: calls short>long, puts short<long
+    # Pair by closest strike, allowing both debit and credit orientations;
+    # the caller (force_close_symbol_via_positions) will choose BUY vs SELL.
     for (exp, right), d in buckets.items():
         longs = sorted(d["longs"].items())
         shorts = sorted(d["shorts"].items())
         if not longs or not shorts:
             continue
         for ls, lq in longs:
-            cands = [(ss, sq) for ss, sq in shorts if ((ss > ls) if right == "C" else (ss < ls)) and sq > 0]
+            # Any short is a candidate; orientation is handled later.
+            cands = [(ss, sq) for ss, sq in shorts if sq > 0]
             if not cands:
                 continue
             ss, sq = min(cands, key=lambda t: abs(t[0] - ls))
@@ -1609,7 +1632,6 @@ def run_from_csv():
                         vprint(args.verbose, f"[{symbol}] Inferred put OTM strike = {k_put} from call width {width}")
                 except Exception:
                     pass
-
             # --- Normalize strike ordering to ensure correct debit spread shape ---
             # Calls: long lower (ATM), short higher (OTM)
             # Puts : long higher (ATM), short lower (OTM)
