@@ -1483,17 +1483,32 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     side_opt = None if getattr(args, "force_close_side", "both") == "both" else getattr(args, "force_close_side")
 
     any_pair = False
-    for exp, right, longK, shortK, qty in _iter_spread_pairs_from_positions(ib, symbol, side=side_opt, max_qty=args.quantity):
+    for exp, right, longK, shortK, qty in _iter_spread_pairs_from_positions(
+        ib, symbol, side=side_opt, max_qty=args.quantity
+    ):
         any_pair = True
         limit = None
         scheme = getattr(args, "use_live_close", "off")
         if scheme in ("join", "mid"):
-            lim = live_spread_price(ib, symbol, exp, right, longK, shortK,
-                                    action="SELL", scheme=scheme, timeout=3.0)
+            lim = live_spread_price(
+                ib,
+                symbol,
+                exp,
+                right,
+                longK,
+                shortK,
+                action="SELL",  # pricing uses SELL-close convention
+                scheme=scheme,
+                timeout=3.0,
+            )
             if lim is not None:
                 try:
                     v = float(lim)
-                    limit = args.min_limit if (v < args.min_limit and getattr(args, "bump_to_min", False)) else (v if v >= args.min_limit else None)
+                    limit = (
+                        args.min_limit
+                        if (v < args.min_limit and getattr(args, "bump_to_min", False))
+                        else (v if v >= args.min_limit else None)
+                    )
                 except Exception:
                     limit = None
 
@@ -1502,57 +1517,73 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
             continue
-        # Decide whether this is a net long or net short vertical so we choose BUY vs SELL correctly.
-        # We can infer sign from actual legs in positions: +longK / -shortK => net long vertical,
-        # -longK / +shortK => net short vertical.
-        net_long = net_short = 0.0
-        for p in ib.positions():
-            c = getattr(p, "contract", None)
-            if not c or getattr(c, "secType", "") != "OPT":
-                continue
-            if getattr(c, "symbol", "").upper() != symbol.upper():
-                continue
-            if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
-                continue
-            if getattr(c, "right", "").upper() != right.upper():
-                continue
-            k = float(getattr(c, "strike", 0.0))
-            q = float(p.position or 0.0)
-            if abs(q) < 1e-9:
-                continue
-            # For our chosen pair, look only at those two strikes
-            if abs(k - longK) < 1e-9:
-                net_long += q
-            elif abs(k - shortK) < 1e-9:
-                net_short += q
 
-        # Default: assume long vertical if ambiguous
-        if net_long > 0 and net_short < 0:
-            # long vertical: close with SELL
-            action = "SELL"
-        elif net_long < 0 and net_short > 0:
-            # short vertical: close with BUY
-            action = "BUY"
-        else:
-            # Fallback: if both same sign or something odd, treat as long vertical
-            action = "SELL"
+        # Decide debit vs credit orientation purely from strikes, using the positive-leg
+        # as reference. For calls:
+        #   debit  vertical: long lower (longK < shortK)  -> SELL to close
+        #   credit vertical: long higher (longK > shortK) -> BUY  to close
+        # For puts:
+        #   debit  vertical: long higher (longK > shortK) -> SELL to close
+        #   credit vertical: long lower (longK < shortK)  -> BUY  to close
+        is_debit = False
+        try:
+            if right.upper() == "C":
+                is_debit = float(longK) < float(shortK)
+            else:  # "P"
+                is_debit = float(longK) > float(shortK)
+        except Exception:
+            # If something is odd, treat as debit so we default to SELL-close
+            is_debit = True
+
+        action = "SELL" if is_debit else "BUY"
 
         tr = place_debit_spread(
-            ib, symbol, exp, longK, shortK, right, limit,
-            quantity=qty, action=action, order_type=order_type
+            ib,
+            symbol,
+            exp,
+            longK,
+            shortK,
+            right,
+            limit,
+            quantity=qty,
+            action=action,
+            order_type=order_type,
         )
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
             submitted += 1
-            record_attempt(symbol, "force_close", "placed", "positions_fallback",
-                           exp=str(exp), right=right, longK=float(longK), shortK=float(shortK),
-                           order_type=order_type, limit=(float(limit) if limit is not None else None),
-                           qty=int(qty), scheme=scheme)
+            record_attempt(
+                symbol,
+                "force_close",
+                "placed",
+                "positions_fallback",
+                exp=str(exp),
+                right=right,
+                longK=float(longK),
+                shortK=float(shortK),
+                order_type=order_type,
+                limit=(float(limit) if limit is not None else None),
+                qty=int(qty),
+                scheme=scheme,
+                orientation=("debit" if is_debit else "credit"),
+                order_action=action,
+            )
         else:
-            record_attempt(symbol, "force_close", "error", "place_failed_positions",
-                           exp=str(exp), right=right, longK=float(longK), shortK=float(shortK),
-                           order_type=order_type, limit=(float(limit) if limit is not None else None),
-                           qty=int(qty))
+            record_attempt(
+                symbol,
+                "force_close",
+                "error",
+                "place_failed_positions",
+                exp=str(exp),
+                right=right,
+                longK=float(longK),
+                shortK=float(shortK),
+                order_type=order_type,
+                limit=(float(limit) if limit is not None else None),
+                qty=int(qty),
+                orientation=("debit" if is_debit else "credit"),
+                order_action=action,
+            )
 
     if not any_pair:
         # Ensure attempts CSV exists and tell you why nothing fired
