@@ -811,6 +811,25 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
     Place a vertical debit spread (combo BAG). If order_type == 'MKT' or limit_price is None, a MarketOrder is used.
     action: 'BUY' to OPEN, 'SELL' to CLOSE.
     """
+        # --- Canonicalize leg orientation: treat combo as a long debit vertical ---
+    # Calls: long lower strike, short higher strike
+    # Puts : long higher strike, short lower strike
+    try:
+        a = float(long_strike)
+        b = float(short_strike)
+        if right.upper() == "C":
+            # ensure a is the lower strike
+            if a > b:
+                a, b = b, a
+        else:  # "P"
+            # ensure a is the higher strike
+            if a < b:
+                a, b = b, a
+        long_strike = a
+        short_strike = b
+    except Exception:
+        # If anything goes wrong, fall back to the caller's ordering
+        pass
     # Define legs
     long_leg = Option(
         symbol=symbol,
