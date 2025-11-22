@@ -2145,7 +2145,27 @@ class DailyCycleManagementMixin:
                 if not (stop_hit or tp_hit):
                     return
 
-                # Delegate to PlaceAnOrder to place a CLOSE (it will use a limit close per its internal logic)
+                # Build the same human-readable reason used in DailyCycle.log
+                reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_hit else "TP(>=%.0f%% max profit)" % (gain_frac*100)
+
+                # Also append to DCM attempts CSV so we can see that this CLOSE is TP/SL-driven
+                try:
+                    _AttemptLogger.write(
+                        symbol=sym,
+                        action="close",
+                        status="queued",
+                        reason=f"rth_risk_exit:{reason}",
+                        exp="",                    # we don't strictly need exp here
+                        right=(right[0].upper() if right else ""),
+                        atm=strike_low,
+                        oth=strike_high,
+                        source="dcm-risk-exit",
+                    )
+                except Exception:
+                    # Best-effort; don't block risk exits if attempts logging fails
+                    pass
+
+                # Delegate to PlaceAnOrder to place a CLOSE (it will use its own limit/market logic)
                 try:
                     self._run_place_an_order([
                         "--mode", "force-close",
@@ -2154,9 +2174,10 @@ class DailyCycleManagementMixin:
                         "--quiet"
                     ])
                     submitted += 1
-                    reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_hit else "TP(>=%.0f%% max profit)" % (gain_frac*100)
-                    LOG.info("Risk exits: submitted CLOSE for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
-                             sym, right, strike_low, strike_high, (now - t0).days, entry, curr, width, reason)
+                    LOG.info(
+                        "Risk exits: submitted CLOSE for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
+                        sym, right, strike_low, strike_high, (now - t0).days, entry, curr, width, reason
+                    )
                 except Exception as e:
                     LOG.warning("Risk exits: failed to submit CLOSE for %s: %s", sym, e)
 
