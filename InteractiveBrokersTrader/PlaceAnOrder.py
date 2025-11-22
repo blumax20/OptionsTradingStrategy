@@ -1018,33 +1018,105 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             pass
         return None
 
-# --- Market close helper ---
-def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, max_qty: int = 1):
+def _infer_vertical_orientation_and_size(
+    ib: IB,
+    symbol: str,
+    expiration: str,
+    right: str,
+    atm_strike: float,
+    oth_strike: float,
+    max_qty: int,
+) -> tuple[str | None, int]:
     """
-    Same as close_spread_if_present, but places a MARKET SELL combo when a matching position is found.
-    Returns True if an order was sent.
+    Inspect current positions for (symbol, expiration, right, atm_strike, oth_strike)
+    and infer whether we are holding a long debit vertical or a short credit vertical.
+
+    Returns (orientation, n) where:
+      - orientation is "long_debit" or "short_credit" (or None if no clean vertical)
+      - n is the integer quantity to close (0 if none).
     """
     longC = qualify_option(ib, symbol, expiration, atm_strike, right)
     shortC = qualify_option(ib, symbol, expiration, oth_strike, right)
     if not longC or not shortC:
-        return False
-    qty_long = qty_short = 0.0
+        return None, 0
+
+    qty_atm = 0.0
+    qty_oth = 0.0
     for p in ib.positions():
-        if getattr(p.contract, 'conId', None) == longC.conId:
-            qty_long += float(p.position)
-        if getattr(p.contract, 'conId', None) == shortC.conId:
-            qty_short += float(p.position)
-    n = min(abs(int(qty_long)), abs(int(qty_short)), max_qty)
+        c = getattr(p, "contract", None)
+        if not c:
+            continue
+        cid = getattr(c, "conId", None)
+        if cid == longC.conId:
+            qty_atm += float(p.position or 0.0)
+        if cid == shortC.conId:
+            qty_oth += float(p.position or 0.0)
+
+    # No exposure on either leg
+    if abs(qty_atm) < 1e-9 and abs(qty_oth) < 1e-9:
+        return None, 0
+
+    n = min(abs(int(qty_atm)), abs(int(qty_oth)), max_qty)
     if n <= 0:
-        logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
-        return False
-    ckey = _close_key(symbol, right, expiration)
-    if ckey in CLOSE_SEEN_KEYS:
-        logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {expiration}; skipping")
+        return None, 0
+
+    orientation: str | None = None
+    # Long debit vertical:
+    #   CALL: +qty @ ATM (lower K), -qty @ OTM (higher K)
+    #   PUT : +qty @ ATM (higher K), -qty @ OTM (lower K)
+    if qty_atm > 0 and qty_oth < 0:
+        orientation = "long_debit"
+    # Short credit vertical (inverted):
+    #   CALL: -qty @ ATM (lower K), +qty @ OTM (higher K)
+    #   PUT : -qty @ ATM (higher K), +qty @ OTM (lower K)
+    elif qty_atm < 0 and qty_oth > 0:
+        orientation = "short_credit"
+
+    return orientation, n
+
+# --- Market close helper ---
+def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: str,
+                                   atm_strike: float, oth_strike: float, max_qty: int = 1):
+    """
+    Attempt to close an existing vertical spread using a MARKET combo order.
+
+    The parent order ACTION is chosen based on the *current* position orientation:
+
+      - Long debit vertical:
+            CALL: +qty @ ATM (lower K), -qty @ OTM (higher K)
+            PUT : +qty @ ATM (higher K), -qty @ OTM (lower K)
+        -> close with SELL combo.
+
+      - Short credit vertical:
+            CALL: -qty @ ATM (lower K), +qty @ OTM (higher K)
+            PUT : -qty @ ATM (higher K), +qty @ OTM (lower K)
+        -> close with BUY combo.
+
+    Returns True if an order was sent.
+    """
+    orientation, n = _infer_vertical_orientation_and_size(
+        ib, symbol, expiration, right, atm_strike, oth_strike, max_qty
+    )
+    if not orientation or n <= 0:
+        logger.info(
+            "[%s] No matching vertical quantity to close MKT for %s %s/%s exp %s",
+            symbol, right, atm_strike, oth_strike, expiration
+        )
         return False
 
-    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right,
-                               None, quantity=n, action='SELL', order_type='MKT')
+    action = "SELL" if orientation == "long_debit" else "BUY"
+
+    ckey = _close_key(symbol, right, expiration)
+    if ckey in CLOSE_SEEN_KEYS:
+        logger.info("[%s] CLOSE already submitted for %s exp %s; skipping MKT",
+                    symbol, right, expiration)
+        return False
+
+    trade = place_debit_spread(
+        ib, symbol, expiration,
+        atm_strike, oth_strike, right,
+        None, quantity=n, action=action, order_type="MKT"
+    )
     if trade is not None:
         CLOSE_SEEN_KEYS.add(ckey)
     return trade is not None
@@ -1136,40 +1208,52 @@ def cancel_close_orders_for_symbol(ib: IB, symbol: str) -> int:
             continue
     return n_cancel
 
-def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str, atm_strike: float, oth_strike: float, limit_price: float, max_qty: int = 50):
+def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str,
+                            atm_strike: float, oth_strike: float,
+                            limit_price: float, max_qty: int = 50):
     """
-    Attempt to close an existing long debit spread by SELLing the combo if we find +1 long @ ATM and -1 short @ OTM (for calls),
-    or +1 long put @ ATM and -1 short put @ lower strike (for puts). Returns True if an order was sent.
+    Attempt to close an existing vertical spread by sending a LIMIT combo order.
+
+    The parent order ACTION is chosen based on the *current* position orientation:
+
+      - Long debit vertical:
+            CALL: +qty @ ATM (lower K), -qty @ OTM (higher K)
+            PUT : +qty @ ATM (higher K), -qty @ OTM (lower K)
+        -> close with SELL combo.
+
+      - Short credit vertical (inverted):
+            CALL: -qty @ ATM (lower K), +qty @ OTM (higher K)
+            PUT : -qty @ ATM (higher K), +qty @ OTM (lower K)
+        -> close with BUY combo.
+
+    Returns True if an order was sent.
     """
     if limit_price is None:
         return False
-    longC = qualify_option(ib, symbol, expiration, atm_strike, right)
-    shortC = qualify_option(ib, symbol, expiration, oth_strike, right)
-    if not longC or not shortC:
+
+    orientation, n = _infer_vertical_orientation_and_size(
+        ib, symbol, expiration, right, atm_strike, oth_strike, max_qty
+    )
+    if not orientation or n <= 0:
+        logger.info(
+            "[%s] No matching vertical quantity to close LMT for %s %s/%s exp %s",
+            symbol, right, atm_strike, oth_strike, expiration
+        )
         return False
 
-    # Inspect current positions to ensure we actually hold the legs
-    pos = ib.positions()
-    logger.debug(f"[{symbol}] Inspecting positions for CLOSE {right}: long@{atm_strike} short@{oth_strike} exp {expiration}")
-    qty_long = qty_short = 0.0
-    for p in pos:
-        if getattr(p.contract, 'conId', None) == longC.conId:
-            qty_long += float(p.position)
-        if getattr(p.contract, 'conId', None) == shortC.conId:
-            qty_short += float(p.position)
-        logger.debug(f"[{symbol}]   pos leg: conId={getattr(p.contract,'conId',None)} strike={getattr(p.contract,'strike',None)} right={getattr(p.contract,'right',None)} exp={getattr(p.contract,'lastTradeDateOrContractMonth',None)} qty={p.position}")
-
-    # For a long debit spread we expect +N on long leg, -N on short leg
-    n = min(abs(int(qty_long)), abs(int(qty_short)), max_qty)
-    if n <= 0:
-        logger.info(f"[{symbol}] No matching spread quantity to close (long={qty_long}, short={qty_short}) for {right} {atm_strike}/{oth_strike} exp {expiration}")
-        return False
     ckey = _close_key(symbol, right, expiration)
     if ckey in CLOSE_SEEN_KEYS:
-        logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {expiration}; skipping")
+        logger.info("[%s] CLOSE already submitted for %s exp %s; skipping LMT",
+                    symbol, right, expiration)
         return False
-    # SELL the combo to close
-    trade = place_debit_spread(ib, symbol, expiration, atm_strike, oth_strike, right, limit_price, quantity=n, action='SELL')
+
+    action = "SELL" if orientation == "long_debit" else "BUY"
+
+    trade = place_debit_spread(
+        ib, symbol, expiration,
+        atm_strike, oth_strike, right,
+        limit_price, quantity=n, action=action
+    )
     if trade is not None:
         CLOSE_SEEN_KEYS.add(ckey)
     return trade is not None
