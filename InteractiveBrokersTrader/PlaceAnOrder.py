@@ -806,12 +806,39 @@ def _is_after_hours():
     wd, hh, mm = n.weekday(), n.hour, n.minute
     return (wd >= 5) or not ((hh > 9 or (hh == 9 and mm >= 30)) and (hh < 16))
 
-def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float, short_strike: float, right: str,limit_price: float | None, quantity: int = 1, action: str = 'BUY', order_type: str = 'LMT'):
+def place_debit_spread(
+    ib: IB,
+    symbol: str,
+    expiration: str,
+    long_strike: float,
+    short_strike: float,
+    right: str,
+    limit_price: float | None,
+    quantity: int = 1,
+    action: str = "BUY",
+    order_type: str = "LMT",
+    role: str | None = None,
+):
     """
-    Place a vertical debit spread (combo BAG). If order_type == 'MKT' or limit_price is None, a MarketOrder is used.
-    action: 'BUY' to OPEN, 'SELL' to CLOSE.
+    Place a vertical spread (combo BAG).
+
+    Parameters
+    ----------
+    ib          : IB connection
+    symbol      : underlying ticker
+    expiration  : IB expiry (YYYYMMDD)
+    long_strike : strike treated as the *long* leg in canonical debit orientation
+    short_strike: strike treated as the *short* leg in canonical debit orientation
+    right       : 'C' or 'P'
+    limit_price : None for market, or a float limit
+    quantity    : combo size
+    action      : 'BUY' or 'SELL' at the BAG level
+    order_type  : 'LMT' or 'MKT'
+    role        : optional semantic tag, e.g. 'force_close'. When role == 'force_close'
+                  we always send a true MARKET order first (no after-hours MKT→LMT
+                  conversion), and only fall back to LMT if IB rejects as riskless.
     """
-        # --- Canonicalize leg orientation: treat combo as a long debit vertical ---
+    # --- Canonicalize leg orientation: treat combo as a long debit vertical ---
     # Calls: long lower strike, short higher strike
     # Puts : long higher strike, short lower strike
     try:
@@ -830,29 +857,33 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
     except Exception:
         # If anything goes wrong, fall back to the caller's ordering
         pass
+
     # Define legs
     long_leg = Option(
         symbol=symbol,
         lastTradeDateOrContractMonth=expiration,
         strike=float(long_strike),
         right=right.upper(),
-        exchange='SMART',
-        currency='USD'
+        exchange="SMART",
+        currency="USD",
     )
     short_leg = Option(
         symbol=symbol,
         lastTradeDateOrContractMonth=expiration,
         strike=float(short_strike),
         right=right.upper(),
-        exchange='SMART',
-        currency='USD'
+        exchange="SMART",
+        currency="USD",
     )
 
     # Qualify legs
     try:
         long_leg = ib.qualifyContracts(long_leg)[0]
         short_leg = ib.qualifyContracts(short_leg)[0]
-        logger.info(f"[{symbol}] {right}-legs qualified: long {long_leg.conId} @{long_strike}, short {short_leg.conId} @{short_strike}, exp {expiration}")
+        logger.info(
+            f"[{symbol}] {right}-legs qualified: long {long_leg.conId} @{long_strike}, "
+            f"short {short_leg.conId} @{short_strike}, exp {expiration}"
+        )
     except Exception as e:
         logger.error(f"[{symbol}] Failed to qualify contracts for {right} spread: {e}")
         return None
@@ -860,46 +891,37 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
     # Build combo contract
     combo = Contract()
     combo.symbol = symbol
-    combo.secType = 'BAG'
-    combo.currency = 'USD'
-    combo.exchange = 'SMART'
+    combo.secType = "BAG"
+    combo.currency = "USD"
+    combo.exchange = "SMART"
 
     leg_long = ComboLeg()
     leg_long.conId = long_leg.conId
     leg_long.ratio = 1
-    leg_long.action = 'BUY'
+    leg_long.action = "BUY"
     leg_long.exchange = long_leg.exchange
 
     leg_short = ComboLeg()
     leg_short.conId = short_leg.conId
     leg_short.ratio = 1
-    leg_short.action = 'SELL'
+    leg_short.action = "SELL"
     leg_short.exchange = short_leg.exchange
 
     combo.comboLegs = [leg_long, leg_short]
 
     # Build and place order
     try:
-        is_bag = getattr(combo, 'secType', '') == 'BAG'
+        is_bag = getattr(combo, "secType", "") == "BAG"
         actual_order_type = None
         actual_limit = None
-        if order_type.upper() == 'MKT' or limit_price is None:
-            if _is_after_hours() and is_bag:
-                # convert to LMT at least at min price (use args.min_limit if you have it; otherwise 0.05)
-                safe_min = 0.05
-                order = LimitOrder(action.upper(), quantity, float(safe_min))
-                # All orders default to DAY; Sunday CLOSEs may be promoted to GTC by _tag_after_hours_limit
-                try:
-                    order.tif = "DAY"
-                except Exception:
-                    pass
-                _tag_after_hours_limit(order)
-                trade = ib.placeOrder(combo, order)
-                actual_order_type = "LMT"
-                actual_limit = float(safe_min)
-            else:
+
+        # --- Order-type selection (with special handling for force_close) ---
+        if order_type.upper() == "MKT" or limit_price is None:
+            if role == "force_close":
+                # Option B: for force-close, ALWAYS send a true MKT first,
+                # regardless of after-hours. Only the riskless-combo handler
+                # is allowed to introduce a LMT retry.
                 order = MarketOrder(action.upper(), quantity)
-                # Explicitly default to DAY for all other orders
                 try:
                     order.tif = "DAY"
                 except Exception:
@@ -907,64 +929,136 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                 trade = ib.placeOrder(combo, order)
                 actual_order_type = "MKT"
                 actual_limit = None
-            logger.info(f"[{symbol}] Placed {right} {'LMT' if (actual_order_type=='LMT') else 'MKT'}{'' if action.upper()=='BUY' else ' CLOSE'} {long_strike}/{short_strike} exp {expiration} (qty={quantity})")
+            else:
+                # Legacy behaviour for non-force-close orders:
+                # after-hours BAG MKT is converted to a tiny LMT at safe_min.
+                if _is_after_hours() and is_bag:
+                    safe_min = 0.05
+                    order = LimitOrder(action.upper(), quantity, float(safe_min))
+                    try:
+                        order.tif = "DAY"
+                    except Exception:
+                        pass
+                    _tag_after_hours_limit(order)
+                    trade = ib.placeOrder(combo, order)
+                    actual_order_type = "LMT"
+                    actual_limit = float(safe_min)
+                else:
+                    order = MarketOrder(action.upper(), quantity)
+                    try:
+                        order.tif = "DAY"
+                    except Exception:
+                        pass
+                    trade = ib.placeOrder(combo, order)
+                    actual_order_type = "MKT"
+                    actual_limit = None
+
+            logger.info(
+                f"[{symbol}] Placed {right} "
+                f"{'LMT' if (actual_order_type == 'LMT') else 'MKT'}"
+                f"{'' if action.upper() == 'BUY' else ' CLOSE'} "
+                f"{long_strike}/{short_strike} exp {expiration} (qty={quantity})"
+            )
             ok, why = _await_working(trade, timeout=3.0)
             reason = "success" if ok else f"not_working:{why}"
             try:
-                rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                            "open_put")
-                record_attempt(symbol, rec_action,
-                            ("placed" if ok else "submitted"),
-                            reason,
-                            exp=str(expiration), right=right.upper(),
-                            longK=float(long_strike), shortK=float(short_strike),
-                            order_type=actual_order_type,
-                            limit=actual_limit,
-                            qty=int(quantity), order_action=action.upper())
+                if role == "force_close":
+                    rec_action = "force_close"
+                else:
+                    rec_action = (
+                        "close_call"
+                        if (action.upper() == "SELL" and right.upper() == "C")
+                        else "close_put"
+                        if (action.upper() == "SELL" and right.upper() == "P")
+                        else "open_call"
+                        if (action.upper() == "BUY" and right.upper() == "C")
+                        else "open_put"
+                    )
+                record_attempt(
+                    symbol,
+                    rec_action,
+                    ("placed" if ok else "submitted"),
+                    reason,
+                    exp=str(expiration),
+                    right=right.upper(),
+                    longK=float(long_strike),
+                    shortK=float(short_strike),
+                    order_type=actual_order_type,
+                    limit=actual_limit,
+                    qty=int(quantity),
+                    order_action=action.upper(),
+                )
             except Exception:
                 pass
-            # If IB classifies the combo as riskless and cancels it instantly, switch to a small-limit with epsilon nudge
+
+            # Riskless-combo handling (Option B: MKT first, then LMT nudge)
             try:
                 ib.sleep(0.3)
             except Exception:
                 pass
             if _was_riskless_reject(trade):
-                # For SELL(CLOSE) nudge up; for BUY(OPEN) nudge down from a tiny anchor
-                anchor = 0.05
+                anchor = 0.05 if actual_limit is None else float(actual_limit)
                 nudged = _nudge_limit_for_riskless(anchor, action)
                 try:
-                    # Create a new LMT order with the nudged limit
                     order2 = LimitOrder(action.upper(), quantity, float(nudged))
+                    try:
+                        order2.tif = "DAY"
+                    except Exception:
+                        pass
+                    _tag_after_hours_limit(order2)
                     trade2 = ib.placeOrder(combo, order2)
-                    logger.info(f"[{symbol}] Riskless-combo MKT rejected; resubmitting as LMT @{nudged:.2f} with epsilon nudge ({RISKLESS_EPSILON:.2f})")
+                    logger.info(
+                        f"[{symbol}] Riskless-combo {actual_order_type} rejected; "
+                        f"resubmitting as LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})"
+                    )
                     try:
                         ok2, why2 = _await_working(trade2, timeout=3.0)
-                        reason2 = ("riskless_retry_ok" if ok2 else f"riskless_retry_not_working:{why2}")
+                        reason2 = (
+                            "riskless_retry_ok"
+                            if ok2
+                            else f"riskless_retry_not_working:{why2}"
+                        )
+                        if role == "force_close":
+                            rec_action2 = "force_close"
+                        else:
+                            rec_action2 = (
+                                "close_call"
+                                if (action.upper() == "SELL" and right.upper() == "C")
+                                else "close_put"
+                                if (action.upper() == "SELL" and right.upper() == "P")
+                                else "open_call"
+                                if (action.upper() == "BUY" and right.upper() == "C")
+                                else "open_put"
+                            )
                         record_attempt(
                             symbol,
-                            ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                            "open_put"),
+                            rec_action2,
                             ("placed" if ok2 else "submitted"),
                             reason2,
-                            exp=str(expiration), right=right.upper(),
-                            longK=float(long_strike), shortK=float(short_strike),
-                            order_type="LMT", prev_order_type="MKT",
-                            prev_limit=None, limit=float(nudged),
+                            exp=str(expiration),
+                            right=right.upper(),
+                            longK=float(long_strike),
+                            shortK=float(short_strike),
+                            order_type="LMT",
+                            prev_order_type=actual_order_type,
+                            prev_limit=actual_limit,
+                            limit=float(nudged),
                             epsilon=float(RISKLESS_EPSILON),
-                            qty=int(quantity), order_action=action.upper())
+                            qty=int(quantity),
+                            order_action=action.upper(),
+                        )
                     except Exception:
                         pass
                     return trade2
                 except Exception as _re:
-                    logger.warning(f"[{symbol}] Riskless-combo retry (MKT→LMT) failed: {_re}")
+                    logger.warning(
+                        f"[{symbol}] Riskless-combo retry ({actual_order_type}→LMT) failed: {_re}"
+                    )
             return trade
+
+        # --- LMT path ---
         else:
             order = LimitOrder(action.upper(), quantity, float(limit_price))
-            # Default all orders to DAY; Sunday CLOSEs may be promoted to GTC by _tag_after_hours_limit
             try:
                 order.tif = "DAY"
             except Exception:
@@ -973,25 +1067,44 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
             trade = ib.placeOrder(combo, order)
             actual_order_type = "LMT"
             actual_limit = float(limit_price)
-            logger.info(f"[{symbol}] Placed {right} LMT{'' if action.upper()=='BUY' else ' CLOSE'} {long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} (qty={quantity})")
+            logger.info(
+                f"[{symbol}] Placed {right} LMT"
+                f"{'' if action.upper() == 'BUY' else ' CLOSE'} "
+                f"{long_strike}/{short_strike} exp {expiration} @ {float(limit_price):.2f} "
+                f"(qty={quantity})"
+            )
             ok, why = _await_working(trade, timeout=3.0)
             reason = "success" if ok else f"not_working:{why}"
             try:
-                rec_action = ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                            "open_put")
-                record_attempt(symbol, rec_action,
-                            ("placed" if ok else "submitted"),
-                            reason,
-                            exp=str(expiration), right=right.upper(),
-                            longK=float(long_strike), shortK=float(short_strike),
-                            order_type=actual_order_type,
-                            limit=actual_limit,
-                            qty=int(quantity), order_action=action.upper())
+                if role == "force_close":
+                    rec_action = "force_close"
+                else:
+                    rec_action = (
+                        "close_call"
+                        if (action.upper() == "SELL" and right.upper() == "C")
+                        else "close_put"
+                        if (action.upper() == "SELL" and right.upper() == "P")
+                        else "open_call"
+                        if (action.upper() == "BUY" and right.upper() == "C")
+                        else "open_put"
+                    )
+                record_attempt(
+                    symbol,
+                    rec_action,
+                    ("placed" if ok else "submitted"),
+                    reason,
+                    exp=str(expiration),
+                    right=right.upper(),
+                    longK=float(long_strike),
+                    shortK=float(short_strike),
+                    order_type=actual_order_type,
+                    limit=actual_limit,
+                    qty=int(quantity),
+                    order_action=action.upper(),
+                )
             except Exception:
                 pass
-            # Briefly wait and check for IB riskless-combo cancellation; if detected, nudge and resubmit once
+
             try:
                 ib.sleep(0.3)
             except Exception:
@@ -1002,24 +1115,46 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
                     order2 = LimitOrder(action.upper(), quantity, float(nudged))
                     _tag_after_hours_limit(order2)
                     trade2 = ib.placeOrder(combo, order2)
-                    logger.info(f"[{symbol}] Riskless-combo LMT rejected @{float(limit_price):.2f}; resubmitting LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})")
+                    logger.info(
+                        f"[{symbol}] Riskless-combo LMT rejected @{float(limit_price):.2f}; "
+                        f"resubmitting LMT @{nudged:.2f} (epsilon {RISKLESS_EPSILON:.2f})"
+                    )
                     try:
                         ok2, why2 = _await_working(trade2, timeout=3.0)
-                        reason2 = ("riskless_retry_ok" if ok2 else f"riskless_retry_not_working:{why2}")
+                        reason2 = (
+                            "riskless_retry_ok"
+                            if ok2
+                            else f"riskless_retry_not_working:{why2}"
+                        )
+                        if role == "force_close":
+                            rec_action2 = "force_close"
+                        else:
+                            rec_action2 = (
+                                "close_call"
+                                if (action.upper() == "SELL" and right.upper() == "C")
+                                else "close_put"
+                                if (action.upper() == "SELL" and right.upper() == "P")
+                                else "open_call"
+                                if (action.upper() == "BUY" and right.upper() == "C")
+                                else "open_put"
+                            )
                         record_attempt(
                             symbol,
-                            ("close_call" if (action.upper()=="SELL" and right.upper()=="C") else
-                            "close_put"  if (action.upper()=="SELL" and right.upper()=="P") else
-                            "open_call"  if (action.upper()=="BUY"  and right.upper()=="C") else
-                            "open_put"),
+                            rec_action2,
                             ("placed" if ok2 else "submitted"),
                             reason2,
-                            exp=str(expiration), right=right.upper(),
-                            longK=float(long_strike), shortK=float(short_strike),
-                            order_type="LMT", prev_order_type="LMT",
-                            prev_limit=float(limit_price), limit=float(nudged),
+                            exp=str(expiration),
+                            right=right.upper(),
+                            longK=float(long_strike),
+                            shortK=float(short_strike),
+                            order_type="LMT",
+                            prev_order_type="LMT",
+                            prev_limit=float(limit_price),
+                            limit=float(nudged),
                             epsilon=float(RISKLESS_EPSILON),
-                            qty=int(quantity), order_action=action.upper())
+                            qty=int(quantity),
+                            order_action=action.upper(),
+                        )
                     except Exception:
                         pass
                     return trade2
@@ -1029,10 +1164,26 @@ def place_debit_spread(ib: IB, symbol: str, expiration: str, long_strike: float,
     except Exception as e:
         logger.error(f"[{symbol}] Failed to place {right} spread order: {e}")
         try:
-            record_attempt(symbol, ("close" if action.upper()=="SELL" else f"open_{right.lower()}"),
-                           "error", "place_failed",
-                           exp=expiration, right=right, longK=long_strike, shortK=short_strike,
-                           limit=limit_price, err=str(e))
+            if role == "force_close":
+                rec_action = "force_close"
+            else:
+                rec_action = (
+                    "close"
+                    if action.upper() == "SELL"
+                    else f"open_{right.lower()}"
+                )
+            record_attempt(
+                symbol,
+                rec_action,
+                "error",
+                "place_failed",
+                exp=expiration,
+                right=right,
+                longK=long_strike,
+                shortK=short_strike,
+                limit=limit_price,
+                err=str(e),
+            )
         except Exception:
             pass
         return None
@@ -1094,8 +1245,15 @@ def _infer_vertical_orientation_and_size(
     return orientation, n
 
 # --- Market close helper ---
-def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: str,
-                                   atm_strike: float, oth_strike: float, max_qty: int = 1):
+def close_spread_market_if_present(
+    ib: IB,
+    symbol: str,
+    expiration: str,
+    right: str,
+    atm_strike: float,
+    oth_strike: float,
+    max_qty: int = 1,
+):
     """
     Attempt to close an existing vertical spread using a MARKET combo order.
 
@@ -1119,7 +1277,11 @@ def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: 
     if not orientation or n <= 0:
         logger.info(
             "[%s] No matching vertical quantity to close MKT for %s %s/%s exp %s",
-            symbol, right, atm_strike, oth_strike, expiration
+            symbol,
+            right,
+            atm_strike,
+            oth_strike,
+            expiration,
         )
         return False
 
@@ -1127,14 +1289,26 @@ def close_spread_market_if_present(ib: IB, symbol: str, expiration: str, right: 
 
     ckey = _close_key(symbol, right, expiration)
     if ckey in CLOSE_SEEN_KEYS:
-        logger.info("[%s] CLOSE already submitted for %s exp %s; skipping MKT",
-                    symbol, right, expiration)
+        logger.info(
+            "[%s] CLOSE already submitted for %s exp %s; skipping MKT",
+            symbol,
+            right,
+            expiration,
+        )
         return False
 
     trade = place_debit_spread(
-        ib, symbol, expiration,
-        atm_strike, oth_strike, right,
-        None, quantity=n, action=action, order_type="MKT"
+        ib,
+        symbol,
+        expiration,
+        atm_strike,
+        oth_strike,
+        right,
+        None,
+        quantity=n,
+        action=action,
+        order_type="MKT",
+        role="force_close",
     )
     if trade is not None:
         CLOSE_SEEN_KEYS.add(ckey)
@@ -1332,73 +1506,86 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
 
 
 # --- Fallback: scan positions for any spread for this symbol and close via MARKET order ---
-def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, max_qty: int = 50) -> int:
+def close_any_spread_for_symbol(
+    ib: IB,
+    symbol: str,
+    side: str | None = None,
+    max_qty: int = 50,
+) -> int:
     """
-    Fallback: scan positions for this symbol and close any vertical debit spread(s) we can detect
-    using MARKET SELL combo orders. This ignores CSV expiration/ATM hints and uses the actual
+    Fallback: scan positions for this symbol and close any vertical spread(s) we can detect
+    using MARKET combo orders. This ignores CSV expiration/ATM hints and uses the actual
     expirations present in the account. Returns the number of market close orders submitted.
+
     If side is 'call' or 'put', restrict to that right; otherwise do both.
+
+    For calls:
+      - debit  vertical: long lower (ls < ss)  -> SELL to close
+      - credit vertical: long higher (ls > ss) -> BUY  to close
+
+    For puts:
+      - debit  vertical: long higher (ls > ss) -> SELL to close
+      - credit vertical: long lower (ls < ss)  -> BUY  to close
     """
     side_set = {side.lower()} if side else {"call", "put"}
-    # Build per-expiration/right maps of long(+qty by strike) and short(+qty by strike)
     from collections import defaultdict
+
     placed = 0
     pos = ib.positions()
-    # Group by (exp,right)
-    buckets: dict[tuple[str,str], dict[str, dict[float, float]]] = {}
+    buckets: dict[tuple[str, str], dict[str, dict[float, float]]] = {}
+
     for p in pos:
-        c = getattr(p, 'contract', None)
-        if not c or getattr(c, 'secType', '') != 'OPT':
+        c = getattr(p, "contract", None)
+        if not c or getattr(c, "secType", "") != "OPT":
             continue
-        if getattr(c, 'symbol', '').upper() != symbol.upper():
+        if getattr(c, "symbol", "").upper() != symbol.upper():
             continue
-        exp = getattr(c, 'lastTradeDateOrContractMonth', '')
-        right = getattr(c, 'right', '').upper()
-        if right not in ('C','P'):
+        exp = getattr(c, "lastTradeDateOrContractMonth", "")
+        right = getattr(c, "right", "").upper()
+        if right not in ("C", "P"):
             continue
-        if (right == 'C' and 'call' not in side_set) or (right == 'P' and 'put' not in side_set):
+        if (right == "C" and "call" not in side_set) or (
+            right == "P" and "put" not in side_set
+        ):
             continue
-        strike = float(getattr(c, 'strike', 0.0))
-        qty = float(getattr(p, 'position', 0.0))
+        strike = float(getattr(c, "strike", 0.0))
+        qty = float(getattr(p, "position", 0.0))
         key = (exp, right)
         if key not in buckets:
-            buckets[key] = {'longs': defaultdict(float), 'shorts': defaultdict(float)}
+            buckets[key] = {"longs": defaultdict(float), "shorts": defaultdict(float)}
         if qty > 0:
-            buckets[key]['longs'][strike] += qty
+            buckets[key]["longs"][strike] += qty
         elif qty < 0:
-            buckets[key]['shorts'][strike] += abs(qty)
-    # For each (exp,right) try to pair long and short strikes into a vertical and close (BUY or SELL) based on orientation
+            buckets[key]["shorts"][strike] += abs(qty)
+
     for (exp, right), d in buckets.items():
-        longs = sorted(d['longs'].items())  # list of (strike, qty)
-        shorts = sorted(d['shorts'].items())
+        longs = sorted(d["longs"].items())
+        shorts = sorted(d["shorts"].items())
         if not longs or not shorts:
             continue
         for ls, lq in longs:
-            # Any opposite-signed short is a candidate; orientation (debit vs credit)
-            # is handled via BUY vs SELL below.
             candidates = [(ss, sq) for ss, sq in shorts if sq > 0]
             if not candidates:
                 continue
-            # choose closest in strike distance
             ss, sq = min(candidates, key=lambda t: abs(t[0] - ls))
             n = int(min(lq, sq, max_qty))
             if n <= 0:
                 continue
 
-            # Decide whether this pair is a debit or credit vertical:
-            #   CALL debit  : long lower (ls < ss)  => SELL to close
-            #   CALL credit : long higher (ls > ss) => BUY to close
-            #   PUT  debit  : long higher (ls > ss) => SELL to close
-            #   PUT  credit : long lower (ls < ss)  => BUY to close
             if right == "C":
                 is_debit = ls < ss
-            else:  # right == "P"
+            else:
                 is_debit = ls > ss
             action = "SELL" if is_debit else "BUY"
 
             ckey = _close_key(symbol, right, exp)
             if ckey in CLOSE_SEEN_KEYS:
-                logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
+                logger.info(
+                    "[%s] CLOSE already submitted for %s exp %s; skipping",
+                    symbol,
+                    right,
+                    exp,
+                )
                 continue
 
             tr = place_debit_spread(
@@ -1412,12 +1599,12 @@ def close_any_spread_for_symbol(ib: IB, symbol: str, side: str | None = None, ma
                 quantity=n,
                 action=action,
                 order_type="MKT",
+                role="force_close",
             )
             if tr is not None:
                 placed += 1
-                # decrement used qty
-                d['longs'][ls] -= n
-                d['shorts'][ss] -= n
+                d["longs"][ls] -= n
+                d["shorts"][ss] -= n
                 CLOSE_SEEN_KEYS.add(ckey)
     return placed
 
@@ -1470,17 +1657,23 @@ def _iter_spread_pairs_from_positions(ib: IB, symbol: str, side: str | None = No
 
 def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     """
-    Close any detectable vertical debit spread(s) for `symbol` directly from positions,
+    Close any detectable vertical spread(s) for `symbol` directly from positions,
     even if `symbol` isn't in today's CSV. Returns number of orders submitted.
 
     Pricing preference:
-      1) If --use-live-close in {'join','mid'} => compute a limit via live_spread_price and place LMT.
+      1) If --use-live-close in {'join','mid'} => compute a limit via live_spread_price
+         using SELL-close convention and place LMT.
       2) Else => place MARKET order.
+
     Respects --min-limit (and --bump-to-min) when a live price exists.
     Always records an attempts row so attempts CSV is created.
     """
     submitted = 0
-    side_opt = None if getattr(args, "force_close_side", "both") == "both" else getattr(args, "force_close_side")
+    side_opt = (
+        None
+        if getattr(args, "force_close_side", "both") == "both"
+        else getattr(args, "force_close_side")
+    )
 
     any_pair = False
     for exp, right, longK, shortK, qty in _iter_spread_pairs_from_positions(
@@ -1497,7 +1690,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 right,
                 longK,
                 shortK,
-                action="SELL",  # pricing uses SELL-close convention
+                action="SELL",  # price using SELL-close convention
                 scheme=scheme,
                 timeout=3.0,
             )
@@ -1518,21 +1711,18 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
             continue
 
-        # Decide debit vs credit orientation purely from strikes, using the positive-leg
-        # as reference. For calls:
-        #   debit  vertical: long lower (longK < shortK)  -> SELL to close
-        #   credit vertical: long higher (longK > shortK) -> BUY  to close
-        # For puts:
-        #   debit  vertical: long higher (longK > shortK) -> SELL to close
-        #   credit vertical: long lower (longK < shortK)  -> BUY  to close
+        # Debit vs credit orientation from strikes:
+        #   CALL debit  : longK < shortK -> SELL to close
+        #   CALL credit : longK > shortK -> BUY  to close
+        #   PUT  debit  : longK > shortK -> SELL to close
+        #   PUT  credit : longK < shortK -> BUY  to close
         is_debit = False
         try:
             if right.upper() == "C":
                 is_debit = float(longK) < float(shortK)
-            else:  # "P"
+            else:
                 is_debit = float(longK) > float(shortK)
         except Exception:
-            # If something is odd, treat as debit so we default to SELL-close
             is_debit = True
 
         action = "SELL" if is_debit else "BUY"
@@ -1548,6 +1738,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             quantity=qty,
             action=action,
             order_type=order_type,
+            role="force_close",
         )
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
@@ -1586,7 +1777,6 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             )
 
     if not any_pair:
-        # Ensure attempts CSV exists and tell you why nothing fired
         record_attempt(symbol, "force_close", "skipped", "no_spread_in_positions")
 
     return submitted
