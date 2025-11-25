@@ -114,6 +114,102 @@ LIQUIDITY_FILTER_PATH = Path(__file__).with_name("LiquidityFilter.py")
 VENV_PY_WIN = Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
 class DailyCycleManagementMixin:
+    def _cancel_working_close_orders(self, sym: str) -> int:
+        """
+        Cancel all working CLOSE combo orders for the given symbol (case-insensitive).
+        Returns the number of cancelled orders.
+        """
+        try:
+            from ib_insync import IB
+        except Exception:
+            return 0
+        n_cxl = 0
+        ib = None
+        try:
+            ib = IB()
+            try:
+                ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+            except Exception:
+                return 0
+            # Ensure openOrders and openTrades are up-to-date
+            try:
+                ib.reqOpenOrders()
+            except Exception:
+                pass
+            trades = []
+            try:
+                trades = ib.openTrades() or []
+            except Exception:
+                try:
+                    trades = ib.trades() or []
+                except Exception:
+                    trades = []
+            for tr in trades:
+                try:
+                    c = getattr(tr, "contract", None)
+                    o = getattr(tr, "order", None)
+                    s = getattr(tr, "orderStatus", None)
+                    if not c or not o or not s:
+                        continue
+                    if getattr(c, "secType", "") != "BAG":
+                        continue
+                    if (getattr(c, "symbol", "") or "").upper() != (sym or "").upper():
+                        continue
+                    if (getattr(o, "action", "") or "").upper() != "SELL":
+                        continue
+                    st = (getattr(s, "status", "") or "").lower()
+                    # Acceptable working statuses
+                    working_states = ("presubmitted", "submitted", "pendingsubmit", "apipending", "inactive")
+                    if st not in working_states:
+                        continue
+                    # Defensive: allow case-insensitive check
+                    if st not in [w.lower() for w in working_states]:
+                        continue
+                    try:
+                        ib.cancelOrder(o)
+                        n_cxl += 1
+                        LOG.info("Cancelled working CLOSE order for %s (orderId=%s, status=%s)", (sym or "").upper(), getattr(o, "orderId", "?"), st)
+                    except Exception as ce:
+                        LOG.warning("Failed to cancel CLOSE order for %s: %s", (sym or "").upper(), ce)
+                except Exception:
+                    continue
+        except Exception:
+            return n_cxl
+        finally:
+            try:
+                if ib:
+                    ib.disconnect()
+            except Exception:
+                pass
+        return n_cxl
+
+    def _latest_close_signal_source(self, sym: str, days: int = 21) -> str | None:
+        """
+        Returns the _csv_src label for the latest close-like signal row for sym (case-insensitive), or None.
+        """
+        try:
+            rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=days)
+            up = (sym or "").upper()
+            for row in rows:
+                s = (row.get("symbol", "") or "").strip().upper()
+                if s != up:
+                    continue
+                # "close-like" logic: same as _delegate_close_from_csvs_within
+                side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
+                if "close" in side_raw:
+                    return row.get("_csv_src")
+                sp = (row.get("strategy_position") or "").strip()
+                try:
+                    if sp and int(sp) == 0:
+                        return row.get("_csv_src")
+                except Exception:
+                    pass
+                side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
+                if "close" in side_col:
+                    return row.get("_csv_src")
+            return None
+        except Exception:
+            return None
     def _working_close_limit_symbols(self) -> set[str]:
         try:
             from ib_insync import IB
@@ -1564,6 +1660,15 @@ class DailyCycleManagementMixin:
         if not csv_exists_today:
             LOG.warning("Pre-close: today's combined CSV missing at %s; proceeding with positions-based fallback as needed.", csv_today_path)
 
+        # Helper: check if latest close signal for sym is older than 1 NY day
+        def _is_close_signal_older_than_1d(sym: str) -> bool:
+            try:
+                src = self._latest_close_signal_source(sym, days=lookback_days)
+                # treat anything not 'today' as older than 1 NY day
+                return bool(src) and (str(src).strip().lower() != "today")
+            except Exception:
+                return False
+
         # gather sources
         work_syms = self._working_close_limit_symbols()
         held_signs = self._collect_held_orientations()
@@ -1605,6 +1710,32 @@ class DailyCycleManagementMixin:
                 pass
             return
         for sym in sorted(close_candidates):
+            # --- Convert older CLOSE LMTs to MKT if conditions met ---
+            if self._has_working_close_order(sym) and _is_close_signal_older_than_1d(sym):
+                n_cxl = self._cancel_working_close_orders(sym)
+                if n_cxl > 0:
+                    self._attempt(
+                        symbol=sym,
+                        action="close",
+                        status="queued",
+                        reason="preclose_convert_cancel_old_lmt",
+                        source="dcm-preclose",
+                    )
+                ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
+                self._attempt(
+                    symbol=sym,
+                    action="close",
+                    status=("placed" if ok else "skipped"),
+                    reason=("preclose_convert_to_mkt" if ok else "preclose_convert_to_mkt_no_vertical"),
+                    source="dcm-preclose",
+                )
+                try:
+                    submitted_set = getattr(self, "_submitted_close_syms", set())
+                    submitted_set.add(sym.upper())
+                    self._submitted_close_syms = submitted_set
+                except Exception:
+                    pass
+                continue
             self._submit_close_shared(sym, csv_exists_today, lookback_days, context="preclose")
         try:
             self._summarize_latest_attempts()
