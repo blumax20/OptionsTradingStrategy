@@ -60,19 +60,6 @@ def _nudge_limit_for_riskless(limit_price: float | None, action: str, eps: float
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
-def _now_ny_time():
-    try:
-        return datetime.now(ZoneInfo("America/New_York")).time()
-    except Exception:
-        return datetime.now().time()
-
-def _next_trading_date_ny(start_dt=None):
-    dt = start_dt or datetime.now(ZoneInfo("America/New_York"))
-    d = dt.date() + timedelta(days=1)
-    # skip Sat/Sun
-    while d.weekday() >= 5:
-        d += timedelta(days=1)
-    return d
 
 def _tag_after_hours_limit(order):
     """
@@ -133,9 +120,7 @@ def _parse_ts_ny(val):
     return None
 import math
 import argparse
-import os
 from pathlib import Path
-from datetime import datetime, timedelta
  # --- Enforce weekly closures from CSV for the last N days (default 7) ---
 def enforce_weekly_closures(ib: IB, df: pd.DataFrame, args, days: int = 7):
     if df is None or df.empty:
@@ -496,53 +481,6 @@ def today_folder_yy_mm_dd(override: str | None = None) -> str:
 def combined_csv_path_for_today(date_override: str | None = None) -> Path:
     return OUTPUT_BASE / today_folder_yy_mm_dd(date_override) / "combined_listener_spreads.csv"
 
-def best_theoretical_limit(row: pd.Series, right: str) -> float | None:
-    """
-    Pick the best available theoretical debit for the requested right ('C' or 'P'):
-    prefer 2.5-wide, then 1-wide, then 5-wide. Returns a float or None if unavailable.
-    """
-    keys = []
-    if right.upper() == 'C':
-        keys = ["call_debit_theo_2_5", "call_debit_theo_1", "call_debit_theo_5"]
-    else:
-        keys = ["put_debit_theo_2_5", "put_debit_theo_1", "put_debit_theo_5"]
-    for k in keys:
-        if k in row and row[k] is not None and not (isinstance(row[k], float) and (math.isnan(row[k]) or row[k] in (float('inf'), float('-inf')))):
-            try:
-                val = float(row[k])
-                # Enforce minimum limit via CLI at call site; return raw here
-                if val > 0:
-                    return round(val, 2)
-            except Exception:
-                continue
-    return None
-
-def best_close_limit(row: pd.Series, right: str) -> float | None:
-    """
-    Choose a reasonable limit to **sell** (close) the spread, preferring quote-based debit limits,
-    falling back to theoretical. Uses the same priority as open: 2.5 -> 1 -> 5.
-    """
-    if right.upper() == 'C':
-        for k in ("call_debit_limit_2_5","call_debit_limit_1","call_debit_limit_5",
-                  "call_debit_theo_2_5","call_debit_theo_1","call_debit_theo_5"):
-            if k in row and row[k] is not None and not (isinstance(row[k], float) and (math.isnan(row[k]) or row[k] in (float('inf'), float('-inf')))):
-                try:
-                    v = float(row[k])
-                    if v > 0:
-                        return round(v, 2)
-                except Exception:
-                    pass
-    else:
-        for k in ("put_debit_limit_2_5","put_debit_limit_1","put_debit_limit_5",
-                  "put_debit_theo_2_5","put_debit_theo_1","put_debit_theo_5"):
-            if k in row and row[k] is not None and not (isinstance(row[k], float) and (math.isnan(row[k]) or row[k] in (float('inf'), float('-inf')))):
-                try:
-                    v = float(row[k])
-                    if v > 0:
-                        return round(v, 2)
-                except Exception:
-                    pass
-    return None
 
 def _spread_width_from_strikes(atm: float | None, oth: float | None) -> float | None:
     try:
@@ -807,6 +745,56 @@ def has_open_position_for_spread(ib: IB, symbol: str, exp: str, right: str, long
         if getattr(c, 'conId', None) == shortC.conId:
             qty_short += float(p.position)
     return (qty_long > 0) and (qty_short < 0)
+
+def has_working_close_order_for_symbol(ib: IB, symbol: str) -> bool:
+    """
+    Return True if there is any working CLOSE (SELL BAG) order for this symbol.
+
+    We treat as working:
+      - status in {PreSubmitted, Submitted, PendingSubmit, ApiPending}
+      - or status == Inactive with tif == GTC (held GTC after hours).
+    """
+    if ib is None:
+        return False
+    up = (symbol or "").upper()
+    try:
+        try:
+            ib.reqOpenOrders()
+            ib.sleep(0.25)
+        except Exception:
+            pass
+
+        try:
+            trades = ib.openTrades() or []
+        except Exception:
+            trades = ib.trades() or []
+
+        working_states = {"PreSubmitted", "Submitted", "PendingSubmit", "ApiPending"}
+
+        for tr in trades:
+            c = getattr(tr, "contract", None)
+            o = getattr(tr, "order", None)
+            s = getattr(tr, "orderStatus", None)
+            if not c or not o or not s:
+                continue
+            if getattr(c, "secType", "") != "BAG":
+                continue
+            if (getattr(c, "symbol", "") or "").upper() != up:
+                continue
+            if (getattr(o, "action", "") or "").upper() != "SELL":
+                continue
+
+            st = (getattr(s, "status", "") or "")
+            st_l = st.lower()
+            if st_l in ("filled", "cancelled", "apicancelled"):
+                continue
+
+            tif = (getattr(o, "tif", "") or "").upper()
+            if st in working_states or (st_l == "inactive" and tif == "GTC"):
+                return True
+        return False
+    except Exception:
+        return False
 
 # If we're outside RTH and this is a BAG option combo, convert MKT -> LMT at min/epsilon
 def _is_after_hours():
@@ -1283,6 +1271,23 @@ def close_spread_market_if_present(
 
     Returns True if an order was sent.
     """
+    # Guard: if any working CLOSE combo already exists for this symbol, skip MKT close.
+    if has_working_close_order_for_symbol(ib, symbol):
+        try:
+            record_attempt(
+                symbol,
+                "force_close",
+                "skipped",
+                "working_close_order",
+                exp=str(expiration),
+                right=right,
+                atm=float(atm_strike),
+                oth=float(oth_strike),
+            )
+        except Exception:
+            pass
+        return False
+
     orientation, n = _infer_vertical_orientation_and_size(
         ib, symbol, expiration, right, atm_strike, oth_strike, max_qty
     )
@@ -1449,6 +1454,23 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str,
     if limit_price is None:
         return False
 
+    # Guard: if any working CLOSE combo already exists for this symbol, skip creating another.
+    if has_working_close_order_for_symbol(ib, symbol):
+        try:
+            record_attempt(
+                symbol,
+                "close",
+                "skipped",
+                "working_close_order",
+                exp=str(expiration),
+                right=right,
+                atm=float(atm_strike),
+                oth=float(oth_strike),
+            )
+        except Exception:
+            pass
+        return False
+
     orientation, n = _infer_vertical_orientation_and_size(
         ib, symbol, expiration, right, atm_strike, oth_strike, max_qty
     )
@@ -1565,6 +1587,15 @@ def close_any_spread_for_symbol(
       - debit  vertical: long higher (ls > ss) -> SELL to close
       - credit vertical: long lower (ls < ss)  -> BUY  to close
     """
+
+    # Guard: do not issue fallback MARKET CLOSE if a working CLOSE BAG exists.
+    if has_working_close_order_for_symbol(ib, symbol):
+        try:
+            record_attempt(symbol, "force_close", "skipped", "working_close_order")
+        except Exception:
+            pass
+        return 0
+
     side_set = {side.lower()} if side else {"call", "put"}
     from collections import defaultdict
 
@@ -1706,6 +1737,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     Respects --min-limit (and --bump-to-min) when a live price exists.
     Always records an attempts row so attempts CSV is created.
     """
+
+    # Guard: for positions-based force-close, respect existing working CLOSE orders.
+    if not args.dry_run and has_working_close_order_for_symbol(ib, symbol):
+        try:
+            record_attempt(symbol, "force_close", "skipped", "working_close_order")
+        except Exception:
+            pass
+        return 0
+
     submitted = 0
     side_opt = (
         None
@@ -2154,6 +2194,18 @@ def run_from_csv():
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
                     cxl = cancel_open_orders_for_symbol(ib, symbol)
+
+                # Guard: if a working CLOSE BAG already exists for this symbol, do not submit another.
+                if not args.dry_run and has_working_close_order_for_symbol(ib, symbol):
+                    record_attempt(
+                        symbol,
+                        "close",
+                        "skipped",
+                        "working_close_order",
+                        exp=expiration,
+                    )
+                    continue
+
                     if cxl > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl} pending OPEN combo order(s) prior to CLOSE")
                     # Attempt to close whichever spread we hold (call and/or put) by inspecting positions
@@ -2273,6 +2325,9 @@ def run_from_csv():
                 allow_put = True
             # --- force-close mode ---
             if args.mode == "force-close":
+                if not args.dry_run and has_working_close_order_for_symbol(ib, symbol):
+                    record_attempt(symbol, "force_close", "skipped", "working_close_order", exp=expiration)
+                    continue
                 # Note: explicit --symbols were already handled above (CSV-independent).
                 sides = ["call","put"] if args.force_close_side == "both" else [args.force_close_side]
                 for side in sides:
