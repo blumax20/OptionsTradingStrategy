@@ -312,14 +312,25 @@ class DailyCycleManagementMixin:
         """
         sym = (sym or '').upper()
         now = self._now_ny()
+        now_d = now.date()
+        max_age = getattr(self, "MAX_SIGNAL_AGE_DAYS_FOR_OPENS", 3)
         def _csv_path_for(dt):
             folder = dt.astimezone(NY).strftime('%y_%m_%d')
-            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
+            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv", folder
+
         for d in range(0, max(1, days)):
-            fp = _csv_path_for(now - timedelta(days=d))
+            dt = now - timedelta(days=d)
+            fp, folder = _csv_path_for(dt)
             if not os.path.exists(fp):
                 continue
             try:
+                try:
+                    folder_dt = datetime.strptime(folder, "%y_%m_%d").date()
+                    age_days = (now_d - folder_dt).days
+                    if age_days > max_age:
+                        continue
+                except Exception:
+                    pass
                 last_row = None
                 with open(fp, newline='', encoding='utf-8') as fh:
                     rdr = csv.DictReader(fh)
@@ -357,6 +368,28 @@ class DailyCycleManagementMixin:
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
+            sym_u = (sym or "").upper()
+
+            # NEW: per-run guard – if we've already submitted any CLOSE for this symbol in this run, skip
+            try:
+                submitted_set = getattr(self, "_submitted_close_syms", set())
+            except Exception:
+                submitted_set = set()
+
+            if sym_u in submitted_set:
+                try:
+                    self._attempt(
+                        symbol=sym_u,
+                        action="close",
+                        status="skipped",
+                        reason=f"{context}_already_submitted_this_run",
+                        source=f"dcm-{context}",
+                    )
+                except Exception:
+                    pass
+                return
+
+        
             # If there is already a working CLOSE order for this symbol, do not delegate again.
             if self._has_working_close_order(sym):
                 try:
@@ -460,6 +493,12 @@ class DailyCycleManagementMixin:
             except Exception:
                 # best-effort; do not fail close submission if STK flatten throws
                 pass
+            # Mark this symbol as fully handled for this run
+            try:
+                submitted_set.add(sym_u)
+                self._submitted_close_syms = submitted_set
+            except Exception:
+                pass
         finally:
             self._in_close_phase = _prev_phase
 
@@ -548,6 +587,18 @@ class DailyCycleManagementMixin:
         for path in paths:
             try:
                 folder = Path(path).parent.name  # YY_MM_DD
+                # Age guard: skip CSV folders older than MAX_SIGNAL_AGE_DAYS_FOR_OPENS
+                try:
+                    folder_dt = datetime.strptime(folder, "%y_%m_%d").date()
+                    age_days = (now_d - folder_dt).days
+                    if age_days > max_age:
+                        LOG.info(
+                            "Open-delegate: skipping folder %s (age=%d days > max=%d)",
+                            folder, age_days, max_age
+                        )
+                        continue
+                except Exception:
+                    pass
                 with open(path, newline="", encoding="utf-8") as fh:
                     rdr = csv.DictReader(fh)
                     for r in rdr:
@@ -674,6 +725,19 @@ class DailyCycleManagementMixin:
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
+                        # Collect currently held option symbols to avoid closing non-existent positions
+            try:
+                held_signs = self._collect_held_orientations()
+                held_syms = set(held_signs.keys())
+            except Exception:
+                held_syms = set()
+
+            # Per-run guard: track symbols we've already attempted CLOSEs for in this run
+            try:
+                submitted_set = getattr(self, "_submitted_close_syms", set())
+            except Exception:
+                submitted_set = set()
+
             paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
             if not paths:
                 LOG.info("Close-delegate: no CSVs within %d day(s); skipping.", days)
@@ -716,9 +780,24 @@ class DailyCycleManagementMixin:
             pick: list[str] = []
             per_day_counts: dict[str, int] = {}
             for sym, (row, label, _) in latest_by_sym.items():
-                if _is_close(row):
-                    pick.append(sym)
-                    per_day_counts[label] = per_day_counts.get(label, 0) + 1
+                if not _is_close(row):
+                    continue
+                sym_u = (sym or "").upper()
+                # Only enforce CSV CLOSEs for symbols we actually hold
+                if sym_u not in held_syms:
+                    try:
+                        self._attempt(
+                            symbol=sym_u,
+                            action="close",
+                            status="skipped",
+                            reason=f"close_within_{days}d_no_position",
+                            source="dcm-close",
+                        )
+                    except Exception:
+                        pass
+                    continue
+                pick.append(sym_u)
+                per_day_counts[label] = per_day_counts.get(label, 0) + 1
 
             if not pick:
                 LOG.info("Close-delegate: no CLOSE symbols found in the last %d day(s).", days)
@@ -744,10 +823,23 @@ class DailyCycleManagementMixin:
                     continue
                 filtered_syms: list[str] = []
                 for s in sorted(set(syms)):
-                    if self._has_working_close_order(s):
+                    s_u = (s or "").upper()
+                    if s_u in submitted_set:
                         try:
                             self._attempt(
-                                symbol=s,
+                                symbol=s_u,
+                                action="close",
+                                status="skipped",
+                                reason=f"close_within_{days}d_already_submitted_this_run",
+                                source="dcm-close",
+                            )
+                        except Exception:
+                            pass
+                        continue
+                    if self._has_working_close_order(s_u):
+                        try:
+                            self._attempt(
+                                symbol=s_u,
                                 action="close",
                                 status="skipped",
                                 reason=f"close_within_{days}d_existing_working_close_stage1",
@@ -756,7 +848,8 @@ class DailyCycleManagementMixin:
                         except Exception:
                             pass
                     else:
-                        filtered_syms.append(s)
+                        filtered_syms.append(s_u)
+                        submitted_set.add(s_u)
                 if not filtered_syms:
                     continue
                 argv_csv = [
@@ -858,6 +951,10 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
         finally:
+            try:
+                self._submitted_close_syms = submitted_set
+            except Exception:
+                pass
             self._in_close_phase = _prev_phase
 
     def _try_close_from_positions(self, sym: str, prefer: str = "MKT", side: str | None = None) -> bool:
@@ -1041,6 +1138,13 @@ class DailyCycleManagementMixin:
     # simple in-memory run guards; replace with persistent store if running in multiple processes
     _last_daily_analysis_at: datetime | None = None
     _last_weekly_maintenance_at: datetime | None = None
+    
+    # NEW: per-run guard for symbols we have already submitted CLOSEs for
+    _submitted_close_syms: set[str] = set()
+
+    # NEW: age guard for using OPEN signals to drive new opens / reversals
+    MAX_SIGNAL_AGE_DAYS_FOR_OPENS: int = 3
+
 
     def _python_executable(self) -> str:
         """
@@ -1085,6 +1189,7 @@ class DailyCycleManagementMixin:
         If ref_dt is Monday, this returns the prior Friday.
         """
         dt = (ref_dt or self._now_ny()).date()
+        max_age = getattr(self, "MAX_SIGNAL_AGE_DAYS_FOR_OPENS", 3)
         from datetime import timedelta
         d = dt - timedelta(days=1)
         # Skip weekend days
@@ -1561,16 +1666,26 @@ class DailyCycleManagementMixin:
         Diagnostic helper to try (re)placing today's OPEN orders directly from the CSV using PlaceAnOrder,
         with a controllable live-limit method ('join' or 'mid'). After the run, summarize latest attempts.
         """
+        try:
+            today_folder = self._now_ny().strftime("%y_%m_%d")
+        except Exception:
+            from datetime import datetime as _dt
+            today_folder = _dt.now(NY).strftime("%y_%m_%d")
+
         argv = [
             "--mode", "from-signal",
+            "--date", today_folder,
             "--min-limit", f"{min_limit:.2f}",
             "--use-live-open", method,
-            "--quiet"
+            "--quiet",
         ]
         if bump_to_min:
             argv.append("--bump-to-min")
         try:
-            LOG.info("Diagnostic open-from-signal: using %s limits, min_limit=%.2f, bump_to_min=%s", method, min_limit, bump_to_min)
+            LOG.info(
+                "Diagnostic open-from-signal: using %s limits, min_limit=%.2f, bump_to_min=%s, date=%s",
+                method, min_limit, bump_to_min, today_folder
+            )
             self._run_place_an_order(argv)
         finally:
             try:
@@ -2743,6 +2858,8 @@ if __name__ == "__main__":
     LOG.info("DailyCycleManagement runner starting (analysis enabled; normal session logic)...")
     try:
         r = _Runner()
+        # NEW: reset per-run CLOSE guard
+        r._submitted_close_syms = set()
         # Reset the active attempts log path before each run to avoid stale logs
         _AttemptLogger._active_path = None
         r.daily_trading_cycle()

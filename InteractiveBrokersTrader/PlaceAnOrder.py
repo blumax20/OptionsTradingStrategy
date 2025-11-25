@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import json
 import csv
 import os
+import re
 # --- Riskless-combo handling ---
 # Epsilon used to "nudge" the net limit when IB rejects a combo as riskless.
 # Can be overridden via env var RISKLESS_EPSILON (e.g., 0.01 or 0.02)
@@ -431,6 +432,17 @@ def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
 
+def _parse_symbols_arg(sym_str: str | None) -> set[str]:
+    """
+    Parse a comma/whitespace/semicolon-separated symbol string into a set
+    of uppercased tickers. Examples:
+      "PEP, FOXA BMY" -> {"PEP","FOXA","BMY"}
+      "PEP;FOXA"      -> {"PEP","FOXA"}
+    """
+    if not sym_str:
+        return set()
+    parts = re.split(r"[,\s;]+", str(sym_str).strip())
+    return {p.upper() for p in parts if p}
 
 def parse_args():
     p = argparse.ArgumentParser(description="Place debit spread orders from combined CSV")
@@ -1283,6 +1295,19 @@ def close_spread_market_if_present(
             oth_strike,
             expiration,
         )
+        try:
+            record_attempt(
+                symbol,
+                "force_close",
+                "skipped",
+                "no_spread_in_positions",
+                exp=str(expiration),
+                right=right,
+                atm=float(atm_strike),
+                oth=float(oth_strike),
+            )
+        except Exception:
+            pass
         return False
 
     action = "SELL" if orientation == "long_debit" else "BUY"
@@ -1432,6 +1457,19 @@ def close_spread_if_present(ib: IB, symbol: str, expiration: str, right: str,
             "[%s] No matching vertical quantity to close LMT for %s %s/%s exp %s",
             symbol, right, atm_strike, oth_strike, expiration
         )
+        try:
+            record_attempt(
+                symbol,
+                "close",
+                "skipped",
+                "no_spread_in_positions",
+                exp=str(expiration),
+                right=right,
+                atm=float(atm_strike),
+                oth=float(oth_strike),
+            )
+        except Exception:
+            pass
         return False
 
     ckey = _close_key(symbol, right, expiration)
@@ -1803,9 +1841,7 @@ def run_from_csv():
                 pass
         except Exception:
             pass
-    only = None
-    if args.symbols:
-        only = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+    only = _parse_symbols_arg(args.symbols) if args.symbols else None
     csv_path = combined_csv_path_for_today(args.date)
     logger.info(f"Loading combined CSV: {csv_path} | mode={args.mode} | qty={args.quantity} | symbols={sorted(list(only)) if only else 'ALL'}")
     try:
@@ -1862,11 +1898,15 @@ def run_from_csv():
         ib.reqMarketDataType(4)
         ib.reqPositions()
         ib.sleep(0.5)
+        position_syms = set()
         try:
             ps = ib.positions()
-            position_syms = {getattr(p.contract, 'symbol', '').upper()
-                 for p in ps
-                 if getattr(p.contract, 'secType', '') == 'OPT' and abs(float(p.position or 0.0)) > 0}
+            position_syms = {
+                getattr(p.contract, "symbol", "").upper()
+                for p in ps
+                if getattr(p.contract, "secType", "") == "OPT"
+                and abs(float(p.position or 0.0)) > 0
+            }
             logger.info(f"Positions loaded: {len(ps)} entries")
         except Exception:
             pass
@@ -1896,7 +1936,7 @@ def run_from_csv():
     # --- Positions-driven force-close for explicitly requested symbols (CSV-independent) ---
     # This runs even if today's CSV has ZERO rows for the requested tickers (e.g., ABR missing).
     if args.mode == "force-close" and args.symbols:
-        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
+        _syms_req = _parse_symbols_arg(args.symbols)
         for _sym in sorted(_syms_req):
             if args.dry_run:
                 # still write a diagnostic attempt so attempts CSV is created
@@ -1936,6 +1976,12 @@ def run_from_csv():
             total_cxl += cancel_open_orders_for_symbol(ib, sym)
         if total_cxl > 0:
             logger.info(f"Cancelled {total_cxl} pending OPEN combo order(s) across CLOSE-priority tickers")
+
+    # Today’s NY date for DTE calculations
+    try:
+        today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        today_ny = datetime.now().date()
 
     placed = 0
     for idx, row in df.iterrows():
@@ -1985,6 +2031,15 @@ def run_from_csv():
                 continue
             missing_exp_or_atm = (not expiration) or pd.isna(atm)
 
+            # Compute DTE from expiration (YYYYMMDD) if possible
+            dte = None
+            if expiration and str(expiration).strip().lower() not in ("nan", "none"):
+                try:
+                    exp_date = datetime.strptime(str(expiration).strip(), "%Y%m%d").date()
+                    dte = (exp_date - today_ny).days
+                except Exception:
+                    dte = None
+
             # If this symbol already has ANY option position in the account, optionally skip all OPEN attempts.
             # This protects against stacking new debit spreads on top of existing exposure (long or short).
             if symbol and symbol.upper() in position_syms and args.mode in ("from-signal", "call", "put", "all"):
@@ -2026,12 +2081,6 @@ def run_from_csv():
             allow_call = allow_put = False
             stype = str(row.get("signal_type") or "").upper()
 
-            # Defensive per-run guard: if we've already opened this side for this symbol, skip any other open paths
-            if allow_call and _open_side_key(symbol, 'C') in OPEN_PLACED_THIS_RUN:
-                allow_call = False
-            if allow_put and _open_side_key(symbol, 'P') in OPEN_PLACED_THIS_RUN:
-                allow_put = False
-
             # Fallback: infer signal_type from strategy_position if stype missing
             if not stype:
                 sp = row.get("strategy_position")
@@ -2046,6 +2095,32 @@ def run_from_csv():
                         stype = "PUT_OPEN"
                     else:
                         stype = "CLOSE"
+
+            # DTE guard for OPEN flows: enforce DTE >= 20 for all PAO opens
+            if dte is not None and dte < 20 and args.mode in ("from-signal", "call", "put", "all"):
+                # Only skip when this row is being used to OPEN a new spread
+                is_open_row = (
+                    args.mode != "from-signal"
+                    or stype in ("CALL_OPEN", "PUT_OPEN", "")
+                )
+                if is_open_row:
+                    record_attempt(
+                        symbol,
+                        "open",
+                        "skipped",
+                        "dte_lt_20",
+                        exp=expiration,
+                        atm=float(atm) if not pd.isna(atm) else None,
+                        oth=None,
+                        dte=int(dte),
+                    )
+                    continue
+
+            # Defensive per-run guard: if we've already opened this side for this symbol, skip any other open paths
+            if allow_call and _open_side_key(symbol, 'C') in OPEN_PLACED_THIS_RUN:
+                allow_call = False
+            if allow_put and _open_side_key(symbol, 'P') in OPEN_PLACED_THIS_RUN:
+                allow_put = False
 
             if args.mode == "from-signal":
                 if stype == "CALL_OPEN":
