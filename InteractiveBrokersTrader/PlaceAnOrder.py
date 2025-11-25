@@ -376,11 +376,6 @@ def record_attempt(symbol: str, action: str, status: str, reason: str, **fields)
 
     ATTEMPTS.append(row)
     log_decision("attempt", symbol, reason, action=action, status=status, **fields)
-
-    try:
-        _attempts_append([row])
-    except Exception:
-        pass
     
 # --- OI gating and RTH detection helpers ---
 def _is_rth(now: datetime | None = None) -> bool:
@@ -2194,20 +2189,20 @@ def run_from_csv():
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
                     cxl = cancel_open_orders_for_symbol(ib, symbol)
-
-                # Guard: if a working CLOSE BAG already exists for this symbol, do not submit another.
-                if not args.dry_run and has_working_close_order_for_symbol(ib, symbol):
-                    record_attempt(
-                        symbol,
-                        "close",
-                        "skipped",
-                        "working_close_order",
-                        exp=expiration,
-                    )
-                    continue
-
                     if cxl > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl} pending OPEN combo order(s) prior to CLOSE")
+
+                    # Guard: if a working CLOSE BAG already exists for this symbol, do not submit another.
+                    if not args.dry_run and has_working_close_order_for_symbol(ib, symbol):
+                        record_attempt(
+                            symbol,
+                            "close",
+                            "skipped",
+                            "working_close_order",
+                            exp=expiration,
+                        )
+                        continue    
+                    
                     # Attempt to close whichever spread we hold (call and/or put) by inspecting positions
                     closed_any = False
                     # Close call spread if present
