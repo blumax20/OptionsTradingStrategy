@@ -2166,13 +2166,28 @@ class DailyCycleManagementMixin:
                         pass
 
             if should_close:
+                # Guard: only one CLOSE attempt per symbol per run, and never if a working CLOSE already exists.
                 if not hasattr(self, "_submitted_close_syms"):
                     self._submitted_close_syms = set()
-                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
-                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
+                if not hasattr(self, "_reconcile_closed_syms"):
+                    self._reconcile_closed_syms = set()
+
+                if (
+                    sym in self._submitted_close_syms
+                    or sym in self._reconcile_closed_syms
+                    or self._has_working_close_order(sym)
+                ):
+                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working this run).", sym)
                     try:
-                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-                                            reason="working_close_order", exp="", right="", source="dcm-reconcile")
+                        _AttemptLogger.write(
+                            symbol=sym,
+                            action="close",
+                            status="skipped",
+                            reason="working_close_order",
+                            exp="",
+                            right="",
+                            source="dcm-reconcile",
+                        )
                     except Exception:
                         pass
                     continue
@@ -2192,12 +2207,20 @@ class DailyCycleManagementMixin:
                         ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
 
                     if ok:
+                        # Mark symbol as closed from this reconcile run so we do not re‑launch CLOSE again.
                         self._submitted_close_syms.add(sym)
+                        self._reconcile_closed_syms.add(sym)
                         submitted += 1
                         try:
-                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
-                                                reason=reason, exp="", right=(try_side.upper() if try_side else ""),
-                                                source="dcm-reconcile")
+                            _AttemptLogger.write(
+                                symbol=sym,
+                                action="close",
+                                status="placed",
+                                reason=reason,
+                                exp="",
+                                right=(try_side.upper() if try_side else ""),
+                                source="dcm-reconcile",
+                            )
                         except Exception:
                             pass
                     else:
