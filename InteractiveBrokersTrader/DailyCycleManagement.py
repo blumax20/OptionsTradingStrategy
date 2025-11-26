@@ -1843,14 +1843,24 @@ class DailyCycleManagementMixin:
             credit_syms = self._detect_credit_or_inverted_spreads()
             if credit_syms:
                 LOG.info("After-hours: enforcing credit/inverted cleanup for: %s",
-                         ", ".join(sorted(credit_syms)))
-                # Use positions-based force-close path in PlaceAnOrder.py
-                self.submit_closes_via_place_anorder(
-                    symbols=credit_syms,
-                    use_live_close="join",
-                    min_limit=0.05,
-                    quiet=True,
-                )
+                        ", ".join(sorted(credit_syms)))
+                for sym in sorted(credit_syms):
+                    try:
+                        ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
+                        try:
+                            _AttemptLogger.write(
+                                symbol=sym,
+                                action="close",
+                                status=("placed" if ok else "skipped"),
+                                reason="after_hours_credit_cleanup",
+                                exp="",
+                                right="",
+                                source="dcm-after-hours",
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        LOG.warning("After-hours: direct credit cleanup failed for %s: %s", sym, e)
         except Exception as e:
             LOG.warning("After-hours: credit-scan/cleanup failed: %s", e)
 
