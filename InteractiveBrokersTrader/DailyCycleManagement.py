@@ -2011,6 +2011,14 @@ class DailyCycleManagementMixin:
             LOG.warning("Reconcile: could not connect to IB: %s", e)
             return
 
+        # Detect any credit / inverted verticals once up-front; these should be
+        # force-flattened with direct MKT orders even if there is no explicit CLOSE signal.
+        try:
+            credit_syms = self._detect_credit_or_inverted_spreads()
+        except Exception as _e_credit:
+            LOG.warning("Reconcile: credit-scan failed; continuing without it: %s", _e_credit)
+            credit_syms = set()
+
         held_info: dict[str, int | None] = {}
         side_info: dict[str, dict[str, bool]] = {}
         try:
@@ -2234,18 +2242,65 @@ class DailyCycleManagementMixin:
                                              reason="latest_open_matches", exp="", right="", source="dcm-reconcile")
                     except Exception:
                         pass
-            if should_close:
-                # Use shared close submission path so we:
-                #  - respect per-run _submitted_close_syms guards
-                #  - avoid placing direct MKT orders from reconcile
-                #  - reuse the same CSV/live-mid fallback logic as preclose
-                LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
-                         sym, (side_to_close or "both"), reason)
+            # If this symbol has a credit/inverted vertical, force-flatten it with a direct
+            # positions-based MKT close, regardless of whether the latest signal is CLOSE.
+            is_credit_sym = False
+            try:
+                is_credit_sym = sym in credit_syms
+            except Exception:
+                is_credit_sym = False
+
+            if not should_close and not is_credit_sym:
+                # Nothing to do for this symbol in reconcile.
+                continue
+
+            # For credit/inverted symbols, always use direct MKT flatten from positions.
+            if is_credit_sym:
+                credit_reason = reason or "reconcile_credit_inverted"
+                LOG.info(
+                    "Reconcile: direct MKT CLOSE for credit/inverted %s side=%s reason=%s",
+                    sym,
+                    (side_to_close or "both"),
+                    credit_reason,
+                )
                 try:
-                    self._submit_close_shared(sym, csv_exists_today, lookback_days, context="reconcile")
-                    submitted += 1
+                    ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
                 except Exception as e:
-                    LOG.warning("Reconcile: _submit_close_shared failed for %s: %s", sym, e)
+                    LOG.warning("Reconcile: _try_close_from_positions failed for credit/inverted %s: %s", sym, e)
+                    ok = False
+
+                try:
+                    _AttemptLogger.write(
+                        symbol=sym,
+                        action="close",
+                        status=("placed" if ok else "skipped"),
+                        reason=credit_reason,
+                        exp="",
+                        right="",
+                        source="dcm-reconcile",
+                    )
+                except Exception:
+                    pass
+
+                if ok:
+                    submitted += 1
+                continue
+
+            # Non-credit case: use shared close submission path so we:
+            #  - respect per-run _submitted_close_syms guards
+            #  - avoid placing direct MKT orders from reconcile
+            #  - reuse the same CSV/live-mid fallback logic as preclose
+            LOG.info(
+                "Reconcile: positions-based CLOSE for %s side=%s reason=%s",
+                sym,
+                (side_to_close or "both"),
+                reason,
+            )
+            try:
+                self._submit_close_shared(sym, csv_exists_today, lookback_days, context="reconcile")
+                submitted += 1
+            except Exception as e:
+                LOG.warning("Reconcile: _submit_close_shared failed for %s: %s", sym, e)
 
         LOG.info(
             "Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).",
