@@ -114,102 +114,6 @@ LIQUIDITY_FILTER_PATH = Path(__file__).with_name("LiquidityFilter.py")
 VENV_PY_WIN = Path(__file__).parents[1] / ".venv" / "Scripts" / "python.exe"
 
 class DailyCycleManagementMixin:
-    def _cancel_working_close_orders(self, sym: str) -> int:
-        """
-        Cancel all working CLOSE combo orders for the given symbol (case-insensitive).
-        Returns the number of cancelled orders.
-        """
-        try:
-            from ib_insync import IB
-        except Exception:
-            return 0
-        n_cxl = 0
-        ib = None
-        try:
-            ib = IB()
-            try:
-                ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
-            except Exception:
-                return 0
-            # Ensure openOrders and openTrades are up-to-date
-            try:
-                ib.reqOpenOrders()
-            except Exception:
-                pass
-            trades = []
-            try:
-                trades = ib.openTrades() or []
-            except Exception:
-                try:
-                    trades = ib.trades() or []
-                except Exception:
-                    trades = []
-            for tr in trades:
-                try:
-                    c = getattr(tr, "contract", None)
-                    o = getattr(tr, "order", None)
-                    s = getattr(tr, "orderStatus", None)
-                    if not c or not o or not s:
-                        continue
-                    if getattr(c, "secType", "") != "BAG":
-                        continue
-                    if (getattr(c, "symbol", "") or "").upper() != (sym or "").upper():
-                        continue
-                    if (getattr(o, "action", "") or "").upper() != "SELL":
-                        continue
-                    st = (getattr(s, "status", "") or "").lower()
-                    # Acceptable working statuses
-                    working_states = ("presubmitted", "submitted", "pendingsubmit", "apipending", "inactive")
-                    if st not in working_states:
-                        continue
-                    # Defensive: allow case-insensitive check
-                    if st not in [w.lower() for w in working_states]:
-                        continue
-                    try:
-                        ib.cancelOrder(o)
-                        n_cxl += 1
-                        LOG.info("Cancelled working CLOSE order for %s (orderId=%s, status=%s)", (sym or "").upper(), getattr(o, "orderId", "?"), st)
-                    except Exception as ce:
-                        LOG.warning("Failed to cancel CLOSE order for %s: %s", (sym or "").upper(), ce)
-                except Exception:
-                    continue
-        except Exception:
-            return n_cxl
-        finally:
-            try:
-                if ib:
-                    ib.disconnect()
-            except Exception:
-                pass
-        return n_cxl
-
-    def _latest_close_signal_source(self, sym: str, days: int = 21) -> str | None:
-        """
-        Returns the _csv_src label for the latest close-like signal row for sym (case-insensitive), or None.
-        """
-        try:
-            rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=days)
-            up = (sym or "").upper()
-            for row in rows:
-                s = (row.get("symbol", "") or "").strip().upper()
-                if s != up:
-                    continue
-                # "close-like" logic: same as _delegate_close_from_csvs_within
-                side_raw = (row.get("signal_type") or row.get("signal_side") or "").strip().lower()
-                if "close" in side_raw:
-                    return row.get("_csv_src")
-                sp = (row.get("strategy_position") or "").strip()
-                try:
-                    if sp and int(sp) == 0:
-                        return row.get("_csv_src")
-                except Exception:
-                    pass
-                side_col = (row.get("side") or row.get("trade_side") or "").strip().lower()
-                if "close" in side_col:
-                    return row.get("_csv_src")
-            return None
-        except Exception:
-            return None
     def _working_close_limit_symbols(self) -> set[str]:
         try:
             from ib_insync import IB
@@ -340,37 +244,22 @@ class DailyCycleManagementMixin:
                     continue
 
                 is_bad = False
-
-                # 1) Detect proper debit verticals for this expiry/right
-                has_debit = False
-                for L, _qL in long_strikes:
-                    for S, _qS in short_strikes:
+                for L, qL in long_strikes:
+                    for S, qS in short_strikes:
+                        # We only look at L>0, S<0 pairs by construction
                         if right == "C":
-                            # Proper CALL debit: long lower, short higher -> L < S
-                            if L < S:
-                                has_debit = True
-                        elif right == "P":
-                            # Proper PUT debit: long higher, short lower -> L > S
-                            if L > S:
-                                has_debit = True
-
-                # 2) Any long/short pair that does NOT match debit geometry is credit/inverted/diagonal-ish
-                for L, _qL in long_strikes:
-                    for S, _qS in short_strikes:
-                        if right == "C":
+                            # Proper CALL debit: long lower, short higher  -> L < S
+                            # If not (L < S), then shape is credit/inverted
                             if not (L < S):
                                 is_bad = True
                                 break
                         elif right == "P":
+                            # Proper PUT debit: long higher, short lower -> L > S
                             if not (L > S):
                                 is_bad = True
                                 break
                     if is_bad:
                         break
-
-                # 3) If we have mixed + / - and no debit at all, also mark as bad
-                if (long_strikes and short_strikes) and (not has_debit):
-                    is_bad = True
 
                 if is_bad:
                     bad_syms.add(sym)
@@ -423,25 +312,14 @@ class DailyCycleManagementMixin:
         """
         sym = (sym or '').upper()
         now = self._now_ny()
-        now_d = now.date()
-        max_age = getattr(self, "MAX_SIGNAL_AGE_DAYS_FOR_OPENS", 3)
         def _csv_path_for(dt):
             folder = dt.astimezone(NY).strftime('%y_%m_%d')
-            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv", folder
-
+            return fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
         for d in range(0, max(1, days)):
-            dt = now - timedelta(days=d)
-            fp, folder = _csv_path_for(dt)
+            fp = _csv_path_for(now - timedelta(days=d))
             if not os.path.exists(fp):
                 continue
             try:
-                try:
-                    folder_dt = datetime.strptime(folder, "%y_%m_%d").date()
-                    age_days = (now_d - folder_dt).days
-                    if age_days > max_age:
-                        continue
-                except Exception:
-                    pass
                 last_row = None
                 with open(fp, newline='', encoding='utf-8') as fh:
                     rdr = csv.DictReader(fh)
@@ -479,28 +357,6 @@ class DailyCycleManagementMixin:
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
-            sym_u = (sym or "").upper()
-
-            # NEW: per-run guard – if we've already submitted any CLOSE for this symbol in this run, skip
-            try:
-                submitted_set = getattr(self, "_submitted_close_syms", set())
-            except Exception:
-                submitted_set = set()
-
-            if sym_u in submitted_set:
-                try:
-                    self._attempt(
-                        symbol=sym_u,
-                        action="close",
-                        status="skipped",
-                        reason=f"{context}_already_submitted_this_run",
-                        source=f"dcm-{context}",
-                    )
-                except Exception:
-                    pass
-                return
-
-        
             # If there is already a working CLOSE order for this symbol, do not delegate again.
             if self._has_working_close_order(sym):
                 try:
@@ -604,12 +460,6 @@ class DailyCycleManagementMixin:
             except Exception:
                 # best-effort; do not fail close submission if STK flatten throws
                 pass
-            # Mark this symbol as fully handled for this run
-            try:
-                submitted_set.add(sym_u)
-                self._submitted_close_syms = submitted_set
-            except Exception:
-                pass
         finally:
             self._in_close_phase = _prev_phase
 
@@ -689,7 +539,6 @@ class DailyCycleManagementMixin:
         submitted_close_syms = getattr(self, "_submitted_close_syms", set())
 
         now_d = self._now_ny().date()
-        max_age = getattr(self, "MAX_SIGNAL_AGE_DAYS_FOR_OPENS", 3)
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, last_n_csvs))
         if not paths:
             LOG.info("Open-delegate: no recent CSVs found; skipping.")
@@ -699,18 +548,6 @@ class DailyCycleManagementMixin:
         for path in paths:
             try:
                 folder = Path(path).parent.name  # YY_MM_DD
-                # Age guard: skip CSV folders older than MAX_SIGNAL_AGE_DAYS_FOR_OPENS
-                try:
-                    folder_dt = datetime.strptime(folder, "%y_%m_%d").date()
-                    age_days = (now_d - folder_dt).days
-                    if age_days > max_age:
-                        LOG.info(
-                            "Open-delegate: skipping folder %s (age=%d days > max=%d)",
-                            folder, age_days, max_age
-                        )
-                        continue
-                except Exception:
-                    pass
                 with open(path, newline="", encoding="utf-8") as fh:
                     rdr = csv.DictReader(fh)
                     for r in rdr:
@@ -837,19 +674,6 @@ class DailyCycleManagementMixin:
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
-                        # Collect currently held option symbols to avoid closing non-existent positions
-            try:
-                held_signs = self._collect_held_orientations()
-                held_syms = set(held_signs.keys())
-            except Exception:
-                held_syms = set()
-
-            # Per-run guard: track symbols we've already attempted CLOSEs for in this run
-            try:
-                submitted_set = getattr(self, "_submitted_close_syms", set())
-            except Exception:
-                submitted_set = set()
-
             paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, days))
             if not paths:
                 LOG.info("Close-delegate: no CSVs within %d day(s); skipping.", days)
@@ -892,24 +716,9 @@ class DailyCycleManagementMixin:
             pick: list[str] = []
             per_day_counts: dict[str, int] = {}
             for sym, (row, label, _) in latest_by_sym.items():
-                if not _is_close(row):
-                    continue
-                sym_u = (sym or "").upper()
-                # Only enforce CSV CLOSEs for symbols we actually hold
-                if sym_u not in held_syms:
-                    try:
-                        self._attempt(
-                            symbol=sym_u,
-                            action="close",
-                            status="skipped",
-                            reason=f"close_within_{days}d_no_position",
-                            source="dcm-close",
-                        )
-                    except Exception:
-                        pass
-                    continue
-                pick.append(sym_u)
-                per_day_counts[label] = per_day_counts.get(label, 0) + 1
+                if _is_close(row):
+                    pick.append(sym)
+                    per_day_counts[label] = per_day_counts.get(label, 0) + 1
 
             if not pick:
                 LOG.info("Close-delegate: no CLOSE symbols found in the last %d day(s).", days)
@@ -935,23 +744,10 @@ class DailyCycleManagementMixin:
                     continue
                 filtered_syms: list[str] = []
                 for s in sorted(set(syms)):
-                    s_u = (s or "").upper()
-                    if s_u in submitted_set:
+                    if self._has_working_close_order(s):
                         try:
                             self._attempt(
-                                symbol=s_u,
-                                action="close",
-                                status="skipped",
-                                reason=f"close_within_{days}d_already_submitted_this_run",
-                                source="dcm-close",
-                            )
-                        except Exception:
-                            pass
-                        continue
-                    if self._has_working_close_order(s_u):
-                        try:
-                            self._attempt(
-                                symbol=s_u,
+                                symbol=s,
                                 action="close",
                                 status="skipped",
                                 reason=f"close_within_{days}d_existing_working_close_stage1",
@@ -960,8 +756,7 @@ class DailyCycleManagementMixin:
                         except Exception:
                             pass
                     else:
-                        filtered_syms.append(s_u)
-                        submitted_set.add(s_u)
+                        filtered_syms.append(s)
                 if not filtered_syms:
                     continue
                 argv_csv = [
@@ -1063,10 +858,6 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
         finally:
-            try:
-                self._submitted_close_syms = submitted_set
-            except Exception:
-                pass
             self._in_close_phase = _prev_phase
 
     def _try_close_from_positions(self, sym: str, prefer: str = "MKT", side: str | None = None) -> bool:
@@ -1257,13 +1048,6 @@ class DailyCycleManagementMixin:
     # simple in-memory run guards; replace with persistent store if running in multiple processes
     _last_daily_analysis_at: datetime | None = None
     _last_weekly_maintenance_at: datetime | None = None
-    
-    # NEW: per-run guard for symbols we have already submitted CLOSEs for
-    _submitted_close_syms: set[str] = set()
-
-    # NEW: age guard for using OPEN signals to drive new opens / reversals
-    MAX_SIGNAL_AGE_DAYS_FOR_OPENS: int = 3
-
 
     def _python_executable(self) -> str:
         """
@@ -1308,7 +1092,6 @@ class DailyCycleManagementMixin:
         If ref_dt is Monday, this returns the prior Friday.
         """
         dt = (ref_dt or self._now_ny()).date()
-        max_age = getattr(self, "MAX_SIGNAL_AGE_DAYS_FOR_OPENS", 3)
         from datetime import timedelta
         d = dt - timedelta(days=1)
         # Skip weekend days
@@ -1549,48 +1332,7 @@ class DailyCycleManagementMixin:
         """
         if not symbols:
             return
-        # Per-run guard: skip symbols we've already submitted CLOSEs for,
-        # or that already have a working CLOSE order.
-        try:
-            submitted_set = getattr(self, "_submitted_close_syms", set())
-        except Exception:
-            submitted_set = set()
-
-        filtered_syms: list[str] = []
-        for s in symbols:
-            sym_u = (s or "").strip().upper()
-            if not sym_u:
-                continue
-            if sym_u in submitted_set:
-                try:
-                    _AttemptLogger.write(
-                        symbol=sym_u,
-                        action="close",
-                        status="skipped",
-                        reason="dcm_submit_closes_already_submitted_this_run",
-                        source="dcm",
-                    )
-                except Exception:
-                    pass
-                continue
-            if self._has_working_close_order(sym_u):
-                try:
-                    _AttemptLogger.write(
-                        symbol=sym_u,
-                        action="close",
-                        status="skipped",
-                        reason="dcm_submit_closes_existing_working_close",
-                        source="dcm",
-                    )
-                except Exception:
-                    pass
-                continue
-            filtered_syms.append(sym_u)
-
-        if not filtered_syms:
-            return
-
-        syms = sorted(set(filtered_syms))
+        syms = sorted({(s or "").strip().upper() for s in symbols if (s or "").strip()})
         argv = ["--mode", "force-close",
                 "--symbols", ",".join(syms),
                 "--min-limit", f"{min_limit:.2f}",
@@ -1610,13 +1352,6 @@ class DailyCycleManagementMixin:
         try:
             _AttemptLogger.write(action="close", status="submitted",
                                  reason="dcm_submit_closes", source="dcm", symbol=",".join(syms))
-        except Exception:
-            pass
-        # Mark these symbols as handled for this run
-        try:
-            for s in syms:
-                submitted_set.add(s)
-            self._submitted_close_syms = submitted_set
         except Exception:
             pass
 
@@ -1731,15 +1466,6 @@ class DailyCycleManagementMixin:
         if not csv_exists_today:
             LOG.warning("Pre-close: today's combined CSV missing at %s; proceeding with positions-based fallback as needed.", csv_today_path)
 
-        # Helper: check if latest close signal for sym is older than 1 NY day
-        def _is_close_signal_older_than_1d(sym: str) -> bool:
-            try:
-                src = self._latest_close_signal_source(sym, days=lookback_days)
-                # treat anything not 'today' as older than 1 NY day
-                return bool(src) and (str(src).strip().lower() != "today")
-            except Exception:
-                return False
-
         # gather sources
         work_syms = self._working_close_limit_symbols()
         held_signs = self._collect_held_orientations()
@@ -1781,32 +1507,6 @@ class DailyCycleManagementMixin:
                 pass
             return
         for sym in sorted(close_candidates):
-            # --- Convert older CLOSE LMTs to MKT if conditions met ---
-            if self._has_working_close_order(sym) and _is_close_signal_older_than_1d(sym):
-                n_cxl = self._cancel_working_close_orders(sym)
-                if n_cxl > 0:
-                    self._attempt(
-                        symbol=sym,
-                        action="close",
-                        status="queued",
-                        reason="preclose_convert_cancel_old_lmt",
-                        source="dcm-preclose",
-                    )
-                ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
-                self._attempt(
-                    symbol=sym,
-                    action="close",
-                    status=("placed" if ok else "skipped"),
-                    reason=("preclose_convert_to_mkt" if ok else "preclose_convert_to_mkt_no_vertical"),
-                    source="dcm-preclose",
-                )
-                try:
-                    submitted_set = getattr(self, "_submitted_close_syms", set())
-                    submitted_set.add(sym.upper())
-                    self._submitted_close_syms = submitted_set
-                except Exception:
-                    pass
-                continue
             self._submit_close_shared(sym, csv_exists_today, lookback_days, context="preclose")
         try:
             self._summarize_latest_attempts()
@@ -1850,24 +1550,14 @@ class DailyCycleManagementMixin:
             credit_syms = self._detect_credit_or_inverted_spreads()
             if credit_syms:
                 LOG.info("After-hours: enforcing credit/inverted cleanup for: %s",
-                        ", ".join(sorted(credit_syms)))
-                for sym in sorted(credit_syms):
-                    try:
-                        ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
-                        try:
-                            _AttemptLogger.write(
-                                symbol=sym,
-                                action="close",
-                                status=("placed" if ok else "skipped"),
-                                reason="after_hours_credit_cleanup",
-                                exp="",
-                                right="",
-                                source="dcm-after-hours",
-                            )
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        LOG.warning("After-hours: direct credit cleanup failed for %s: %s", sym, e)
+                         ", ".join(sorted(credit_syms)))
+                # Use positions-based force-close path in PlaceAnOrder.py
+                self.submit_closes_via_place_anorder(
+                    symbols=credit_syms,
+                    use_live_close="join",
+                    min_limit=0.05,
+                    quiet=True,
+                )
         except Exception as e:
             LOG.warning("After-hours: credit-scan/cleanup failed: %s", e)
 
@@ -1878,26 +1568,16 @@ class DailyCycleManagementMixin:
         Diagnostic helper to try (re)placing today's OPEN orders directly from the CSV using PlaceAnOrder,
         with a controllable live-limit method ('join' or 'mid'). After the run, summarize latest attempts.
         """
-        try:
-            today_folder = self._now_ny().strftime("%y_%m_%d")
-        except Exception:
-            from datetime import datetime as _dt
-            today_folder = _dt.now(NY).strftime("%y_%m_%d")
-
         argv = [
             "--mode", "from-signal",
-            "--date", today_folder,
             "--min-limit", f"{min_limit:.2f}",
             "--use-live-open", method,
-            "--quiet",
+            "--quiet"
         ]
         if bump_to_min:
             argv.append("--bump-to-min")
         try:
-            LOG.info(
-                "Diagnostic open-from-signal: using %s limits, min_limit=%.2f, bump_to_min=%s, date=%s",
-                method, min_limit, bump_to_min, today_folder
-            )
+            LOG.info("Diagnostic open-from-signal: using %s limits, min_limit=%.2f, bump_to_min=%s", method, min_limit, bump_to_min)
             self._run_place_an_order(argv)
         finally:
             try:
@@ -2011,12 +1691,6 @@ class DailyCycleManagementMixin:
         # 1) Collect currently held option symbols and their orientation AND side info
         try:
             from ib_insync import IB
-            
-            # Track today's CSV existence once for reconcile context
-            csv_today_path = _ny_csv_path()
-            csv_exists_today = os.path.exists(csv_today_path)
-            lookback_days = days
-
         except Exception as e:
             LOG.warning("Reconcile: ib_insync unavailable; skipping IB position check: %s", e)
             return
@@ -2027,14 +1701,6 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("Reconcile: could not connect to IB: %s", e)
             return
-
-        # Detect any credit / inverted verticals once up-front; these should be
-        # force-flattened with direct MKT orders even if there is no explicit CLOSE signal.
-        try:
-            credit_syms = self._detect_credit_or_inverted_spreads()
-        except Exception as _e_credit:
-            LOG.warning("Reconcile: credit-scan failed; continuing without it: %s", _e_credit)
-            credit_syms = set()
 
         held_info: dict[str, int | None] = {}
         side_info: dict[str, dict[str, bool]] = {}
@@ -2259,148 +1925,61 @@ class DailyCycleManagementMixin:
                                              reason="latest_open_matches", exp="", right="", source="dcm-reconcile")
                     except Exception:
                         pass
-            # If this symbol has a credit/inverted vertical, force-flatten it with a direct
-            # positions-based MKT close, regardless of whether the latest signal is CLOSE.
-            is_credit_sym = False
-            try:
-                is_credit_sym = sym in credit_syms
-            except Exception:
-                is_credit_sym = False
 
-            if not should_close and not is_credit_sym:
-                # Nothing to do for this symbol in reconcile.
-                continue
+            if should_close:
+                if not hasattr(self, "_submitted_close_syms"):
+                    self._submitted_close_syms = set()
+                if sym in self._submitted_close_syms or self._has_working_close_order(sym):
+                    LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
+                    try:
+                        _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                            reason="working_close_order", exp="", right="", source="dcm-reconcile")
+                    except Exception:
+                        pass
+                    continue
 
-            # For credit/inverted symbols, always use direct MKT flatten from positions.
-            if is_credit_sym:
-                credit_reason = reason or "reconcile_credit_inverted"
-                LOG.info(
-                    "Reconcile: direct MKT CLOSE for credit/inverted %s side=%s reason=%s",
-                    sym,
-                    (side_to_close or "both"),
-                    credit_reason,
-                )
+                _prev_phase = getattr(self, "_in_close_phase", False)
+                self._in_close_phase = True
                 try:
-                    ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
-                except Exception as e:
-                    LOG.warning("Reconcile: _try_close_from_positions failed for credit/inverted %s: %s", sym, e)
-                    ok = False
+                    # Use positions-based close so we can handle both long and short verticals (credits and debits).
+                    LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
+                            sym, (side_to_close or "both"), reason)
+                    try_side = side_to_close  # "call", "put", or None
+                    ok = self._try_close_from_positions(sym, prefer="MKT", side=try_side)
 
-                try:
-                    _AttemptLogger.write(
-                        symbol=sym,
-                        action="close",
-                        status=("placed" if ok else "skipped"),
-                        reason=credit_reason,
-                        exp="",
-                        right="",
-                        source="dcm-reconcile",
-                    )
-                except Exception:
-                    pass
+                    if not ok and try_side is not None:
+                        # Fallback: if we couldn't close the requested side, try closing any verticals in this symbol.
+                        LOG.info("Reconcile: fallback CLOSE for %s (any side) after side=%s failure.", sym, try_side)
+                        ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
 
-                if ok:
-                    submitted += 1
-                continue
+                    if ok:
+                        self._submitted_close_syms.add(sym)
+                        submitted += 1
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
+                                                reason=reason, exp="", right=(try_side.upper() if try_side else ""),
+                                                source="dcm-reconcile")
+                        except Exception:
+                            pass
+                    else:
+                        LOG.info("Reconcile: no verticals closed for %s in positions-based CLOSE.", sym)
+                        try:
+                            _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                                reason="no_vertical_in_positions", exp="",
+                                                right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
+                        except Exception:
+                            pass
 
-            # Non-credit case: use shared close submission path so we:
-            #  - respect per-run _submitted_close_syms guards
-            #  - avoid placing direct MKT orders from reconcile
-            #  - reuse the same CSV/live-mid fallback logic as preclose
-            LOG.info(
-                "Reconcile: positions-based CLOSE for %s side=%s reason=%s",
-                sym,
-                (side_to_close or "both"),
-                reason,
-            )
-            try:
-                self._submit_close_shared(sym, csv_exists_today, lookback_days, context="reconcile")
-                submitted += 1
-            except Exception as e:
-                LOG.warning("Reconcile: _submit_close_shared failed for %s: %s", sym, e)
+                    if latest_is_close:
+                        try:
+                            if self._flatten_stock_if_present(sym):
+                                LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
+                        except Exception as _e_stk:
+                            LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
+                finally:
+                    self._in_close_phase = _prev_phase
 
-        LOG.info(
-            "Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).",
-            looked,
-            submitted,
-        )
-        #     if should_close:
-        #         # Guard: only one CLOSE attempt per symbol per run, and never if a working CLOSE already exists.
-        #         if not hasattr(self, "_submitted_close_syms"):
-        #             self._submitted_close_syms = set()
-        #         if not hasattr(self, "_reconcile_closed_syms"):
-        #             self._reconcile_closed_syms = set()
-
-        #         if (
-        #             sym in self._submitted_close_syms
-        #             or sym in self._reconcile_closed_syms
-        #             or self._has_working_close_order(sym)
-        #         ):
-        #             LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working this run).", sym)
-        #             try:
-        #                 _AttemptLogger.write(
-        #                     symbol=sym,
-        #                     action="close",
-        #                     status="skipped",
-        #                     reason="working_close_order",
-        #                     exp="",
-        #                     right="",
-        #                     source="dcm-reconcile",
-        #                 )
-        #             except Exception:
-        #                 pass
-        #             continue
-
-        #         _prev_phase = getattr(self, "_in_close_phase", False)
-        #         self._in_close_phase = True
-        #         try:
-        #             # Use positions-based close so we can handle both long and short verticals (credits and debits).
-        #             LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
-        #                     sym, (side_to_close or "both"), reason)
-        #             try_side = side_to_close  # "call", "put", or None
-        #             ok = self._try_close_from_positions(sym, prefer="MKT", side=try_side)
-
-        #             if not ok and try_side is not None:
-        #                 # Fallback: if we couldn't close the requested side, try closing any verticals in this symbol.
-        #                 LOG.info("Reconcile: fallback CLOSE for %s (any side) after side=%s failure.", sym, try_side)
-        #                 ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
-
-        #             if ok:
-        #                 # Mark symbol as closed from this reconcile run so we do not re‑launch CLOSE again.
-        #                 self._submitted_close_syms.add(sym)
-        #                 self._reconcile_closed_syms.add(sym)
-        #                 submitted += 1
-        #                 try:
-        #                     _AttemptLogger.write(
-        #                         symbol=sym,
-        #                         action="close",
-        #                         status="placed",
-        #                         reason=reason,
-        #                         exp="",
-        #                         right=(try_side.upper() if try_side else ""),
-        #                         source="dcm-reconcile",
-        #                     )
-        #                 except Exception:
-        #                     pass
-        #             else:
-        #                 LOG.info("Reconcile: no verticals closed for %s in positions-based CLOSE.", sym)
-        #                 try:
-        #                     _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-        #                                         reason="no_vertical_in_positions", exp="",
-        #                                         right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
-        #                 except Exception:
-        #                     pass
-
-        #             if latest_is_close:
-        #                 try:
-        #                     if self._flatten_stock_if_present(sym):
-        #                         LOG.info("Reconcile: flattened stock for %s based on latest CLOSE signal.", sym)
-        #                 except Exception as _e_stk:
-        #                     LOG.warning("Reconcile: stock flatten failed for %s: %s", sym, _e_stk)
-        #         finally:
-        #             self._in_close_phase = _prev_phase
-
-        # LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
+        LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
     def _rth_risk_exits(self, days_old: int = 7, loss_frac: float = 0.5, gain_frac: float = 0.5) -> None:
         """
@@ -3136,13 +2715,55 @@ class DailyCycleManagementMixin:
             return
 
 
+# ----- Runnable entry point for scheduled after-hours placement -----
+if __name__ == "__main__":
+    import os, sys, logging
+    from pathlib import Path
+    # Configure logging to console and a persistent log on Windows
+    log_dir = Path(r"C:\OptionsHistory\logs") if sys.platform.startswith("win") else Path("./logs")
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    log_path = log_dir / "DailyCycle.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
+        ]
+    )
+
+    class _Runner(DailyCycleManagementMixin):
+        """
+        Force daily analysis to be eligible, but otherwise use the normal session logic.
+        On weekends or outside RTH this will naturally take the after-close path (including reconcile).
+        """
+        def __init__(self):
+            # Reset the active attempts log path on each run to avoid stale logs
+            _AttemptLogger._active_path = None
+            super().__init__()
+        def _can_run_daily_analysis(self) -> bool:  # always allow analysis eligibility
+            return True
+
+    LOG.info("DailyCycleManagement runner starting (analysis enabled; normal session logic)...")
+    try:
+        r = _Runner()
+        # Reset the active attempts log path before each run to avoid stale logs
+        _AttemptLogger._active_path = None
+        r.daily_trading_cycle()
+        LOG.info("DailyCycleManagement runner completed.")
+        sys.exit(0)
+    except Exception:
+        LOG.exception("DailyCycleManagement runner failed.")
+        sys.exit(1)
 if __name__ == "__main__":
     """
     Minimal CLI so this module can be run directly (the PS menu calls this file).
     Safe by default; actions are opt-in via flags.
     """
     import argparse, os, sys, logging
-    from pathlib import Path
 
     parser = argparse.ArgumentParser(description="DailyCycleManagement runner")
     parser.add_argument("--place-opens", action="store_true",
@@ -3158,30 +2779,9 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Enable INFO logging.")
     args = parser.parse_args()
 
-    # Configure logging to console and a persistent log on Windows
-    log_dir = Path(r"C:\OptionsHistory\logs") if sys.platform.startswith("win") else Path("./logs")
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    # Ensure today's dated folder (YY_MM_DD) exists
-    try:
-        from datetime import datetime
-        ny = ZoneInfo("America/New_York")
-        folder = datetime.now(ny).strftime("%y_%m_%d")
-        dated_dir = Path(rf"C:\OptionsHistory\{folder}") if sys.platform.startswith("win") else Path(f"./{folder}")
-        dated_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    log_path = log_dir / "DailyCycle.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
-        ]
-    )
+    # Basic logger
+    logging.basicConfig(level=(logging.INFO if args.verbose else logging.WARNING),
+                        format="%(asctime)s [%(levelname)s] %(message)s")
 
     class _Host(DailyCycleManagementMixin):
         pass
