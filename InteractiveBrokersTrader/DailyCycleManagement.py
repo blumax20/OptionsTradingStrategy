@@ -1088,10 +1088,17 @@ class DailyCycleManagementMixin:
             return False
 
         ib = IB()
+        # Use a mostly-unique clientId per invocation to avoid "client id already in use"
         try:
-            ib.connect('127.0.0.1', 7497, clientId=884, timeout=6)
+            import random
+            client_id = 880 + random.randint(0, 99)
+        except Exception:
+            client_id = 884  # fallback
+
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=6)
         except Exception as e:
-            LOG.warning("direct-close: connect failed: %s", e)
+            LOG.warning("direct-close: connect failed (clientId=%s): %s", client_id, e)
             return False
 
         submitted = False
