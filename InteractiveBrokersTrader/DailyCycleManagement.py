@@ -348,6 +348,91 @@ class DailyCycleManagementMixin:
                 continue
         return None
 
+    def _cancel_symbol_close_orders(self, symbol: str) -> int:
+        """
+        Cancel all pending/working SELL combo (BAG) orders for the given ticker.
+        Returns number of orders cancelled.
+        """
+        try:
+            from ib_insync import IB
+        except Exception:
+            return 0
+
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+        except Exception:
+            return 0
+
+        try:
+            # Refresh local view of open orders/trades
+            try:
+                ib.reqOpenOrders()
+                ib.sleep(0.25)
+            except Exception:
+                pass
+
+            n_cancel = 0
+            sym_u = (symbol or "").upper()
+
+            for tr in ib.trades() or []:
+                try:
+                    c = getattr(tr, "contract", None)
+                    o = getattr(tr, "order", None)
+                    s = getattr(tr, "orderStatus", None)
+                    if not (c and o and s):
+                        continue
+
+                    if getattr(c, "secType", "") != "BAG":
+                        continue
+                    if (getattr(c, "symbol", "") or "").upper() != sym_u:
+                        continue
+
+                    act = (getattr(o, "action", "") or "").upper()
+                    status = (getattr(s, "status", "") or "")
+
+                    # Common working/pre-working states
+                    if act == "SELL" and status in ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending", "ApiCancelled", "Inactive"):
+                        try:
+                            ib.cancelOrder(o)
+                            n_cancel += 1
+                            LOG.info(
+                                "[%s] Cancelled pending CLOSE order (id=%s, status=%s)",
+                                sym_u,
+                                getattr(o, "orderId", None),
+                                status,
+                            )
+                            try:
+                                self._attempt(
+                                    symbol=sym_u,
+                                    action="cancel_close",
+                                    status="placed",
+                                    reason="cancelled",
+                                    exp=getattr(c, "comboLegsDescrip", ""),
+                                    right="?",
+                                    source="dcm-preclose",
+                                    order_id=getattr(o, "orderId", None),
+                                    prev_status=status,
+                                )
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            LOG.warning(
+                                "[%s] Failed to cancel order %s: %s",
+                                sym_u,
+                                getattr(o, "orderId", None),
+                                e,
+                            )
+                except Exception:
+                    continue
+
+            return n_cancel
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
     def _submit_close_shared(self, sym: str, csv_exists_today: bool, lookback_days: int, context: str) -> None:
         """
         Shared submission path used by both pre-close (≈15:00) and after-hours reconcile.
@@ -357,18 +442,32 @@ class DailyCycleManagementMixin:
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
-            # If there is already a working CLOSE order for this symbol, do not delegate again.
-            if self._has_working_close_order(sym):
-                try:
+            has_working = self._has_working_close_order(sym)
+
+            # NEW: In preclose, we *replace* stale close limits instead of skipping them
+            if context == "preclose" and has_working:
+                n_cxl = self._cancel_symbol_close_orders(sym)
+                if n_cxl > 0:
                     self._attempt(
                         symbol=sym,
                         action="close",
-                        status="skipped",
-                        reason=f"{context}_existing_working_close",
-                        source=f"dcm-{context}",
+                        status="placed",
+                        reason="preclose_cancel_existing_close",
+                        source="dcm-preclose",
+                        extra={"cancelled": n_cxl},
                     )
-                except Exception:
-                    pass
+                # we just cancelled them; treat as if no working close exists
+                has_working = False
+
+            # For non-preclose flows, keep the old guard: skip if a working close already exists
+            if context != "preclose" and has_working:
+                self._attempt(
+                    symbol=sym,
+                    action="close",
+                    status="skipped",
+                    reason=f"{context}_existing_working_close",
+                    source=f"dcm-{context}",
+                )
                 return
 
             # Stage 1: delegate using CSV-derived limits only (no live quotes)

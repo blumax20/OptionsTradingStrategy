@@ -1,5 +1,6 @@
 from ib_insync import IB, Option, LimitOrder, MarketOrder
 from ib_insync.contract import ComboLeg, Contract
+from ib_close_guard import has_working_auto_close
 import logging
 from ib_insync import util as _ibutil
 import pandas as pd
@@ -838,6 +839,29 @@ def place_debit_spread(
                   we always send a true MARKET order first (no after-hours MKT→LMT
                   conversion), and only fall back to LMT if IB rejects as riskless.
     """
+    # --- HARD CLOSE GUARD ---
+    if has_working_auto_close(symbol):
+        logger.info("[%s] close-guard: existing working AUTO_CLOSE; skipping.", symbol)
+        try:
+            rec_action = (
+                "force_close" if role == "force_close"
+                else "close_call" if right.upper() == "C"
+                else "close_put" if right.upper() == "P"
+                else "close"
+            )
+            record_attempt(
+                symbol,
+                rec_action,
+                "skipped",
+                "existing_working_close",
+                exp=str(expiration),
+                right=right.upper(),
+                longK=float(long_strike),
+                shortK=float(short_strike),
+            )
+        except Exception:
+            pass
+        return None
     # --- Canonicalize leg orientation: treat combo as a long debit vertical ---
     # Calls: long lower strike, short higher strike
     # Puts : long higher strike, short lower strike
