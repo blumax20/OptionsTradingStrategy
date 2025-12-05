@@ -470,7 +470,7 @@ class DailyCycleManagementMixin:
                 )
                 return
 
-            # Stage 1: delegate using CSV-derived limits only (no live quotes)
+            # Stage 1: delegate using CSV-derived limits (from-signal mode respects CSV limits)
             try:
                 self._attempt(
                     symbol=sym,
@@ -482,10 +482,10 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
             self._run_place_an_order([
-                "--mode","force-close",
+                "--mode","from-signal",  # Changed: use from-signal to respect CSV limits
                 "--symbols", sym,
                 "--min-limit","0.01" if context == "preclose" else "0.05",
-                "--use-live-close","off",
+                "--use-live-close","off",  # Don't override CSV limits with live quotes
                 "--quantity","50",
                 "--quiet"
             ])
@@ -502,22 +502,22 @@ class DailyCycleManagementMixin:
                 except Exception:
                     pass
             else:
-                # Stage 2: delegate using live mid quotes as fallback
+                # Stage 2: fallback to force-close with live join quotes (aggressive close)
                 try:
                     self._attempt(
                         symbol=sym,
                         action="close",
                         status="queued",
-                        reason=f"{context}_delegated_live_mid",
+                        reason=f"{context}_fallback_live_join",
                         source=f"dcm-{context}",
                     )
                 except Exception:
                     pass
                 self._run_place_an_order([
-                    "--mode","force-close",
+                    "--mode","force-close",  # Force-close scans positions directly
                     "--symbols", sym,
                     "--min-limit","0.01" if context == "preclose" else "0.05",
-                    "--use-live-close","join",
+                    "--use-live-close","join",  # Use live join quotes for aggressive pricing
                     "--quantity","50",
                     "--quiet"
                 ])
