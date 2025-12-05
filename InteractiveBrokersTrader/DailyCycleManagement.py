@@ -1424,10 +1424,13 @@ class DailyCycleManagementMixin:
                                         symbols: list[str] | set[str],
                                         use_live_close: str = "join",
                                         min_limit: float = 0.05,
-                                        quiet: bool = True) -> None:
+                                        quiet: bool = True,
+                                        fallback_individual_legs: bool = False) -> None:
         """
         Convenience: delegate CLOSE placement (force-close) for a set of symbols to PlaceAnOrder.py.
         This path ignores today's CSV contents and will inspect IB positions in PlaceAnOrder.
+
+        If fallback_individual_legs=True, will close individual legs if one leg is worthless (< min_limit).
         """
         if not symbols:
             return
@@ -1437,6 +1440,8 @@ class DailyCycleManagementMixin:
                 "--min-limit", f"{min_limit:.2f}",
                 "--use-live-close", (use_live_close or "off"),
                 "--quantity","50"]
+        if fallback_individual_legs:
+            argv.append("--fallback-individual-legs")
         if quiet:
             argv.append("--quiet")
 
@@ -1651,11 +1656,13 @@ class DailyCycleManagementMixin:
                 LOG.info("After-hours: enforcing credit/inverted cleanup for: %s",
                          ", ".join(sorted(credit_syms)))
                 # Use positions-based force-close path in PlaceAnOrder.py
+                # Enable fallback to close individual legs if one is worthless
                 self.submit_closes_via_place_anorder(
                     symbols=credit_syms,
                     use_live_close="join",
                     min_limit=0.05,
                     quiet=True,
+                    fallback_individual_legs=True,  # Close individual legs if combo fails
                 )
         except Exception as e:
             LOG.warning("After-hours: credit-scan/cleanup failed: %s", e)

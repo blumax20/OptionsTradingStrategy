@@ -471,6 +471,8 @@ def parse_args():
                    help="Minimum OI required on BOTH legs to allow OPEN orders (applies per --oi-check).")
     p.add_argument("--oi-check", choices=["off","rth","always"], default="rth",
                    help="When to enforce the OI gate for OPEN orders: 'off' (never), 'rth' (only during 09:30–16:00 NY), or 'always'.")
+    p.add_argument("--fallback-individual-legs", action="store_true",
+                   help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -941,10 +943,9 @@ def place_debit_spread(
 
         # --- Order-type selection (with special handling for force_close) ---
         if order_type.upper() == "MKT" or limit_price is None:
-            if role == "force_close":
-                # Option B: for force-close, ALWAYS send a true MKT first,
-                # regardless of after-hours. Only the riskless-combo handler
-                # is allowed to introduce a LMT retry.
+            if role == "force_close" and limit_price is None:
+                # For force-close: use MKT only when no limit price is available.
+                # If a limit exists, fall through to the LMT path below.
                 order = MarketOrder(action.upper(), quantity)
                 try:
                     order.tif = "DAY"
@@ -1751,19 +1752,64 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
         action = "SELL" if is_debit else "BUY"
 
-        tr = place_debit_spread(
-            ib,
-            symbol,
-            exp,
-            longK,
-            shortK,
-            right,
-            limit,
-            quantity=qty,
-            action=action,
-            order_type=order_type,
-            role="force_close",
-        )
+        # Check if fallback-individual-legs is enabled
+        use_fallback = getattr(args, "fallback_individual_legs", False)
+        skip_combo = False
+
+        if use_fallback:
+            # Check market values of both legs to see if one is worthless
+            try:
+                long_opt = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
+                short_opt = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
+
+                long_opt = ib.qualifyContracts(long_opt)[0]
+                short_opt = ib.qualifyContracts(short_opt)[0]
+
+                t_long = ib.reqMktData(long_opt, '', False, False)
+                t_short = ib.reqMktData(short_opt, '', False, False)
+                ib.sleep(2.5)
+
+                long_value = _ticker_mid(t_long)
+                short_value = _ticker_mid(t_short)
+
+                # Cancel market data
+                try:
+                    ib.cancelMktData(long_opt)
+                    ib.cancelMktData(short_opt)
+                except Exception:
+                    pass
+
+                # If one leg is worthless but the other has value, skip combo
+                long_worthless = (long_value is None or long_value < args.min_limit)
+                short_worthless = (short_value is None or short_value < args.min_limit)
+
+                if (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
+                    skip_combo = True
+                    logger.info(
+                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
+                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
+                        f"will close individual valuable leg(s) only"
+                    )
+            except Exception as e:
+                logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
+                skip_combo = False
+
+        tr = None
+        if not skip_combo:
+            # Try combo close as normal
+            tr = place_debit_spread(
+                ib,
+                symbol,
+                exp,
+                longK,
+                shortK,
+                right,
+                limit,
+                quantity=qty,
+                action=action,
+                order_type=order_type,
+                role="force_close",
+            )
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
             submitted += 1
@@ -1799,6 +1845,107 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 orientation=("debit" if is_debit else "credit"),
                 order_action=action,
             )
+
+        # If combo was skipped, close individual valuable legs
+        if skip_combo and use_fallback:
+            # Find position quantities for each leg
+            try:
+                long_qty = 0
+                short_qty = 0
+
+                for p in ib.positions():
+                    c = getattr(p, "contract", None)
+                    if not c or getattr(c, "secType", "") != "OPT":
+                        continue
+                    if getattr(c, "symbol", "").upper() != symbol.upper():
+                        continue
+                    if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
+                        continue
+                    if getattr(c, "right", "").upper() != right.upper():
+                        continue
+
+                    strike = float(getattr(c, "strike", 0.0))
+                    pos = float(getattr(p, "position", 0.0))
+
+                    if abs(strike - float(longK)) < 0.01:
+                        long_qty = pos
+                    elif abs(strike - float(shortK)) < 0.01:
+                        short_qty = pos
+
+                # Close valuable legs individually
+                legs_closed = 0
+
+                if not long_worthless and abs(long_qty) > 0:
+                    # Close long leg
+                    leg_action = "SELL" if long_qty > 0 else "BUY"
+                    leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
+                    leg_order.tif = "DAY"
+
+                    long_opt_to_close = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
+                    long_opt_to_close = ib.qualifyContracts(long_opt_to_close)[0]
+
+                    trade = ib.placeOrder(long_opt_to_close, leg_order)
+                    legs_closed += 1
+                    submitted += 1
+
+                    logger.info(
+                        f"[{symbol}] Closed individual LONG {right} {longK} exp {exp} "
+                        f"({leg_action} {abs(long_qty):.0f} @ ${long_value:.2f})"
+                    )
+
+                    record_attempt(
+                        symbol,
+                        "close_individual_leg",
+                        "placed",
+                        "worthless_leg_fallback",
+                        exp=str(exp),
+                        right=right,
+                        longK=float(longK),
+                        limit=float(long_value),
+                        qty=int(abs(long_qty)),
+                        order_action=leg_action,
+                        leg_type="long",
+                        leg_value=float(long_value),
+                    )
+
+                if not short_worthless and abs(short_qty) > 0:
+                    # Close short leg
+                    leg_action = "SELL" if short_qty > 0 else "BUY"
+                    leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
+                    leg_order.tif = "DAY"
+
+                    short_opt_to_close = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
+                    short_opt_to_close = ib.qualifyContracts(short_opt_to_close)[0]
+
+                    trade = ib.placeOrder(short_opt_to_close, leg_order)
+                    legs_closed += 1
+                    submitted += 1
+
+                    logger.info(
+                        f"[{symbol}] Closed individual SHORT {right} {shortK} exp {exp} "
+                        f"({leg_action} {abs(short_qty):.0f} @ ${short_value:.2f})"
+                    )
+
+                    record_attempt(
+                        symbol,
+                        "close_individual_leg",
+                        "placed",
+                        "worthless_leg_fallback",
+                        exp=str(exp),
+                        right=right,
+                        shortK=float(shortK),
+                        limit=float(short_value),
+                        qty=int(abs(short_qty)),
+                        order_action=leg_action,
+                        leg_type="short",
+                        leg_value=float(short_value),
+                    )
+
+                if legs_closed > 0:
+                    logger.info(f"[{symbol}] Closed {legs_closed} individual leg(s) via fallback")
+
+            except Exception as e_legs:
+                logger.error(f"[{symbol}] Failed to close individual legs: {e_legs}")
 
     if not any_pair:
         record_attempt(symbol, "force_close", "skipped", "no_spread_in_positions")
