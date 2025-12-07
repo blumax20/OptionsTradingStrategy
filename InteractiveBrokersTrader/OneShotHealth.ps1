@@ -262,8 +262,17 @@ try {
 # Check if ImprovedHealthQueries.py exists
 if (Test-Path $HealthQueriesPy) {
   try {
-    $plJson = & $Py $HealthQueriesPy 2>&1
+    # Capture stdout only, ignore stderr (IB warnings)
+    $plJson = & $Py $HealthQueriesPy 2>$null
     $obj = $null
+    # Handle case where output might have multiple lines - get the JSON part
+    if ($plJson -is [array]) {
+      $plJson = $plJson -join "`n"
+    }
+    # Extract JSON from output (find the first { to last })
+    if ($plJson -match '(?s)(\{.*\})') {
+      $plJson = $matches[1]
+    }
     try { $obj = $plJson | ConvertFrom-Json -ErrorAction Stop } catch {}
 
     # helper for PS 5.1: null/empty coalesce
