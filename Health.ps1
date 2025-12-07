@@ -337,13 +337,19 @@ if (Test-Path $HealthQueriesPy) {
         }
       }
 
-      # Recent executions summary (individual fills)
+      # Recent executions summary (grouped by spread)
       if ($obj.recent_executions_count -gt 0) {
-        "`nRecent Executions (individual): $($obj.recent_executions_count)" | Tee-Object -FilePath $Report -Append
+        "`nRecent Executions (by spread): $($obj.recent_executions_count)" | Tee-Object -FilePath $Report -Append
         foreach ($e in $obj.recent_executions) {
           $closeTag = if ($e.is_close) { "[CLOSE]" } else { "[OPEN]" }
-          ("  {0} | {1} {2} K={3} {4} | {5} {6} @ {7:N2} | P/L: {8:N2}" -f $e.time, $e.symbol, $e.expiration, $e.strike, $e.right, $e.side, $closeTag, $e.price, $e.pnl) |
+          $strikesStr = ($e.strikes -join '/')
+          ("  {0} | {1} {2} {3} {4} | strikes={5} w={6} | P/L: {7:N2} {8}" -f $e.time, $e.symbol, $e.expiration, $e.right, $e.spread_type, $strikesStr, $e.width, $e.spread_pnl, $closeTag) |
             Tee-Object -FilePath $Report -Append | Out-Null
+          # Show individual legs
+          foreach ($leg in $e.legs) {
+            ("    {0,-5} K={1,-7} fill={2,-6} legP/L={3:N2}" -f $leg.side, $leg.strike, $leg.price, $leg.pnl) |
+              Tee-Object -FilePath $Report -Append | Out-Null
+          }
         }
       }
     } else {
