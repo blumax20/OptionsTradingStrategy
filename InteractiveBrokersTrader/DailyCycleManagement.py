@@ -483,6 +483,7 @@ class DailyCycleManagementMixin:
                 pass
             self._run_place_an_order([
                 "--mode","from-signal",  # Changed: use from-signal to respect CSV limits
+                "--date", self._now_ny().strftime("%y_%m_%d"),  # Ensure correct dated CSV directory
                 "--symbols", sym,
                 "--min-limit","0.01" if context == "preclose" else "0.05",
                 "--use-live-close","off",  # Don't override CSV limits with live quotes
@@ -515,6 +516,7 @@ class DailyCycleManagementMixin:
                     pass
                 self._run_place_an_order([
                     "--mode","force-close",  # Force-close scans positions directly
+                    "--date", self._now_ny().strftime("%y_%m_%d"),  # Ensure correct dated CSV directory
                     "--symbols", sym,
                     "--min-limit","0.01" if context == "preclose" else "0.05",
                     "--use-live-close","join",  # Use live join quotes for aggressive pricing
