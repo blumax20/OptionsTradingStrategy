@@ -646,11 +646,11 @@ def main():
         fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
 
         # Collect leg-level CLOSE fills (no market data)
+        # IMPROVED: Use realizedPNL != 0 as primary indicator (IB only reports realized P/L on closes)
         legs=[]
         for f in fills:
             c,e=f.contract,f.execution
             if getattr(c,"secType","")!="OPT": continue
-            if getattr(e,"openClose","")!="C": continue
             t_utc=parse_ib_time(getattr(e,"time","")); t_ny=t_utc.astimezone(NY) if t_utc else None
             pnl=0.0
             try:
@@ -661,6 +661,12 @@ def main():
             except Exception:
                 # Commission may be unavailable — treat as 0 and continue
                 pnl=0.0
+            # Determine if this is a closing trade:
+            # 1. Primary: If realizedPNL != 0, it's definitely a close (IB only reports realized P/L on closes)
+            # 2. Fallback: Check if openClose field is set to 'C'
+            open_close_field = getattr(e,"openClose","")
+            is_close = (abs(pnl) > 0.001) or (open_close_field == "C")
+            if not is_close: continue
             legs.append(dict(sym=c.symbol,
                              exp=getattr(c,"lastTradeDateOrContractMonth",""),
                              right=getattr(c,"right",""),
