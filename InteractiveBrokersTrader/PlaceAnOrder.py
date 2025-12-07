@@ -1730,6 +1730,25 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 except Exception:
                     limit = None
 
+        # FALLBACK: If live quotes failed, try CSV theoretical limits
+        if limit is None:
+            try:
+                csv_path = combined_csv_path_for_today(args.date)
+                if csv_path.exists():
+                    df_csv = pd.read_csv(csv_path)
+                    if "symbol" in df_csv.columns:
+                        df_csv["symbol"] = df_csv["symbol"].astype(str).map(_clean_symbol)
+                    rows = df_csv[df_csv["symbol"].astype(str).str.upper() == symbol.upper()]
+                    if not rows.empty:
+                        row = rows.iloc[0]
+                        width = abs(float(longK) - float(shortK))
+                        csv_limit = width_aligned_close_limit(row, right, width)
+                        if csv_limit is not None and csv_limit >= args.min_limit:
+                            limit = csv_limit
+                            logger.info(f"[{symbol}] Force-close fallback: using CSV theoretical limit {limit:.2f} (live quotes unavailable)")
+            except Exception as e:
+                logger.warning(f"[{symbol}] Failed to read CSV fallback for force-close: {e}")
+
         order_type = "LMT" if (limit is not None) else "MKT"
         ckey = _close_key(symbol, right, exp)
         if ckey in CLOSE_SEEN_KEYS:

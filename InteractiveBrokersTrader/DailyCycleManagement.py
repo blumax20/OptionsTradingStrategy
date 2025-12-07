@@ -471,6 +471,8 @@ class DailyCycleManagementMixin:
                 return
 
             # Stage 1: delegate using CSV-derived limits (from-signal mode respects CSV limits)
+            dated_folder = self._now_ny().strftime("%y_%m_%d")
+            LOG.info(f"[{sym}] Stage 1: Attempting CSV-based close from {dated_folder} (context={context})")
             try:
                 self._attempt(
                     symbol=sym,
@@ -483,7 +485,7 @@ class DailyCycleManagementMixin:
                 pass
             self._run_place_an_order([
                 "--mode","from-signal",  # Changed: use from-signal to respect CSV limits
-                "--date", self._now_ny().strftime("%y_%m_%d"),  # Ensure correct dated CSV directory
+                "--date", dated_folder,  # Ensure correct dated CSV directory
                 "--symbols", sym,
                 "--min-limit","0.01" if context == "preclose" else "0.05",
                 "--use-live-close","off",  # Don't override CSV limits with live quotes
@@ -491,7 +493,9 @@ class DailyCycleManagementMixin:
                 "--quiet"
             ])
 
-            if self._has_working_close_order(sym):
+            has_working = self._has_working_close_order(sym)
+            LOG.info(f"[{sym}] Stage 1 completed: has_working_close_order={has_working}")
+            if has_working:
                 try:
                     self._attempt(
                         symbol=sym,
@@ -504,6 +508,7 @@ class DailyCycleManagementMixin:
                     pass
             else:
                 # Stage 2: fallback to force-close with live join quotes (aggressive close)
+                LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close)")
                 try:
                     self._attempt(
                         symbol=sym,
@@ -516,7 +521,7 @@ class DailyCycleManagementMixin:
                     pass
                 self._run_place_an_order([
                     "--mode","force-close",  # Force-close scans positions directly
-                    "--date", self._now_ny().strftime("%y_%m_%d"),  # Ensure correct dated CSV directory
+                    "--date", dated_folder,  # Ensure correct dated CSV directory
                     "--symbols", sym,
                     "--min-limit","0.01" if context == "preclose" else "0.05",
                     "--use-live-close","join",  # Use live join quotes for aggressive pricing
