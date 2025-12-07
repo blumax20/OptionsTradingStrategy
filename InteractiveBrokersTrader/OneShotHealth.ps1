@@ -305,16 +305,37 @@ if (Test-Path $HealthQueriesPy) {
       if ($obj.recent_trades_count -gt 0) {
         "`nRecent Trades: $($obj.recent_trades_count)" | Tee-Object -FilePath $Report -Append
         foreach ($t in $obj.recent_trades) {
-          ("  {0} | {1} | {2} | {3}" -f $t.time, $t.symbol, $t.action, $t.status) |
+          $strike = if ($t.strike) { "K=$($t.strike)" } else { "" }
+          $exp = if ($t.expiration) { "exp=$($t.expiration)" } else { "" }
+          $right = if ($t.right) { $t.right } else { "" }
+          $spread = if ($t.is_spread) { "[SPREAD]" } else { "" }
+          $lmt = if ($t.lmt_price) { "lmt=$($t.lmt_price)" } else { "" }
+          ("  {0} | {1} {2} {3} {4} | {5} | {6} {7} {8}" -f $t.time, $t.symbol, $exp, $strike, $right, $t.action, $t.status, $spread, $lmt) |
             Tee-Object -FilePath $Report -Append | Out-Null
         }
       }
 
-      # Recent executions summary
+      # Closed spreads summary (aggregated P/L)
+      if ($obj.closed_spreads_count -gt 0) {
+        "`nClosed Spreads (last 7 days): $($obj.closed_spreads_count)  |  Total P/L: $($obj.total_closed_spreads_pnl.ToString('N2'))" | Tee-Object -FilePath $Report -Append
+        foreach ($s in $obj.closed_spreads) {
+          $strikesStr = ($s.strikes -join '/')
+          ("  {0} | {1} {2} {3} {4} | strikes={5} w={6} | P/L: {7:N2}" -f $s.time, $s.symbol, $s.expiration, $s.right, $s.spread_type, $strikesStr, $s.width, $s.spread_pnl) |
+            Tee-Object -FilePath $Report -Append | Out-Null
+          # Show individual legs
+          foreach ($leg in $s.legs) {
+            ("    {0,-5} K={1,-7} fill={2,-6} legP/L={3:N2}" -f $leg.side, $leg.strike, $leg.price, $leg.pnl) |
+              Tee-Object -FilePath $Report -Append | Out-Null
+          }
+        }
+      }
+
+      # Recent executions summary (individual fills)
       if ($obj.recent_executions_count -gt 0) {
-        "`nRecent Executions: $($obj.recent_executions_count)" | Tee-Object -FilePath $Report -Append
+        "`nRecent Executions (individual): $($obj.recent_executions_count)" | Tee-Object -FilePath $Report -Append
         foreach ($e in $obj.recent_executions) {
-          ("  {0} | {1} | {2} | P/L: {3:N2}" -f $e.time, $e.symbol, $e.side, $e.pnl) |
+          $closeTag = if ($e.is_close) { "[CLOSE]" } else { "[OPEN]" }
+          ("  {0} | {1} {2} K={3} {4} | {5} {6} @ {7:N2} | P/L: {8:N2}" -f $e.time, $e.symbol, $e.expiration, $e.strike, $e.right, $e.side, $closeTag, $e.price, $e.pnl) |
             Tee-Object -FilePath $Report -Append | Out-Null
         }
       }
