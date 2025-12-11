@@ -1781,8 +1781,12 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 long_opt = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
                 short_opt = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
 
-                long_opt = ib.qualifyContracts(long_opt)[0]
-                short_opt = ib.qualifyContracts(short_opt)[0]
+                qualified_long = ib.qualifyContracts(long_opt)
+                qualified_short = ib.qualifyContracts(short_opt)
+                if not qualified_long or not qualified_short:
+                    raise ValueError(f"Could not qualify contracts: long={len(qualified_long)}, short={len(qualified_short)}")
+                long_opt = qualified_long[0]
+                short_opt = qualified_short[0]
 
                 t_long = ib.reqMktData(long_opt, '', False, False)
                 t_short = ib.reqMktData(short_opt, '', False, False)
@@ -1799,14 +1803,16 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     pass
 
                 # If one leg is worthless but the other has value, skip combo
-                long_worthless = (long_value is None or long_value < args.min_limit)
-                short_worthless = (short_value is None or short_value < args.min_limit)
+                # Use a higher threshold (0.15) for worthless determination than min_limit
+                worthless_threshold = max(0.15, args.min_limit)
+                long_worthless = (long_value is None or long_value < worthless_threshold)
+                short_worthless = (short_value is None or short_value < worthless_threshold)
 
                 if (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
                     skip_combo = True
                     logger.info(
                         f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
-                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
+                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
                         f"will close individual valuable leg(s) only"
                     )
             except Exception as e:

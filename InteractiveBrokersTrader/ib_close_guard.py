@@ -34,6 +34,9 @@ def has_working_auto_close(symbol: str,
         return False
 
     try:
+        # Must request all open orders first to see orders from other client IDs
+        ib.reqAllOpenOrders()
+        ib.sleep(0.5)
         trades = ib.openTrades() or []
         working_states: Set[str] = {
             "presubmitted", "submitted", "pendingsubmit", "apipending"
