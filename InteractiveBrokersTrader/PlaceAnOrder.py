@@ -1777,30 +1777,62 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
         if use_fallback:
             # Check market values of both legs to see if one is worthless
+            # First try to get values from portfolio (already qualified contracts)
+            long_value = None
+            short_value = None
+            long_contract_from_pos = None
+            short_contract_from_pos = None
+
             try:
-                long_opt = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
-                short_opt = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
+                # Try portfolio data first (more reliable, already qualified)
+                portfolio = ib.portfolio()
+                for item in portfolio:
+                    c = item.contract
+                    if getattr(c, "secType", "") != "OPT":
+                        continue
+                    if getattr(c, "symbol", "").upper() != symbol.upper():
+                        continue
+                    if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
+                        continue
+                    if getattr(c, "right", "").upper() != right.upper():
+                        continue
+                    strike = float(getattr(c, "strike", 0.0))
+                    mkt_price = getattr(item, "marketPrice", None)
+                    if mkt_price is not None and mkt_price > 0:
+                        if abs(strike - float(longK)) < 0.01:
+                            long_value = float(mkt_price)
+                            long_contract_from_pos = c
+                        elif abs(strike - float(shortK)) < 0.01:
+                            short_value = float(mkt_price)
+                            short_contract_from_pos = c
 
-                qualified_long = ib.qualifyContracts(long_opt)
-                qualified_short = ib.qualifyContracts(short_opt)
-                if not qualified_long or not qualified_short:
-                    raise ValueError(f"Could not qualify contracts: long={len(qualified_long)}, short={len(qualified_short)}")
-                long_opt = qualified_long[0]
-                short_opt = qualified_short[0]
+                # If portfolio didn't give us values, try market data request
+                if long_value is None or short_value is None:
+                    long_opt = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
+                    short_opt = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
 
-                t_long = ib.reqMktData(long_opt, '', False, False)
-                t_short = ib.reqMktData(short_opt, '', False, False)
-                ib.sleep(2.5)
+                    qualified_long = ib.qualifyContracts(long_opt)
+                    qualified_short = ib.qualifyContracts(short_opt)
+                    if not qualified_long or not qualified_short:
+                        raise ValueError(f"Could not qualify contracts: long={len(qualified_long)}, short={len(qualified_short)}")
+                    long_opt = qualified_long[0]
+                    short_opt = qualified_short[0]
 
-                long_value = _ticker_mid(t_long)
-                short_value = _ticker_mid(t_short)
+                    t_long = ib.reqMktData(long_opt, '', False, False)
+                    t_short = ib.reqMktData(short_opt, '', False, False)
+                    ib.sleep(2.5)
 
-                # Cancel market data
-                try:
-                    ib.cancelMktData(long_opt)
-                    ib.cancelMktData(short_opt)
-                except Exception:
-                    pass
+                    if long_value is None:
+                        long_value = _ticker_mid(t_long)
+                    if short_value is None:
+                        short_value = _ticker_mid(t_short)
+
+                    # Cancel market data
+                    try:
+                        ib.cancelMktData(long_opt)
+                        ib.cancelMktData(short_opt)
+                    except Exception:
+                        pass
 
                 # If one leg is worthless but the other has value, skip combo
                 # Use a higher threshold (0.15) for worthless determination than min_limit
@@ -1873,10 +1905,12 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
         # If combo was skipped, close individual valuable legs
         if skip_combo and use_fallback:
-            # Find position quantities for each leg
+            # Find position quantities and contracts for each leg
             try:
                 long_qty = 0
                 short_qty = 0
+                long_contract = None
+                short_contract = None
 
                 for p in ib.positions():
                     c = getattr(p, "contract", None)
@@ -1894,20 +1928,30 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                     if abs(strike - float(longK)) < 0.01:
                         long_qty = pos
+                        long_contract = c  # Already qualified from positions
                     elif abs(strike - float(shortK)) < 0.01:
                         short_qty = pos
+                        short_contract = c  # Already qualified from positions
 
                 # Close valuable legs individually
                 legs_closed = 0
 
                 if not long_worthless and abs(long_qty) > 0:
-                    # Close long leg
+                    # Close long leg - use contract from positions if available
                     leg_action = "SELL" if long_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
                     leg_order.tif = "DAY"
 
-                    long_opt_to_close = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
-                    long_opt_to_close = ib.qualifyContracts(long_opt_to_close)[0]
+                    if long_contract is not None:
+                        long_opt_to_close = long_contract
+                    elif long_contract_from_pos is not None:
+                        long_opt_to_close = long_contract_from_pos
+                    else:
+                        long_opt_to_close = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
+                        qualified = ib.qualifyContracts(long_opt_to_close)
+                        if not qualified:
+                            raise ValueError(f"Could not qualify long leg contract for {symbol} {longK}")
+                        long_opt_to_close = qualified[0]
 
                     trade = ib.placeOrder(long_opt_to_close, leg_order)
                     legs_closed += 1
@@ -1934,13 +1978,21 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     )
 
                 if not short_worthless and abs(short_qty) > 0:
-                    # Close short leg
+                    # Close short leg - use contract from positions if available
                     leg_action = "SELL" if short_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
                     leg_order.tif = "DAY"
 
-                    short_opt_to_close = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
-                    short_opt_to_close = ib.qualifyContracts(short_opt_to_close)[0]
+                    if short_contract is not None:
+                        short_opt_to_close = short_contract
+                    elif short_contract_from_pos is not None:
+                        short_opt_to_close = short_contract_from_pos
+                    else:
+                        short_opt_to_close = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
+                        qualified = ib.qualifyContracts(short_opt_to_close)
+                        if not qualified:
+                            raise ValueError(f"Could not qualify short leg contract for {symbol} {shortK}")
+                        short_opt_to_close = qualified[0]
 
                     trade = ib.placeOrder(short_opt_to_close, leg_order)
                     legs_closed += 1
