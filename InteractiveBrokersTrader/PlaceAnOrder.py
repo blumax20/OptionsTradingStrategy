@@ -1806,8 +1806,11 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             short_value = float(mkt_price)
                             short_contract_from_pos = c
 
+                # If portfolio gave us both values, skip market data request
+                if long_value is not None and short_value is not None:
+                    logger.info(f"[{symbol}] Got leg values from portfolio: long=${long_value:.2f}, short=${short_value:.2f}")
                 # If portfolio didn't give us values, try market data request
-                if long_value is None or short_value is None:
+                elif long_value is None or short_value is None:
                     long_opt = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
                     short_opt = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
 
@@ -1820,7 +1823,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                     t_long = ib.reqMktData(long_opt, '', False, False)
                     t_short = ib.reqMktData(short_opt, '', False, False)
-                    ib.sleep(2.5)
+                    ib.sleep(5.0)  # Increased from 2.5s to allow market data to populate
 
                     if long_value is None:
                         long_value = _ticker_mid(t_long)
@@ -1834,13 +1837,35 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     except Exception:
                         pass
 
+                    # Fallback: if market data still None, try portfolio marketPrice as last resort
+                    if long_value is None and long_contract_from_pos is not None:
+                        for item in portfolio:
+                            if getattr(item.contract, 'conId', None) == getattr(long_contract_from_pos, 'conId', None):
+                                fallback = getattr(item, 'marketPrice', None)
+                                if fallback and fallback > 0:
+                                    long_value = float(fallback)
+                                    logger.info(f"[{symbol}] Using portfolio marketPrice fallback for long leg: ${long_value:.2f}")
+                                    break
+                    if short_value is None and short_contract_from_pos is not None:
+                        for item in portfolio:
+                            if getattr(item.contract, 'conId', None) == getattr(short_contract_from_pos, 'conId', None):
+                                fallback = getattr(item, 'marketPrice', None)
+                                if fallback and fallback > 0:
+                                    short_value = float(fallback)
+                                    logger.info(f"[{symbol}] Using portfolio marketPrice fallback for short leg: ${short_value:.2f}")
+                                    break
+
                 # If one leg is worthless but the other has value, skip combo
                 # Use a higher threshold (0.15) for worthless determination than min_limit
                 worthless_threshold = max(0.15, args.min_limit)
                 long_worthless = (long_value is None or long_value < worthless_threshold)
                 short_worthless = (short_value is None or short_value < worthless_threshold)
 
-                if (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
+                # Handle the case where both values are None - can't determine worthless status
+                if long_value is None and short_value is None:
+                    logger.warning(f"[{symbol}] Could not get market prices for either leg; will attempt combo close")
+                    skip_combo = False
+                elif (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
                     skip_combo = True
                     logger.info(
                         f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
@@ -1936,7 +1961,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 # Close valuable legs individually
                 legs_closed = 0
 
-                if not long_worthless and abs(long_qty) > 0:
+                if not long_worthless and abs(long_qty) > 0 and long_value is not None:
                     # Close long leg - use contract from positions if available
                     leg_action = "SELL" if long_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
@@ -1977,7 +2002,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_value=float(long_value),
                     )
 
-                if not short_worthless and abs(short_qty) > 0:
+                if not short_worthless and abs(short_qty) > 0 and short_value is not None:
                     # Close short leg - use contract from positions if available
                     leg_action = "SELL" if short_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
