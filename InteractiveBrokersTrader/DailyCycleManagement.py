@@ -1233,6 +1233,52 @@ class DailyCycleManagementMixin:
         folder = ny_now.strftime("%y_%m_%d")
         self._run_liquidity_filter_for_folder(folder, only_rth=only_rth, timeout=timeout)
 
+    def _populate_missing_strikes_for_folder(self, folder_yy_mm_dd: str, timeout: int = 120) -> int:
+        """
+        Launch LiquidityFilter.py --populate-strikes for a specific folder.
+        Returns the number of rows updated (0 if none or on error).
+        """
+        python = self._python_executable()
+        script = str(LIQUIDITY_FILTER_PATH)
+        argv = [python, script, "--day-dir", fr"C:\OptionsHistory\{folder_yy_mm_dd}", "--populate-strikes"]
+        LOG.info("Populating missing strikes for %s", folder_yy_mm_dd)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            if proc.stdout:
+                LOG.info("[populate-strikes stdout]\n%s", proc.stdout.strip())
+            if proc.stderr:
+                LOG.warning("[populate-strikes stderr]\n%s", proc.stderr.strip())
+            if proc.returncode != 0:
+                LOG.error("populate-strikes exited with code %s for %s", proc.returncode, folder_yy_mm_dd)
+                return 0
+            # Parse output to get count
+            import re
+            match = re.search(r'updated (\d+) rows', proc.stdout or "")
+            return int(match.group(1)) if match else 0
+        except subprocess.TimeoutExpired:
+            LOG.error("populate-strikes timed out after %ss for %s", timeout, folder_yy_mm_dd)
+        except FileNotFoundError:
+            LOG.error("LiquidityFilter.py not found at %s", script)
+        except Exception as e:
+            LOG.exception("Failed to populate strikes for %s: %s", folder_yy_mm_dd, e)
+        return 0
+
+    def _populate_missing_strikes_today_and_prev(self) -> int:
+        """
+        Populate missing strikes in today's and previous trading day's CSVs.
+        Returns total rows updated.
+        """
+        try:
+            today_folder = self._now_ny().strftime("%y_%m_%d")
+        except Exception:
+            from datetime import datetime
+            today_folder = datetime.now(NY).strftime("%y_%m_%d")
+        prev_folder = self._prev_trading_day_folder()
+        total = self._populate_missing_strikes_for_folder(today_folder)
+        if prev_folder != today_folder:
+            total += self._populate_missing_strikes_for_folder(prev_folder)
+        return total
+
     def _has_working_close_order(self, sym: str) -> bool:
         """
         Return True if there is an existing working CLOSE order (SELL combo) for the given symbol.
@@ -1681,6 +1727,14 @@ class DailyCycleManagementMixin:
         Diagnostic helper to try (re)placing today's OPEN orders directly from the CSV using PlaceAnOrder,
         with a controllable live-limit method ('join' or 'mid'). After the run, summarize latest attempts.
         """
+        # First, populate any missing strikes in today's and previous day's CSVs
+        try:
+            updated = self._populate_missing_strikes_today_and_prev()
+            if updated:
+                LOG.info("Pre-open: populated %d rows with missing strikes", updated)
+        except Exception as e:
+            LOG.warning("Pre-open: failed to populate missing strikes: %s", e)
+
         argv = [
             "--mode", "from-signal",
             "--min-limit", f"{min_limit:.2f}",

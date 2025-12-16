@@ -14,10 +14,11 @@ try:
 except Exception:
     ZoneInfo = None
 try:
-    from ib_insync import IB, Option, util as _ibutil
+    from ib_insync import IB, Option, Stock, util as _ibutil
 except Exception:
     IB = None
     Option = Option if 'Option' in globals() else object
+    Stock = None
     _ibutil = None
 
 def _combo_key(symbol: str, right: str, exp: str, k_atm: float, k_oth: float) -> Tuple[str, str, str, float, float]:
@@ -162,6 +163,237 @@ def _default_fetcher(symbol: str, right: str, exp: str, strike: float):
     open interest and IV on the specific option contract.
     """
     return None, None
+
+
+def _get_strike_increment(price: float) -> float:
+    """
+    Determine standard strike increment based on stock price.
+    """
+    if price < 5:
+        return 0.5
+    elif price < 25:
+        return 1.0
+    elif price < 200:
+        return 2.5
+    else:
+        return 5.0
+
+
+def _round_to_strike(price: float, increment: float) -> float:
+    """Round price to nearest valid strike."""
+    return round(price / increment) * increment
+
+
+def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type: str, logger=None) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Given a symbol and expiration, fetch the current price and compute ATM + OTM strikes.
+
+    Returns (atm_strike, otm_strike_call, otm_strike_put) or (None, None, None) on failure.
+
+    For CALL spreads: ATM < OTM (buy lower, sell higher)
+    For PUT spreads: ATM > OTM (buy higher, sell lower)
+    """
+    if ib is None or Stock is None:
+        return (None, None, None)
+
+    try:
+        # Get current stock price
+        stock = Stock(symbol, "SMART", "USD")
+        qualified = ib.qualifyContracts(stock)
+        if not qualified:
+            if logger:
+                logger(f"[{symbol}] Could not qualify stock contract")
+            return (None, None, None)
+
+        stock = qualified[0]
+
+        # Request market data snapshot - try delayed/frozen first
+        try:
+            ib.reqMarketDataType(4)  # 4 = delayed-frozen
+        except Exception:
+            pass
+
+        ticker = ib.reqMktData(stock, "", False, False)
+        ib.sleep(2.0)
+
+        # Get price - prefer last, then close, then bid/ask midpoint
+        price = None
+        # Check for valid numeric values (not NaN)
+        def _valid(v):
+            return v is not None and isinstance(v, (int, float)) and v == v and v > 0
+
+        if _valid(ticker.last):
+            price = ticker.last
+        elif _valid(ticker.close):
+            price = ticker.close
+        elif _valid(ticker.bid) and _valid(ticker.ask):
+            price = (ticker.bid + ticker.ask) / 2
+
+        try:
+            ib.cancelMktData(stock)
+        except Exception:
+            pass
+
+        # If still no price, try to get from reqHistoricalData (last 1 bar)
+        if price is None:
+            try:
+                bars = ib.reqHistoricalData(
+                    stock,
+                    endDateTime='',
+                    durationStr='1 D',
+                    barSizeSetting='1 day',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=10
+                )
+                if bars and len(bars) > 0:
+                    price = bars[-1].close
+                    if logger:
+                        logger(f"[{symbol}] Using historical close: ${price:.2f}")
+            except Exception as e:
+                if logger:
+                    logger(f"[{symbol}] Historical data request failed: {e}")
+
+        if price is None or price <= 0:
+            if logger:
+                logger(f"[{symbol}] Could not get valid price (last={getattr(ticker, 'last', None)}, close={getattr(ticker, 'close', None)})")
+            return (None, None, None)
+
+        # Determine strike increment and ATM
+        increment = _get_strike_increment(price)
+        atm = _round_to_strike(price, increment)
+
+        # Standard spread width: 1 strike for most, but use increment-based logic
+        # For calls: OTM is higher than ATM
+        # For puts: OTM is lower than ATM
+        otm_call = atm + increment
+        otm_put = atm - increment
+
+        if logger:
+            logger(f"[{symbol}] price=${price:.2f} -> ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}")
+
+        return (atm, otm_call, otm_put)
+
+    except Exception as e:
+        if logger:
+            logger(f"[{symbol}] Error getting strikes: {e}")
+        return (None, None, None)
+
+
+def populate_missing_strikes(day_dir: str,
+                             ib_host: str = "127.0.0.1",
+                             ib_port: int = 7497,
+                             client_id: int = 916,
+                             logger=None) -> int:
+    """
+    Scan combined_listener_spreads.csv for rows with missing strike data and populate them.
+
+    Returns the number of rows updated.
+    """
+    csv_path, cols, rows = _read_combined_csv(day_dir)
+    if not rows:
+        if logger:
+            logger(f"populate_missing_strikes: no rows in {csv_path}")
+        return 0
+
+    # Find column names
+    lc = {c.lower(): c for c in cols}
+    sym_col = lc.get("symbol")
+    exp_col = lc.get("expiration") or lc.get("exp") or lc.get("expiry")
+    atm_col = lc.get("atm_strike")
+    otm_call_col = lc.get("otm_strike_call")
+    otm_put_col = lc.get("otm_strike_put")
+    stype_col = lc.get("signal_type")
+
+    if not sym_col or not exp_col:
+        if logger:
+            logger("populate_missing_strikes: missing symbol or expiration columns")
+        return 0
+
+    # Ensure strike columns exist
+    if atm_col is None:
+        atm_col = "atm_strike"
+        if atm_col not in cols:
+            cols.append(atm_col)
+    if otm_call_col is None:
+        otm_call_col = "otm_strike_call"
+        if otm_call_col not in cols:
+            cols.append(otm_call_col)
+    if otm_put_col is None:
+        otm_put_col = "otm_strike_put"
+        if otm_put_col not in cols:
+            cols.append(otm_put_col)
+
+    # Find rows with missing strikes
+    rows_needing_strikes = []
+    for i, row in enumerate(rows):
+        atm_val = row.get(atm_col, "")
+        otm_call_val = row.get(otm_call_col, "")
+        otm_put_val = row.get(otm_put_col, "")
+
+        # Check if any strike is missing
+        atm_missing = not atm_val or atm_val.strip() == "" or _parse_float(atm_val) is None
+
+        if atm_missing:
+            symbol = str(row.get(sym_col, "")).strip().upper()
+            exp = str(row.get(exp_col, "")).strip()
+            stype = str(row.get(stype_col, "")).strip().upper() if stype_col else ""
+            if symbol and exp:
+                rows_needing_strikes.append((i, symbol, exp, stype))
+
+    if not rows_needing_strikes:
+        if logger:
+            logger("populate_missing_strikes: no rows with missing strikes")
+        return 0
+
+    if logger:
+        logger(f"populate_missing_strikes: {len(rows_needing_strikes)} rows need strikes")
+
+    # Connect to IB and fetch strikes
+    if IB is None:
+        if logger:
+            logger("populate_missing_strikes: ib_insync not available")
+        return 0
+
+    ib = IB()
+    updates = 0
+    try:
+        ib.connect(ib_host, ib_port, clientId=client_id, timeout=10)
+
+        # Group by symbol to avoid redundant lookups
+        symbol_strikes = {}  # symbol -> (atm, otm_call, otm_put)
+
+        for idx, symbol, exp, stype in rows_needing_strikes:
+            if symbol not in symbol_strikes:
+                atm, otm_call, otm_put = _get_atm_and_otm_strikes(ib, symbol, exp, stype, logger=logger)
+                symbol_strikes[symbol] = (atm, otm_call, otm_put)
+
+            atm, otm_call, otm_put = symbol_strikes[symbol]
+
+            if atm is not None:
+                rows[idx][atm_col] = atm
+                rows[idx][otm_call_col] = otm_call
+                rows[idx][otm_put_col] = otm_put
+                updates += 1
+                if logger:
+                    logger(f"[{symbol}] Populated strikes: ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}")
+
+    except Exception as e:
+        if logger:
+            logger(f"populate_missing_strikes: IB connection error: {e}")
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+
+    if updates > 0:
+        _write_combined_csv(csv_path, cols, rows)
+        if logger:
+            logger(f"populate_missing_strikes: updated {updates} rows in {csv_path}")
+
+    return updates
 
 def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 0.6):
     """
@@ -387,18 +619,24 @@ def should_cancel_for_low_oi(day_dir: str,
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Enrich combined_listener_spreads.csv with OI/IV columns.")
+    ap = argparse.ArgumentParser(description="Enrich combined_listener_spreads.csv with OI/IV columns or populate missing strikes.")
     ap.add_argument("--day-dir", required=True, help="Folder like C:\\OptionsHistory\\YY_MM_DD")
     ap.add_argument("--only-rth", action="store_true", help="Only enrich when current time is RTH (09:30–16:00 NY).")
+    ap.add_argument("--populate-strikes", action="store_true", help="Populate missing ATM/OTM strikes by fetching current prices from IB.")
     ap.add_argument("--ib-host", default="127.0.0.1")
     ap.add_argument("--ib-port", type=int, default=7497)
     ap.add_argument("--client-id", type=int, default=915)
     args = ap.parse_args()
 
-    def _log(msg: str): 
+    def _log(msg: str):
         print(msg, flush=True)
 
-    if args.only_rth:
+    if args.populate_strikes:
+        # Populate missing strikes first
+        updated = populate_missing_strikes(args.day_dir, ib_host=args.ib_host, ib_port=args.ib_port,
+                                           client_id=args.client_id + 1, logger=_log)
+        print(f"Strike population: updated {updated} rows in: {args.day_dir}")
+    elif args.only_rth:
         changed = enrich_if_rth(args.day_dir, ib_host=args.ib_host, ib_port=args.ib_port, client_id=args.client_id, logger=_log)
         print(f"Enrichment {'made changes' if changed else 'no changes needed'} in: {args.day_dir} (mode=only_rth)")
     else:

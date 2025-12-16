@@ -2140,6 +2140,18 @@ def run_from_csv():
             position_syms = {getattr(p.contract, 'symbol', '').upper()
                  for p in ps
                  if getattr(p.contract, 'secType', '') == 'OPT' and abs(float(p.position or 0.0)) > 0}
+            # Track which side(s) each symbol has positions in: {symbol: {'C', 'P'}}
+            position_sides: dict[str, set[str]] = {}
+            for p in ps:
+                c = getattr(p, 'contract', None)
+                if not c or getattr(c, 'secType', '') != 'OPT':
+                    continue
+                if abs(float(getattr(p, 'position', 0) or 0.0)) == 0:
+                    continue
+                sym = getattr(c, 'symbol', '').upper()
+                right = getattr(c, 'right', '').upper()
+                if sym and right in ('C', 'P'):
+                    position_sides.setdefault(sym, set()).add(right)
             logger.info(f"Positions loaded: {len(ps)} entries")
         except Exception:
             pass
@@ -2258,18 +2270,8 @@ def run_from_csv():
                 continue
             missing_exp_or_atm = (not expiration) or pd.isna(atm)
 
-            # If this symbol already has ANY option position in the account, optionally skip all OPEN attempts.
-            # This protects against stacking new debit spreads on top of existing exposure (long or short).
-            if symbol and symbol.upper() in position_syms and args.mode in ("from-signal", "call", "put", "all"):
-                # Record a generic open skip; we don't yet know CALL/PUT side here.
-                record_attempt(
-                    symbol, "open", "skipped", "skip_open_any_position",
-                    exp=expiration,
-                    atm=float(atm) if not pd.isna(atm) else None,
-                    oth=None
-                )
-                # Do NOT set allow_call/allow_put; just skip this row entirely.
-                continue
+            # NOTE: Position-skip check moved below after signal type is determined,
+            # so that opposite-side positions can trigger unwind instead of immediate skip.
 
             # Helper to enforce min limit
             def enforce_min_limit(x: float | None) -> float | None:
@@ -2322,32 +2324,48 @@ def run_from_csv():
 
             if args.mode == "from-signal":
                 if stype == "CALL_OPEN":
+                    # Check if we already have a CALL position (same-side) -> skip
+                    sym_sides = position_sides.get(symbol.upper(), set())
+                    if 'C' in sym_sides:
+                        record_attempt(symbol, "open", "skipped", "skip_open_same_side_position",
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='C')
+                        logger.info(f"[{symbol}] Skipping CALL_OPEN: already have CALL position")
+                        continue
                     # Latest-signal-wins: cancel any working CLOSE orders before we open
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
-                    # NEW: proactively unwind existing PUT spreads (opposite side)
-                    try:
-                        n_unw = close_any_spread_for_symbol(ib, symbol, side="put", max_qty=args.quantity)
-                        if n_unw > 0:
-                            logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN")
-                            record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open", exp=None, right="P", qty=n_unw)
-                    except Exception as _e:
-                        logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
+                    # Proactively unwind existing PUT spreads (opposite side)
+                    if 'P' in sym_sides:
+                        try:
+                            n_unw = close_any_spread_for_symbol(ib, symbol, side="put", max_qty=args.quantity)
+                            if n_unw > 0:
+                                logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN")
+                                record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open", exp=None, right="P", qty=n_unw)
+                        except Exception as _e:
+                            logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
                     allow_call = True
                 elif stype == "PUT_OPEN":
+                    # Check if we already have a PUT position (same-side) -> skip
+                    sym_sides = position_sides.get(symbol.upper(), set())
+                    if 'P' in sym_sides:
+                        record_attempt(symbol, "open", "skipped", "skip_open_same_side_position",
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='P')
+                        logger.info(f"[{symbol}] Skipping PUT_OPEN: already have PUT position")
+                        continue
                     # Latest-signal-wins: cancel any working CLOSE orders before we open
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
-                    # NEW: proactively unwind existing CALL spreads (opposite side)
-                    try:
-                        n_unw = close_any_spread_for_symbol(ib, symbol, side="call", max_qty=args.quantity)
-                        if n_unw > 0:
-                            logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN")
-                            record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open", exp=None, right="C", qty=n_unw)
-                    except Exception as _e:
-                        logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
+                    # Proactively unwind existing CALL spreads (opposite side)
+                    if 'C' in sym_sides:
+                        try:
+                            n_unw = close_any_spread_for_symbol(ib, symbol, side="call", max_qty=args.quantity)
+                            if n_unw > 0:
+                                logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN")
+                                record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open", exp=None, right="C", qty=n_unw)
+                        except Exception as _e:
+                            logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
                     allow_put = True
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
