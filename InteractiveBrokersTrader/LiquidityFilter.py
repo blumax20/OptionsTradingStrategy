@@ -184,17 +184,17 @@ def _round_to_strike(price: float, increment: float) -> float:
     return round(price / increment) * increment
 
 
-def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type: str, logger=None) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type: str, logger=None) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Given a symbol and expiration, fetch the current price and compute ATM + OTM strikes.
 
-    Returns (atm_strike, otm_strike_call, otm_strike_put) or (None, None, None) on failure.
+    Returns (atm_strike, otm_strike_call, otm_strike_put, current_price) or (None, None, None, None) on failure.
 
     For CALL spreads: ATM < OTM (buy lower, sell higher)
     For PUT spreads: ATM > OTM (buy higher, sell lower)
     """
     if ib is None or Stock is None:
-        return (None, None, None)
+        return (None, None, None, None)
 
     try:
         # Get current stock price
@@ -203,7 +203,7 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
         if not qualified:
             if logger:
                 logger(f"[{symbol}] Could not qualify stock contract")
-            return (None, None, None)
+            return (None, None, None, None)
 
         stock = qualified[0]
 
@@ -258,7 +258,7 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
         if price is None or price <= 0:
             if logger:
                 logger(f"[{symbol}] Could not get valid price (last={getattr(ticker, 'last', None)}, close={getattr(ticker, 'close', None)})")
-            return (None, None, None)
+            return (None, None, None, None)
 
         # Determine strike increment and ATM
         increment = _get_strike_increment(price)
@@ -273,12 +273,12 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
         if logger:
             logger(f"[{symbol}] price=${price:.2f} -> ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}")
 
-        return (atm, otm_call, otm_put)
+        return (atm, otm_call, otm_put, price)
 
     except Exception as e:
         if logger:
             logger(f"[{symbol}] Error getting strikes: {e}")
-        return (None, None, None)
+        return (None, None, None, None)
 
 
 def populate_missing_strikes(day_dir: str,
@@ -305,13 +305,14 @@ def populate_missing_strikes(day_dir: str,
     otm_call_col = lc.get("otm_strike_call")
     otm_put_col = lc.get("otm_strike_put")
     stype_col = lc.get("signal_type")
+    price_col = lc.get("current_price")
 
     if not sym_col or not exp_col:
         if logger:
             logger("populate_missing_strikes: missing symbol or expiration columns")
         return 0
 
-    # Ensure strike columns exist
+    # Ensure strike and price columns exist
     if atm_col is None:
         atm_col = "atm_strike"
         if atm_col not in cols:
@@ -324,18 +325,22 @@ def populate_missing_strikes(day_dir: str,
         otm_put_col = "otm_strike_put"
         if otm_put_col not in cols:
             cols.append(otm_put_col)
+    if price_col is None:
+        price_col = "current_price"
+        if price_col not in cols:
+            cols.append(price_col)
 
-    # Find rows with missing strikes
+    # Find rows with missing strikes or current_price
     rows_needing_strikes = []
     for i, row in enumerate(rows):
         atm_val = row.get(atm_col, "")
-        otm_call_val = row.get(otm_call_col, "")
-        otm_put_val = row.get(otm_put_col, "")
+        price_val = row.get(price_col, "")
 
-        # Check if any strike is missing
-        atm_missing = not atm_val or atm_val.strip() == "" or _parse_float(atm_val) is None
+        # Check if strike or price is missing
+        atm_missing = not atm_val or str(atm_val).strip() == "" or _parse_float(atm_val) is None
+        price_missing = not price_val or str(price_val).strip() == "" or _parse_float(price_val) is None
 
-        if atm_missing:
+        if atm_missing or price_missing:
             symbol = str(row.get(sym_col, "")).strip().upper()
             exp = str(row.get(exp_col, "")).strip()
             stype = str(row.get(stype_col, "")).strip().upper() if stype_col else ""
@@ -362,22 +367,23 @@ def populate_missing_strikes(day_dir: str,
         ib.connect(ib_host, ib_port, clientId=client_id, timeout=10)
 
         # Group by symbol to avoid redundant lookups
-        symbol_strikes = {}  # symbol -> (atm, otm_call, otm_put)
+        symbol_data = {}  # symbol -> (atm, otm_call, otm_put, current_price)
 
         for idx, symbol, exp, stype in rows_needing_strikes:
-            if symbol not in symbol_strikes:
-                atm, otm_call, otm_put = _get_atm_and_otm_strikes(ib, symbol, exp, stype, logger=logger)
-                symbol_strikes[symbol] = (atm, otm_call, otm_put)
+            if symbol not in symbol_data:
+                atm, otm_call, otm_put, current_price = _get_atm_and_otm_strikes(ib, symbol, exp, stype, logger=logger)
+                symbol_data[symbol] = (atm, otm_call, otm_put, current_price)
 
-            atm, otm_call, otm_put = symbol_strikes[symbol]
+            atm, otm_call, otm_put, current_price = symbol_data[symbol]
 
             if atm is not None:
                 rows[idx][atm_col] = atm
                 rows[idx][otm_call_col] = otm_call
                 rows[idx][otm_put_col] = otm_put
+                rows[idx][price_col] = current_price
                 updates += 1
                 if logger:
-                    logger(f"[{symbol}] Populated strikes: ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}")
+                    logger(f"[{symbol}] Populated: ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}, price={current_price}")
 
     except Exception as e:
         if logger:
