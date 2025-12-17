@@ -2684,20 +2684,24 @@ def run_from_csv():
                                             record_attempt(symbol, "open_call", "placed", "success",
                                                            exp=new_exp, atm=float(atm), oth=float(k_call), limit=live_limit)
                                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
-                # 2) Fallback to debit_limit only when both legs have OI ≥ 100
+                # 2) Fallback to debit_limit only when both legs have OI ≥ threshold (respects --oi-check)
                 if not attempted:
-                    oi_ok = False
-                    try:
-                        oi1 = float(row.get("open_interest_atm_call") or 0.0)
-                        oi2 = float(row.get("open_interest_otm_call") or 0.0)
-                        oi_ok = (oi1 >= 100) and (oi2 >= 100)
-                    except Exception:
+                    # Respect the --oi-check setting: only enforce OI gate during RTH if 'rth', always if 'always', never if 'off'
+                    _need_oi_fallback = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
+                    oi_ok = True  # Default to allowing if OI check is not needed
+                    if _need_oi_fallback:
                         oi_ok = False
-                    if not oi_ok:
-                        record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
-                                       oi_atm=oi1, oi_otm=oi2, threshold=100,
-                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
-                                       oth=float(k_call) if not pd.isna(k_call) else None)
+                        try:
+                            oi1 = float(row.get("open_interest_atm_call") or 0.0)
+                            oi2 = float(row.get("open_interest_otm_call") or 0.0)
+                            oi_ok = (oi1 >= args.oi_threshold) and (oi2 >= args.oi_threshold)
+                        except Exception:
+                            oi_ok = False
+                        if not oi_ok:
+                            record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                                           oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
+                                           exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
+                                           oth=float(k_call) if not pd.isna(k_call) else None, scope=args.oi_check)
                     if oi_ok:
                         wb = _width_bucket(w_call_open)
                         ordered = [f"call_debit_limit_{wb}"] if wb else []
@@ -2839,20 +2843,24 @@ def run_from_csv():
                                                 exp=used_exp, atm=float(atm), oth=float(k_put), limit=live_limit
                                             )
                                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
-                # 2) Fallback to debit_limit only when both legs have OI ≥ 100
+                # 2) Fallback to debit_limit only when both legs have OI ≥ threshold (respects --oi-check)
                 if not attempted:
-                    oi_ok = False
-                    try:
-                        oi1 = float(row.get("open_interest_atm_put") or 0.0)
-                        oi2 = float(row.get("open_interest_otm_put") or 0.0)
-                        oi_ok = (oi1 >= 100) and (oi2 >= 100)
-                    except Exception:
+                    # Respect the --oi-check setting: only enforce OI gate during RTH if 'rth', always if 'always', never if 'off'
+                    _need_oi_fallback = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
+                    oi_ok = True  # Default to allowing if OI check is not needed
+                    if _need_oi_fallback:
                         oi_ok = False
-                    if not oi_ok:
-                        record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
-                                       oi_atm=oi1, oi_otm=oi2, threshold=100,
-                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
-                                       oth=float(k_put) if not pd.isna(k_put) else None)
+                        try:
+                            oi1 = float(row.get("open_interest_atm_put") or 0.0)
+                            oi2 = float(row.get("open_interest_otm_put") or 0.0)
+                            oi_ok = (oi1 >= args.oi_threshold) and (oi2 >= args.oi_threshold)
+                        except Exception:
+                            oi_ok = False
+                        if not oi_ok:
+                            record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                                           oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
+                                           exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
+                                           oth=float(k_put) if not pd.isna(k_put) else None, scope=args.oi_check)
                     if oi_ok:
                         wb = _width_bucket(w_put_open)
                         ordered = [f"put_debit_limit_{wb}"] if wb else []

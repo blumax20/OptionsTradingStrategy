@@ -966,7 +966,7 @@ class DailyCycleManagementMixin:
         finally:
             self._in_close_phase = _prev_phase
 
-    def _try_close_from_positions(self, sym: str, prefer: str = "MKT", side: str | None = None) -> bool:
+    def _try_close_from_positions(self, sym: str, prefer: str = "LMT", side: str | None = None) -> bool:
         """
         Best-effort direct close using current IB positions for `sym`.
         - If a long vertical debit is detected (CALL or PUT), submit a combo close as a BAG:
@@ -977,6 +977,8 @@ class DailyCycleManagementMixin:
         - If no clean vertical is found but orphan option legs exist, flatten each leg with a market order.
         - If a stock position is present for `sym`, flatten it (SELL if long, BUY if short).
         Returns True if at least one order was submitted.
+
+        When prefer='LMT', attempts to read theoretical limit from CSV; falls back to MKT if unavailable.
         """
         try:
             from ib_insync import IB, Contract, ComboLeg, ContractDetails, MarketOrder, LimitOrder
@@ -997,6 +999,50 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("direct-close: connect failed (clientId=%s): %s", client_id, e)
             return False
+
+        # Helper to get theoretical close limit from CSV
+        def _get_theo_limit(right: str, width: float) -> float | None:
+            """Look up theoretical limit from today's CSV for the symbol/right/width."""
+            try:
+                csv_path = _ny_csv_path()
+                if not csv_path or not os.path.exists(csv_path):
+                    LOG.debug("direct-close: CSV not found at %s", csv_path)
+                    return None
+                import pandas as pd
+                df = pd.read_csv(csv_path)
+                if "symbol" not in df.columns:
+                    return None
+                df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+                rows = df[df["symbol"] == up]
+                if rows.empty:
+                    return None
+                row = rows.iloc[-1]  # Use latest row for symbol
+                # Determine width bucket
+                if abs(width - 1.0) < 0.5:
+                    bucket = "1"
+                elif abs(width - 2.5) < 0.75:
+                    bucket = "2_5"
+                else:
+                    bucket = "5"
+                # Try limit columns first, then theo
+                prefix = "call_debit" if right.upper() == "C" else "put_debit"
+                for kind in ("limit", "theo"):
+                    col = f"{prefix}_{kind}_{bucket}"
+                    if col in df.columns:
+                        try:
+                            v = row[col]
+                            if pd.notna(v):
+                                v = float(v)
+                                if v > 0:
+                                    LOG.info("direct-close: found theo limit for %s %s width=%s: %s from col %s", up, right, width, v, col)
+                                    return round(v, 2)
+                        except Exception as ex:
+                            LOG.debug("direct-close: failed to parse %s for %s: %s", col, up, ex)
+                LOG.debug("direct-close: no theo limit found for %s %s width=%s bucket=%s", up, right, width, bucket)
+                return None
+            except Exception as e:
+                LOG.debug("direct-close: failed to get theo limit for %s %s: %s", up, right, e)
+                return None
 
         submitted = False
         up = (sym or '').upper()
@@ -1035,9 +1081,20 @@ class DailyCycleManagementMixin:
                         ComboLeg(conId=shortConId, ratio=1, action='SELL', exchange='SMART')
                     ]
                     action = 'SELL' if is_long_vertical else 'BUY'
-                    order = MarketOrder(action, 1) if (prefer or 'MKT').upper() == 'MKT' else LimitOrder(action, 1, 0.01)
+
+                    # Determine order type: try LMT with theo value, fall back to MKT
+                    width = abs(high - low)
+                    theo_limit = _get_theo_limit(right, width) if prefer.upper() == 'LMT' else None
+
+                    if theo_limit is not None:
+                        order = LimitOrder(action, 1, theo_limit)
+                        order_desc = f"LMT @ {theo_limit:.2f}"
+                    else:
+                        order = MarketOrder(action, 1)
+                        order_desc = "MKT"
+
                     tr = ib.placeOrder(bag, order)
-                    LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, (prefer or 'MKT').upper())
+                    LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, order_desc)
                     return True
                 except Exception as e:
                     LOG.warning("direct-close: combo place failed for %s %s %s/%s: %s", up, right, low, high, e)
@@ -2112,12 +2169,12 @@ class DailyCycleManagementMixin:
                     LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
                             sym, (side_to_close or "both"), reason)
                     try_side = side_to_close  # "call", "put", or None
-                    ok = self._try_close_from_positions(sym, prefer="MKT", side=try_side)
+                    ok = self._try_close_from_positions(sym, prefer="LMT", side=try_side)
 
                     if not ok and try_side is not None:
                         # Fallback: if we couldn't close the requested side, try closing any verticals in this symbol.
                         LOG.info("Reconcile: fallback CLOSE for %s (any side) after side=%s failure.", sym, try_side)
-                        ok = self._try_close_from_positions(sym, prefer="MKT", side=None)
+                        ok = self._try_close_from_positions(sym, prefer="LMT", side=None)
 
                     if ok:
                         self._submitted_close_syms.add(sym)
