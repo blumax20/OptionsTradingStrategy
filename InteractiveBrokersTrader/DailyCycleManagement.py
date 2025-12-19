@@ -2234,7 +2234,7 @@ class DailyCycleManagementMixin:
 
         LOG.info("Reconcile lookback (held-first): evaluated %d held symbol(s); submitted %d CLOSE order(s).", looked, submitted)
 
-    def _rth_risk_exits(self, days_old: int = 7, loss_frac: float = 0.5, gain_frac: float = 0.5) -> None:
+    def _rth_risk_exits(self, days_old: int = 2, loss_frac: float = 0.5, gain_frac: float = 0.5) -> None:
         """
         During Regular Trading Hours, scan currently-held vertical debit spreads that are older than `days_old`
         and close them with a limit order if either:
@@ -2261,8 +2261,12 @@ class DailyCycleManagementMixin:
             return
 
         def _mid(t: Ticker) -> float | None:
-            if t.bid is not None and t.ask is not None and t.ask > 0 and t.bid >= 0:
-                return (t.bid + t.ask) / 2
+            # Handle worthless options: if both bid and ask are 0, treat as 0 value
+            if t.bid is not None and t.ask is not None:
+                if t.bid == 0 and t.ask == 0:
+                    return 0.0  # Worthless option
+                if t.ask > 0 and t.bid >= 0:
+                    return (t.bid + t.ask) / 2
             return t.last if t.last is not None else None
 
         # Build current positions per symbol, split by rights and strikes to detect vertical debits
@@ -2391,6 +2395,7 @@ class DailyCycleManagementMixin:
                     if ml is not None and ms is not None:
                         curr = max(0.0, ml - ms)
                     if curr is None:
+                        LOG.debug("Risk exits: skipping %s %s - no valid market data (ml=%s, ms=%s)", sym, right, ml, ms)
                         return
                 except Exception as e:
                     LOG.warning("Risk exits: MD error for %s %s strikes(%s,%s): %s", sym, right, strike_low, strike_high, e)
@@ -2889,7 +2894,7 @@ class DailyCycleManagementMixin:
                 LOG.warning("RTH liquidity cleanup skipped due to error: %s", e)
             # New: take-profit / stop-loss exits for older positions (RTH only)
             try:
-                self._rth_risk_exits(days_old=7, loss_frac=0.5, gain_frac=0.5)
+                self._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
             except Exception as e:
                 LOG.warning("Risk exits skipped due to error: %s", e)
             try:
