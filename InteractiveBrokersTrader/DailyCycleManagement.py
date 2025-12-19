@@ -3047,6 +3047,13 @@ if __name__ == "__main__":
             host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=1)
 
         if args.preclose:
+            # Time guard: only allow preclose during 14:55-15:10 ET
+            now_ny = host._now_ny()
+            hh, mm = now_ny.hour, now_ny.minute
+            in_preclose_window = (hh == 14 and mm >= 55) or (hh == 15 and mm <= 10)
+            if not in_preclose_window:
+                LOG.error(f"--preclose blocked: current time {now_ny.strftime('%H:%M')} ET is outside 14:55-15:10 window")
+                sys.exit(1)
             host._pre_close_market_conversion()
 
         if args.after_hours:
