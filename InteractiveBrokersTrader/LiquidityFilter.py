@@ -78,14 +78,22 @@ def read_oi_from_csv(day_dir: str,
         cols = {name.lower(): name for name in reader.fieldnames or []}
         # Expected columns (best-effort)
         sym_col = cols.get("symbol")
-        right_col = cols.get("right")
+        right_col = cols.get("right") or cols.get("signal_type")
         exp_col = cols.get("exp") or cols.get("expiry") or cols.get("expiration")
-        atm_col = cols.get("atm") or cols.get("k_atm") or cols.get("strike_long") or cols.get("strike1")
+        atm_col = cols.get("atm") or cols.get("k_atm") or cols.get("strike_long") or cols.get("strike1") or cols.get("atm_strike")
+        # For OTM, try generic first, then call/put specific based on right parameter
         oth_col = cols.get("oth") or cols.get("k_oth") or cols.get("strike_short") or cols.get("strike2")
+        if not oth_col:
+            oth_col = cols.get("otm_strike_call") if right.upper() == "C" else cols.get("otm_strike_put")
+        # OI columns: try generic first, then call/put specific based on right parameter
         oi_atm_col = cols.get("oi_atm") or cols.get("open_interest_atm") or cols.get("oi1")
         oi_oth_col = cols.get("oi_oth") or cols.get("open_interest_oth") or cols.get("oi2")
+        if not oi_atm_col:
+            oi_atm_col = cols.get("open_interest_atm_call") if right.upper() == "C" else cols.get("open_interest_atm_put")
+        if not oi_oth_col:
+            oi_oth_col = cols.get("open_interest_otm_call") if right.upper() == "C" else cols.get("open_interest_otm_put")
 
-        if not all([sym_col, right_col, exp_col, atm_col, oth_col]):
+        if not all([sym_col, right_col, exp_col, atm_col]):
             return (None, None)
 
         # iterate and keep the last matching row (latest write wins)
@@ -93,12 +101,20 @@ def read_oi_from_csv(day_dir: str,
         oi_oth = None
         for row in reader:
             try:
+                # Convert signal_type to right if needed
+                row_right = str(row[right_col]).strip().upper()
+                if row_right in ("CALL_OPEN", "CALL_CLOSE"):
+                    row_right = "C"
+                elif row_right in ("PUT_OPEN", "PUT_CLOSE"):
+                    row_right = "P"
+                # Handle missing oth_col - use 0.0 as placeholder if not available
+                row_oth = float(row[oth_col]) if oth_col and row.get(oth_col) else 0.0
                 key = _combo_key(
                     str(row[sym_col]).strip(),
-                    str(row[right_col]).strip(),
+                    row_right,
                     str(row[exp_col]).strip(),
                     float(row[atm_col]),
-                    float(row[oth_col]),
+                    row_oth,
                 )
             except Exception:
                 continue
@@ -461,12 +477,15 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
     # Normalize column keys present in source
     lc = {c.lower(): c for c in cols}
     sym = lc.get("symbol")
-    rgt = lc.get("right")
+    rgt = lc.get("right") or lc.get("signal_type")
     exp = lc.get("exp") or lc.get("expiry") or lc.get("expiration")
-    atm = lc.get("atm") or lc.get("k_atm") or lc.get("strike_long") or lc.get("strike1")
+    atm = lc.get("atm") or lc.get("k_atm") or lc.get("strike_long") or lc.get("strike1") or lc.get("atm_strike")
+    # For OTM strikes, we have separate call/put columns in new CSV format
     oth = lc.get("oth") or lc.get("k_oth") or lc.get("strike_short") or lc.get("strike2")
+    oth_call = lc.get("otm_strike_call")
+    oth_put = lc.get("otm_strike_put")
 
-    if not all([sym, rgt, exp, atm, oth]):
+    if not all([sym, rgt, exp, atm]) or (not oth and not oth_call and not oth_put):
         if logger: logger("enrich_csv: missing key columns in combined_listener_spreads.csv")
         return False
 
@@ -488,10 +507,26 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
     for row in rows:
         try:
             symbol = str(row[sym]).strip()
-            right  = str(row[rgt]).strip().upper()
+            # Convert signal_type to right if needed
+            right = str(row[rgt]).strip().upper()
+            if right in ("CALL_OPEN", "CALL_CLOSE"):
+                right = "C"
+            elif right in ("PUT_OPEN", "PUT_CLOSE"):
+                right = "P"
+            elif right == "CLOSE":
+                # For generic CLOSE signals, skip - we don't know call vs put
+                continue
             expiry = str(row[exp]).strip()
             k1 = float(row[atm])
-            k2 = float(row[oth])
+            # Get OTM strike from appropriate column based on right
+            if oth:
+                k2 = float(row[oth])
+            elif right == "C" and oth_call:
+                k2 = float(row[oth_call]) if row.get(oth_call) else None
+            elif right == "P" and oth_put:
+                k2 = float(row[oth_put]) if row.get(oth_put) else None
+            else:
+                k2 = None
         except Exception:
             continue
 
@@ -505,8 +540,8 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
                 row["iv_atm"] = float(iv1)
                 updates += 1
 
-        # OTH leg fill
-        if _need(row.get("oi_oth")) or _need(row.get("iv_oth")):
+        # OTH leg fill (only if we have a valid OTM strike)
+        if k2 is not None and (_need(row.get("oi_oth")) or _need(row.get("iv_oth"))):
             oi2, iv2 = fetch(symbol, right, expiry, k2)
             if oi2 is not None:
                 row["oi_oth"] = int(oi2)
