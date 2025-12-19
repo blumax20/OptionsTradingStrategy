@@ -2250,13 +2250,39 @@ def run_from_csv():
             k_put = row.get("otm_strike_put")
 
 
-            # If put OTM is missing but call OTM exists, infer symmetric width as a fallback
+            # --- OTM strike inference when missing ---
+            # 1) If put OTM is missing but call OTM exists, infer symmetric width
             if (pd.isna(k_put) or k_put is None) and not pd.isna(k_call) and not pd.isna(atm):
                 try:
                     width = abs(float(k_call) - float(atm))
                     if width > 0:
                         k_put = float(atm) - width
                         vprint(args.verbose, f"[{symbol}] Inferred put OTM strike = {k_put} from call width {width}")
+                except Exception:
+                    pass
+            # 2) If call OTM is missing but put OTM exists, infer symmetric width
+            if (pd.isna(k_call) or k_call is None) and not pd.isna(k_put) and not pd.isna(atm):
+                try:
+                    width = abs(float(atm) - float(k_put))
+                    if width > 0:
+                        k_call = float(atm) + width
+                        vprint(args.verbose, f"[{symbol}] Inferred call OTM strike = {k_call} from put width {width}")
+                except Exception:
+                    pass
+            # 3) If BOTH OTM strikes are missing, infer from ATM using default width based on price
+            if (pd.isna(k_call) or k_call is None) and (pd.isna(k_put) or k_put is None) and not pd.isna(atm):
+                try:
+                    _atm_f = float(atm)
+                    # Default width: $1 for stocks ≤$50, $2.50 for $50-$200, $5 for >$200
+                    if _atm_f <= 50:
+                        default_width = 1.0
+                    elif _atm_f <= 200:
+                        default_width = 2.5
+                    else:
+                        default_width = 5.0
+                    k_call = _atm_f + default_width
+                    k_put = _atm_f - default_width
+                    vprint(args.verbose, f"[{symbol}] Inferred OTM strikes from default width {default_width}: call={k_call}, put={k_put}")
                 except Exception:
                     pass
             # --- Normalize strike ordering to ensure correct debit spread shape ---
@@ -2363,6 +2389,12 @@ def run_from_csv():
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
                     allow_call = True
+                    # Guard: if OTM strike is still missing after inference, skip with logged reason
+                    if pd.isna(k_call) or k_call is None:
+                        record_attempt(symbol, "open_call", "skipped", "missing_otm_strike",
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='C')
+                        logger.warning(f"[{symbol}] Skipping CALL_OPEN: missing OTM call strike (could not infer)")
+                        continue
                 elif stype == "PUT_OPEN":
                     # Check if we already have a PUT position (same-side) -> skip
                     sym_sides = position_sides.get(symbol.upper(), set())
@@ -2385,6 +2417,12 @@ def run_from_csv():
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
                     allow_put = True
+                    # Guard: if OTM strike is still missing after inference, skip with logged reason
+                    if pd.isna(k_put) or k_put is None:
+                        record_attempt(symbol, "open_put", "skipped", "missing_otm_strike",
+                                       exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='P')
+                        logger.warning(f"[{symbol}] Skipping PUT_OPEN: missing OTM put strike (could not infer)")
+                        continue
                 elif stype in ("CLOSE","CALL_CLOSE","PUT_CLOSE"):
                     # Cancel any pending OPENs for this ticker before closing
                     cxl = cancel_open_orders_for_symbol(ib, symbol)
