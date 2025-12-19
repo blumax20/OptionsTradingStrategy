@@ -843,27 +843,45 @@ def place_debit_spread(
     """
     # --- HARD CLOSE GUARD ---
     if has_working_auto_close(symbol):
-        logger.info("[%s] close-guard: existing working AUTO_CLOSE; skipping.", symbol)
-        try:
-            rec_action = (
-                "force_close" if role == "force_close"
-                else "close_call" if right.upper() == "C"
-                else "close_put" if right.upper() == "P"
-                else "close"
-            )
-            record_attempt(
-                symbol,
-                rec_action,
-                "skipped",
-                "existing_working_close",
-                exp=str(expiration),
-                right=right.upper(),
-                longK=float(long_strike),
-                shortK=float(short_strike),
-            )
-        except Exception:
-            pass
-        return None
+        # For force_close role (3pm preclose), cancel existing limit order and proceed with market
+        if role == "force_close":
+            logger.info("[%s] force_close: cancelling existing working CLOSE to replace with MKT", symbol)
+            try:
+                cxl_count = cancel_close_orders_for_symbol(ib, symbol)
+                logger.info("[%s] force_close: cancelled %d existing CLOSE order(s)", symbol, cxl_count)
+                record_attempt(
+                    symbol,
+                    "force_close",
+                    "placed",
+                    "cancel_existing_close_for_mkt",
+                    exp=str(expiration),
+                    right=right.upper(),
+                    cancelled=cxl_count,
+                )
+            except Exception as e:
+                logger.warning("[%s] force_close: failed to cancel existing CLOSE: %s", symbol, e)
+            # Proceed to place market order (don't return)
+        else:
+            logger.info("[%s] close-guard: existing working AUTO_CLOSE; skipping.", symbol)
+            try:
+                rec_action = (
+                    "close_call" if right.upper() == "C"
+                    else "close_put" if right.upper() == "P"
+                    else "close"
+                )
+                record_attempt(
+                    symbol,
+                    rec_action,
+                    "skipped",
+                    "existing_working_close",
+                    exp=str(expiration),
+                    right=right.upper(),
+                    longK=float(long_strike),
+                    shortK=float(short_strike),
+                )
+            except Exception:
+                pass
+            return None
     # --- Canonicalize leg orientation: treat combo as a long debit vertical ---
     # Calls: long lower strike, short higher strike
     # Puts : long higher strike, short lower strike

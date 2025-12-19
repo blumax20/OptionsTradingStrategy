@@ -660,20 +660,50 @@ class DailyCycleManagementMixin:
                         sym = (r.get("symbol") or "").strip().upper()
                         if not sym:
                             continue
-                        # If we already hold an options position in this symbol, do not delegate new OPENs
-                        if sym in held_syms:
-                            try:
-                                self._attempt(
-                                    symbol=sym,
-                                    action="open",
-                                    status="skipped",
-                                    reason="skip_open_any_position",
-                                    source="dcm-open",
-                                )
-                            except Exception:
-                                pass
-                            continue
-                        if sym in submitted_close_syms:
+                        side_raw = (r.get("signal_type") or r.get("signal_side") or "").strip().lower()
+                        # Determine signal side: +1 for CALL_OPEN, -1 for PUT_OPEN
+                        signal_is_call = "call" in side_raw
+                        signal_is_put = "put" in side_raw
+                        signal_sign = +1 if signal_is_call else (-1 if signal_is_put else 0)
+
+                        # Check if this is a flip scenario: we hold opposite side and close was submitted
+                        held_sign = held_signs.get(sym)  # +1 for call, -1 for put, None if no position
+                        is_flip = (sym in submitted_close_syms and
+                                   held_sign is not None and
+                                   signal_sign != 0 and
+                                   held_sign != signal_sign)
+
+                        # If we already hold an options position in this symbol, skip unless it's a flip
+                        if sym in held_syms and not is_flip:
+                            # Check if it's same-side (would be a duplicate) vs opposite-side (flip)
+                            if held_sign == signal_sign:
+                                try:
+                                    self._attempt(
+                                        symbol=sym,
+                                        action="open",
+                                        status="skipped",
+                                        reason="skip_open_same_side_position",
+                                        source="dcm-open",
+                                    )
+                                except Exception:
+                                    pass
+                                continue
+                            elif sym not in submitted_close_syms:
+                                # Opposite side but no close submitted yet - skip for now
+                                try:
+                                    self._attempt(
+                                        symbol=sym,
+                                        action="open",
+                                        status="skipped",
+                                        reason="skip_open_opposite_no_close_yet",
+                                        source="dcm-open",
+                                    )
+                                except Exception:
+                                    pass
+                                continue
+
+                        # If a close was submitted but it's NOT a flip, skip the open
+                        if sym in submitted_close_syms and not is_flip:
                             try:
                                 self._attempt(
                                     symbol=sym,
@@ -685,7 +715,6 @@ class DailyCycleManagementMixin:
                             except Exception:
                                 pass
                             continue
-                        side_raw = (r.get("signal_type") or r.get("signal_side") or "").strip().lower()
                         if "open" not in side_raw:
                             continue
                         exp_s = (r.get("expiration") or r.get("exp") or r.get("lastTradeDateOrContractMonth") or "").strip()
