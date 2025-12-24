@@ -1251,6 +1251,7 @@ def _infer_vertical_orientation_and_size(
     longC = qualify_option(ib, symbol, expiration, atm_strike, right)
     shortC = qualify_option(ib, symbol, expiration, oth_strike, right)
     if not longC or not shortC:
+        logger.warning(f"[{symbol}] Failed to qualify options: longC={'OK' if longC else 'FAIL'}, shortC={'OK' if shortC else 'FAIL'} for {right} {atm_strike}/{oth_strike} exp {expiration}")
         return None, 0
 
     qty_atm = 0.0
@@ -1267,10 +1268,12 @@ def _infer_vertical_orientation_and_size(
 
     # No exposure on either leg
     if abs(qty_atm) < 1e-9 and abs(qty_oth) < 1e-9:
+        logger.info(f"[{symbol}] No positions found for {right} {atm_strike}/{oth_strike} exp {expiration} (qty_atm={qty_atm}, qty_oth={qty_oth})")
         return None, 0
 
     n = min(abs(int(qty_atm)), abs(int(qty_oth)), max_qty)
     if n <= 0:
+        logger.warning(f"[{symbol}] Position found but qty <= 0: qty_atm={qty_atm}, qty_oth={qty_oth}, n={n}")
         return None, 0
 
     orientation: str | None = None
@@ -1285,6 +1288,7 @@ def _infer_vertical_orientation_and_size(
     elif qty_atm < 0 and qty_oth > 0:
         orientation = "short_credit"
 
+    logger.info(f"[{symbol}] Position detected: {right} {atm_strike}/{oth_strike} exp {expiration}, orientation={orientation}, n={n}, qty_atm={qty_atm}, qty_oth={qty_oth}")
     return orientation, n
 
 # --- Market close helper ---
@@ -2130,6 +2134,29 @@ def run_from_csv():
             # If parsing fails, fall back to keeping the CSV as-is
             pass
 
+    # Filter OPEN signals to same-day only (preserve historical CLOSE signals for lookback)
+    if "_ts" in df.columns and "signal_type" in df.columns:
+        try:
+            today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+
+            # Split into OPEN vs CLOSE signals
+            mask_open = df.get("signal_type", pd.Series(dtype=str)).astype(str).str.upper().isin(
+                ["CALL_OPEN", "PUT_OPEN", "OPEN"]
+            )
+            df_open = df[mask_open].copy()
+            df_close = df[~mask_open].copy()
+
+            # Apply date filter to opens only
+            df_open_filtered = df_open[df_open["_ts"].notna() & (df_open["_ts"].dt.date == today_ny)]
+
+            # Recombine: same-day opens + all closes (historical allowed for lookback)
+            df = pd.concat([df_open_filtered, df_close], ignore_index=True)
+
+            logger.info(f"Filtered OPEN signals to same-day: {len(df_open_filtered)}/{len(df_open)} "
+                        f"(date={today_ny}), kept {len(df_close)} CLOSE signals")
+        except Exception as e:
+            logger.warning(f"Failed to apply same-day filter for OPEN signals: {e}")
+
     # Validate minimal columns
     required_cols = ["symbol", "expiration", "atm_strike", "otm_strike_call", "otm_strike_put"]
     missing = [c for c in required_cols if c not in df.columns]
@@ -2439,6 +2466,7 @@ def run_from_csv():
                     call_close_raw = width_aligned_close_limit(row, 'C', w_call)
                     _raw_close_c = live_close_limit_c if (live_close_limit_c is not None) else call_close_raw
                     call_close_limit = enforce_close_limit(_raw_close_c)
+                    logger.info(f"[{symbol}] CLOSE CALL limits: live={live_close_limit_c}, csv_raw={call_close_raw}, enforced={call_close_limit}, atm={atm}, k_call={k_call}, exp={expiration}")
                     if not pd.isna(k_call) and call_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE CALL exact {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                         if args.dry_run:
@@ -2450,11 +2478,14 @@ def run_from_csv():
                                 logger.info(f"[{symbol}] Submitted CLOSE for CALL spread {atm}/{k_call} exp {expiration} @ {call_close_limit}")
                                 closed_any = True
                                 placed += 1
-                    # fallback to market close if position present
-                    if call_close_limit is None and not pd.isna(k_call) and not pd.isna(atm):
-                        if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'C', float(atm), float(k_call), max_qty=args.quantity):
-                            logger.info(f"[{symbol}] Submitted CLOSE CALL (MKT fallback) {atm}/{k_call} exp {expiration}")
-                            placed += 1
+                            else:
+                                logger.warning(f"[{symbol}] close_spread_if_present returned False for CALL {atm}/{k_call} exp {expiration} @ {call_close_limit}")
+                    else:
+                        # Stage 1: skip if no limit available, let DCM proceed to Stage 1.5 (live-mid) or Stage 2 (market)
+                        if call_close_limit is None and not pd.isna(k_call) and not pd.isna(atm):
+                            logger.info(f"[{symbol}] CLOSE CALL {atm}/{k_call} exp {expiration}: no limit available, skipping (Stage 1)")
+                        else:
+                            logger.warning(f"[{symbol}] Skipping CLOSE CALL: k_call_is_na={pd.isna(k_call)}, limit_is_none={call_close_limit is None}, atm_is_na={pd.isna(atm)}")
                     # Close put spread if present
                     live_close_limit_p = None
                     if getattr(args, "use_live_close", "off") in ("mid","join") and not pd.isna(atm) and not pd.isna(k_put):
@@ -2464,6 +2495,7 @@ def run_from_csv():
                     put_close_raw = width_aligned_close_limit(row, 'P', w_put)
                     _raw_close_p = live_close_limit_p if (live_close_limit_p is not None) else put_close_raw
                     put_close_limit = enforce_close_limit(_raw_close_p)
+                    logger.info(f"[{symbol}] CLOSE PUT limits: live={live_close_limit_p}, csv_raw={put_close_raw}, enforced={put_close_limit}, atm={atm}, k_put={k_put}, exp={expiration}")
                     if not pd.isna(k_put) and put_close_limit is not None and not pd.isna(atm):
                         vprint(args.verbose, f"[{symbol}] Attempt CLOSE PUT exact {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                         if args.dry_run:
@@ -2475,11 +2507,14 @@ def run_from_csv():
                                 logger.info(f"[{symbol}] Submitted CLOSE for PUT spread {atm}/{k_put} exp {expiration} @ {put_close_limit}")
                                 closed_any = True
                                 placed += 1
-                    # fallback to market close if position present
-                    if put_close_limit is None and not pd.isna(k_put) and not pd.isna(atm):
-                        if not args.dry_run and close_spread_market_if_present(ib, symbol, expiration, 'P', float(atm), float(k_put), max_qty=args.quantity):
-                            logger.info(f"[{symbol}] Submitted CLOSE PUT (MKT fallback) {atm}/{k_put} exp {expiration}")
-                            placed += 1
+                            else:
+                                logger.warning(f"[{symbol}] close_spread_if_present returned False for PUT {atm}/{k_put} exp {expiration} @ {put_close_limit}")
+                    else:
+                        # Stage 1: skip if no limit available, let DCM proceed to Stage 1.5 (live-mid) or Stage 2 (market)
+                        if put_close_limit is None and not pd.isna(k_put) and not pd.isna(atm):
+                            logger.info(f"[{symbol}] CLOSE PUT {atm}/{k_put} exp {expiration}: no limit available, skipping (Stage 1)")
+                        else:
+                            logger.warning(f"[{symbol}] Skipping CLOSE PUT: k_put_is_na={pd.isna(k_put)}, limit_is_none={put_close_limit is None}, atm_is_na={pd.isna(atm)}")
                     if not closed_any:
                         # try approximate match within tolerance
                         if not pd.isna(k_call) and not pd.isna(atm):
