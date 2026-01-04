@@ -507,14 +507,15 @@ class DailyCycleManagementMixin:
                 except Exception:
                     pass
             else:
-                # Stage 2: fallback to force-close with live join quotes (aggressive close)
-                LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close)")
+                # Stage 2: fallback to force-close with age-based pricing (mid for same-day, join for previous-day)
+                scheme = self._determine_live_close_scheme_for_symbol(sym)
+                LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close with '{scheme}' scheme)")
                 try:
                     self._attempt(
                         symbol=sym,
                         action="close",
                         status="queued",
-                        reason=f"{context}_fallback_live_join",
+                        reason=f"{context}_fallback_live_{scheme}",
                         source=f"dcm-{context}",
                     )
                 except Exception:
@@ -524,7 +525,7 @@ class DailyCycleManagementMixin:
                     "--date", dated_folder,  # Ensure correct dated CSV directory
                     "--symbols", sym,
                     "--min-limit","0.01" if context == "preclose" else "0.05",
-                    "--use-live-close","join",  # Use live join quotes for aggressive pricing
+                    "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
                     "--quantity","50",
                     "--quiet"
                 ])
@@ -1083,6 +1084,74 @@ class DailyCycleManagementMixin:
 
         # Position is from previous trading day or earlier
         return open_date <= prev_trading_date
+
+    def _determine_live_close_scheme_for_symbol(self, symbol: str) -> str:
+        """
+        Determine which live-close pricing scheme to use based on position age.
+
+        Returns:
+            'mid' for same-day positions (conservative)
+            'join' for previous-day positions (aggressive)
+        """
+        try:
+            from ib_insync import IB
+
+            # Connect to IB to check position age
+            ib = IB()
+            try:
+                ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+            except Exception as e:
+                LOG.debug("Live-close scheme: connect failed, defaulting to 'mid': %s", e)
+                return 'mid'  # Conservative default
+
+            try:
+                # Get positions for this symbol
+                positions = ib.positions()
+                option_positions = [
+                    p for p in positions
+                    if getattr(p.contract, 'symbol', '').upper() == symbol.upper()
+                    and getattr(p.contract, 'secType', '') == 'OPT'
+                ]
+
+                if not option_positions:
+                    LOG.debug("Live-close scheme: no positions found for %s, using 'mid'", symbol)
+                    return 'mid'
+
+                # Get earliest open date across all legs
+                open_dates = []
+                for p in option_positions:
+                    conId = p.contract.conId
+                    open_date = self._get_position_open_date(conId)
+                    if open_date:
+                        open_dates.append(open_date)
+
+                if not open_dates:
+                    LOG.info("Live-close scheme: unknown age for %s, using 'mid' (conservative)", symbol)
+                    return 'mid'
+
+                earliest_open_date = min(open_dates)
+
+                # Check if previous trading day
+                is_prev_day = self._is_previous_trading_day_position(earliest_open_date)
+
+                if is_prev_day:
+                    LOG.info("Live-close scheme: %s opened %s (previous trading day), using 'join' (aggressive)",
+                             symbol, earliest_open_date)
+                    return 'join'
+                else:
+                    LOG.info("Live-close scheme: %s opened %s (same day), using 'mid' (conservative)",
+                             symbol, earliest_open_date)
+                    return 'mid'
+
+            finally:
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            LOG.warning("Live-close scheme determination failed for %s: %s, defaulting to 'mid'", symbol, e)
+            return 'mid'  # Conservative default
 
     def _try_close_from_positions(self, sym: str, prefer: str = "LMT", side: str | None = None) -> bool:
         """

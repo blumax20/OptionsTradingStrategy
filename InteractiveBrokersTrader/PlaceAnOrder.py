@@ -1765,11 +1765,72 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         row = rows.iloc[0]
                         width = abs(float(longK) - float(shortK))
                         csv_limit = width_aligned_close_limit(row, right, width)
-                        if csv_limit is not None and csv_limit >= args.min_limit:
-                            limit = csv_limit
-                            logger.info(f"[{symbol}] Force-close fallback: using CSV theoretical limit {limit:.2f} (live quotes unavailable)")
+                        if csv_limit is not None:
+                            # Apply conservative buffer (10%) for better fill rate
+                            buffered_csv_limit = csv_limit * 0.90
+                            if buffered_csv_limit >= args.min_limit:
+                                limit = buffered_csv_limit
+                                logger.info(f"[{symbol}] Force-close fallback: using CSV theoretical limit with 10% buffer: "
+                                            f"raw=${csv_limit:.2f}, buffered=${limit:.2f} (live quotes unavailable)")
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to read CSV fallback for force-close: {e}")
+
+        # FALLBACK 3: Use stale position market prices (IB position data)
+        if limit is None:
+            try:
+                logger.info(f"[{symbol}] No CSV limit found, trying position market prices (stale fallback)")
+
+                # Get current positions from IB
+                positions = ib.positions()
+
+                # Find positions for this symbol's option legs
+                long_pos = None
+                short_pos = None
+
+                for p in positions:
+                    c = p.contract
+                    if getattr(c, 'symbol', '').upper() != symbol.upper():
+                        continue
+                    if getattr(c, 'secType', '') != 'OPT':
+                        continue
+
+                    strike = float(getattr(c, 'strike', 0.0))
+
+                    # Match to our spread legs
+                    if abs(strike - float(longK)) < 0.01:
+                        long_pos = p
+                    elif abs(strike - float(shortK)) < 0.01:
+                        short_pos = p
+
+                if long_pos and short_pos:
+                    # Use IB's market prices (last mark)
+                    long_market_price = getattr(long_pos, 'marketPrice', None)
+                    short_market_price = getattr(short_pos, 'marketPrice', None)
+
+                    if long_market_price and short_market_price:
+                        # Calculate spread value
+                        spread_value = long_market_price - short_market_price
+
+                        # Apply conservative buffer (10%) for better fill rate
+                        buffered_limit = spread_value * 0.90
+
+                        # Enforce minimum
+                        if buffered_limit >= args.min_limit:
+                            limit = round(buffered_limit, 2)
+                            logger.info(f"[{symbol}] Using stale position prices: long=${long_market_price:.2f}, "
+                                        f"short=${short_market_price:.2f}, spread=${spread_value:.2f}, "
+                                        f"buffered_limit=${limit:.2f} (10% buffer)")
+                        else:
+                            logger.warning(f"[{symbol}] Stale position limit ${buffered_limit:.2f} below min_limit "
+                                          f"${args.min_limit}, skipping")
+                    else:
+                        logger.debug(f"[{symbol}] Position market prices not available: "
+                                    f"long={long_market_price}, short={short_market_price}")
+                else:
+                    logger.debug(f"[{symbol}] Could not find both position legs for stale fallback")
+
+            except Exception as e:
+                logger.warning(f"[{symbol}] Failed to get stale position prices: {e}")
 
         order_type = "LMT" if (limit is not None) else "MKT"
         ckey = _close_key(symbol, right, exp)
