@@ -995,6 +995,95 @@ class DailyCycleManagementMixin:
         finally:
             self._in_close_phase = _prev_phase
 
+    def _get_position_open_date(self, conId: int) -> date | None:
+        """
+        Query IB execution history and return the date when this contract was opened.
+        Returns None if no open execution found within last 30 days.
+        """
+        try:
+            from ib_insync import IB, ExecutionFilter, util
+            from datetime import timedelta, date
+            from zoneinfo import ZoneInfo
+
+            # Connect to IB
+            ib = IB()
+            try:
+                ib.connect('127.0.0.1', 7497, clientId=885, timeout=6)
+            except Exception as e:
+                LOG.debug("Position age check: connect failed: %s", e)
+                return None
+
+            try:
+                # Get executions from last 30 days
+                now = self._now_ny()
+                since = (now.astimezone(ZoneInfo("UTC")) - timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
+                fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
+
+                # Find earliest OPEN execution for this conId
+                open_times = []
+                for f in fills:
+                    if f.contract.conId != conId:
+                        continue
+                    # Filter to OPEN transactions only (not closes)
+                    if getattr(f.execution, "openClose", "") != "O":
+                        continue
+                    try:
+                        t_utc = util.parseIBDatetime(getattr(f.execution, "time", ""))
+                        if t_utc:
+                            t_ny = t_utc.astimezone(ZoneInfo("America/New_York"))
+                            open_times.append(t_ny)
+                    except Exception:
+                        pass
+
+                # Return earliest open date
+                if open_times:
+                    earliest = min(open_times)
+                    return earliest.date()
+                return None
+
+            finally:
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            LOG.debug("Failed to get position open date for conId %s: %s", conId, e)
+            return None
+
+    def _is_previous_trading_day_position(self, open_date: date | None) -> bool:
+        """
+        Check if position was opened on a PREVIOUS trading day (not today).
+
+        Returns:
+            True if opened previous trading day or earlier
+            False if opened today OR open_date is None (unknown age)
+
+        Note: Currently only handles weekends. To add holiday support, integrate
+        pandas_market_calendars.get_calendar('NYSE').
+        """
+        if not open_date:
+            # Unknown age: treat as same-day (safer, avoids unwanted market orders)
+            return False
+
+        today = self._now_ny().date()
+
+        # Same calendar date → same-day position
+        if open_date == today:
+            return False
+
+        # Check if opened on previous trading day or earlier
+        # Walk backwards from today until we hit a trading day
+        from datetime import timedelta
+        prev_trading_date = today - timedelta(days=1)
+
+        # Skip weekends
+        while prev_trading_date.weekday() >= 5:  # 5=Sat, 6=Sun
+            prev_trading_date -= timedelta(days=1)
+
+        # Position is from previous trading day or earlier
+        return open_date <= prev_trading_date
+
     def _try_close_from_positions(self, sym: str, prefer: str = "LMT", side: str | None = None) -> bool:
         """
         Best-effort direct close using current IB positions for `sym`.
@@ -1111,16 +1200,40 @@ class DailyCycleManagementMixin:
                     ]
                     action = 'SELL' if is_long_vertical else 'BUY'
 
-                    # Determine order type: try LMT with theo value, fall back to MKT
+                    # Determine order type: try LMT with theo value, fall back to MKT (if allowed)
                     width = abs(high - low)
                     theo_limit = _get_theo_limit(right, width) if prefer.upper() == 'LMT' else None
 
                     if theo_limit is not None:
+                        # Have CSV limit: use it
                         order = LimitOrder(action, 1, theo_limit)
                         order_desc = f"LMT @ {theo_limit:.2f}"
                     else:
-                        order = MarketOrder(action, 1)
-                        order_desc = "MKT"
+                        # No CSV limit: check position age before allowing market fallback
+                        # Get open dates for both legs
+                        open_date_long = self._get_position_open_date(longConId)
+                        open_date_short = self._get_position_open_date(shortConId)
+
+                        # Use earliest open date across legs (most conservative)
+                        if open_date_long and open_date_short:
+                            position_open_date = min(open_date_long, open_date_short)
+                        else:
+                            position_open_date = open_date_long or open_date_short
+
+                        # Check if this is a previous trading day position
+                        is_prev_day = self._is_previous_trading_day_position(position_open_date)
+
+                        if is_prev_day:
+                            # Previous trading day: allow market fallback
+                            order = MarketOrder(action, 1)
+                            order_desc = f"MKT (opened {position_open_date})"
+                            LOG.info("direct-close: allowing market fallback for %s %s (opened %s)", up, right, position_open_date)
+                        else:
+                            # Same-day OR unknown age: limit orders only
+                            age_desc = f"opened {position_open_date}" if position_open_date else "unknown age"
+                            LOG.info("direct-close: skipping market fallback for %s %s vertical %s/%s (%s, no CSV limit)",
+                                     up, right, low, high, age_desc)
+                            return False  # Skip this order, don't place anything
 
                     tr = ib.placeOrder(bag, order)
                     LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, order_desc)
