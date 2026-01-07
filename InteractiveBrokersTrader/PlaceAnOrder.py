@@ -1552,6 +1552,108 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
     return (best[0], best[1], best[2]) if best[2] > 0 else (None, None, 0)
 
 
+def _has_position_with_expiration(ib: IB, symbol: str, expiration: str, side: str | None) -> bool:
+    """
+    Check if any positions exist for symbol with the given expiration.
+    If side is specified ('call' or 'put'), only check that side.
+
+    Returns True if at least one matching position found.
+    """
+    side_set = {side.lower()} if side else {"call", "put"}
+
+    for p in ib.positions():
+        c = getattr(p, "contract", None)
+        if not c or getattr(c, "secType", "") != "OPT":
+            continue
+        if getattr(c, "symbol", "").upper() != symbol.upper():
+            continue
+        pos_exp = getattr(c, "lastTradeDateOrContractMonth", "")
+        if pos_exp != expiration:
+            continue
+        right = getattr(c, "right", "").upper()
+        if right == "C" and "call" not in side_set:
+            continue
+        if right == "P" and "put" not in side_set:
+            continue
+        qty = float(getattr(p, "position", 0.0))
+        if abs(qty) > 1e-9:
+            return True
+    return False
+
+
+def find_spread_with_flexible_expiration(
+    ib: IB,
+    symbol: str,
+    target_expiration: str,
+    days_tolerance: int = 7,
+    max_qty: int = 50
+) -> tuple[float | None, float | None, str | None, str | None, int]:
+    """
+    Find vertical spread where expiration is within ±days_tolerance of target_expiration.
+    Returns closest matching spread by days difference.
+
+    Returns: (atm_strike, oth_strike, actual_exp, right, qty) or (None, None, None, None, 0)
+    """
+    from datetime import datetime
+
+    try:
+        target_dt = datetime.strptime(target_expiration, "%Y%m%d")
+    except:
+        return (None, None, None, None, 0)
+
+    spreads = {}  # key: (exp, right, days_diff) -> {'longs': {}, 'shorts': {}}
+
+    for p in ib.positions():
+        c = getattr(p, 'contract', None)
+        if not c or getattr(c, 'symbol', '').upper() != symbol.upper():
+            continue
+        if getattr(c, 'secType', '') != 'OPT':
+            continue
+
+        exp = getattr(c, 'lastTradeDateOrContractMonth', '')
+        if not exp:
+            continue
+
+        # Check if within tolerance
+        try:
+            exp_dt = datetime.strptime(exp, "%Y%m%d")
+            days_diff = abs((exp_dt - target_dt).days)
+            if days_diff > days_tolerance:
+                continue
+        except:
+            continue
+
+        right = getattr(c, 'right', '').upper()
+        strike = float(getattr(c, 'strike', 0.0))
+        qty = float(getattr(p, 'position', 0.0))
+
+        key = (exp, right, days_diff)
+        if key not in spreads:
+            spreads[key] = {'longs': {}, 'shorts': {}}
+
+        if qty > 0:
+            spreads[key]['longs'][strike] = qty
+        elif qty < 0:
+            spreads[key]['shorts'][strike] = abs(qty)
+
+    # Find closest expiration with valid spread
+    for (exp, right, days_diff) in sorted(spreads.keys(), key=lambda x: x[2]):
+        d = spreads[(exp, right, days_diff)]
+        longs = d['longs']
+        shorts = d['shorts']
+
+        if not longs or not shorts:
+            continue
+
+        for ls, lq in longs.items():
+            for ss, sq in shorts.items():
+                n = int(min(lq, sq, max_qty))
+                if n > 0:
+                    return (float(ls), float(ss), exp, right, n)
+
+    return (None, None, None, None, 0)
+
+
 # --- Fallback: scan positions for any spread for this symbol and close via MARKET order ---
 def close_any_spread_for_symbol(
     ib: IB,
@@ -1831,6 +1933,29 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to get stale position prices: {e}")
+
+        # Warn-only expiration validation (Option 3)
+        if exp:  # CSV expiration provided
+            has_exact_match = _has_position_with_expiration(ib, symbol, exp, right)
+
+            if not has_exact_match:
+                # Try flexible matching (±7 days)
+                tol_days = getattr(args, "expiration_tolerance_days", 7)
+                flex_atm, flex_oth, flex_exp, flex_right, flex_qty = find_spread_with_flexible_expiration(
+                    ib, symbol, exp, days_tolerance=tol_days
+                )
+
+                if flex_exp:
+                    logger.warning(
+                        f"[{symbol}] CSV expiration {exp} not found in positions, but found "
+                        f"spread at {flex_exp} (within ±{tol_days}d). "
+                        f"Continuing with CSV expiration anyway (warn-only mode)."
+                    )
+                else:
+                    logger.warning(
+                        f"[{symbol}] CSV expiration {exp} not found in positions, and no spread "
+                        f"found within ±{tol_days}d. Continuing anyway (warn-only mode)."
+                    )
 
         order_type = "LMT" if (limit is not None) else "MKT"
         ckey = _close_key(symbol, right, exp)
@@ -2337,6 +2462,44 @@ def run_from_csv():
             k_call = row.get("otm_strike_call")
             k_put = row.get("otm_strike_put")
 
+            # --- Fetch current price from IB if CSV is missing it ---
+            current_price = row.get("current_price")
+            if symbol and (pd.isna(current_price) or not current_price):
+                try:
+                    from ib_insync import Stock
+                    # Fetch current price from IB for stock
+                    stock_contract = Stock(symbol, 'SMART', 'USD')
+                    ib.qualifyContracts(stock_contract)
+                    ticker = ib.reqTickers(stock_contract)[0]
+
+                    if ticker and hasattr(ticker, 'marketPrice') and ticker.marketPrice():
+                        current_price = ticker.marketPrice()
+                        vprint(args.verbose, f"[{symbol}] Fetched current price from IB: ${current_price:.2f}")
+                    elif ticker and hasattr(ticker, 'last') and ticker.last:
+                        current_price = ticker.last
+                        vprint(args.verbose, f"[{symbol}] Using last price from IB: ${current_price:.2f}")
+                    else:
+                        current_price = None
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to fetch current price from IB: {e}")
+                    current_price = None
+
+            # --- Calculate ATM strike from current price if CSV is missing it ---
+            if pd.isna(atm) and current_price:
+                try:
+                    # Determine strike interval based on price
+                    if current_price <= 50:
+                        interval = 1.0
+                    elif current_price <= 200:
+                        interval = 2.5
+                    else:
+                        interval = 5.0
+
+                    # Round to nearest strike
+                    atm = round(current_price / interval) * interval
+                    vprint(args.verbose, f"[{symbol}] Calculated ATM strike from current price ${current_price:.2f}: {atm} (interval={interval})")
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to calculate ATM from current price: {e}")
 
             # --- OTM strike inference when missing ---
             # 1) If put OTM is missing but call OTM exists, infer symmetric width
@@ -2516,6 +2679,38 @@ def run_from_csv():
                     cxl = cancel_open_orders_for_symbol(ib, symbol)
                     if cxl > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl} pending OPEN combo order(s) prior to CLOSE")
+
+                    # Warn-only expiration validation (Option 3)
+                    if expiration and expiration not in (None, "", "nan", "NaN"):
+                        # Determine which side(s) to check based on signal type
+                        check_side = None
+                        if stype == "CALL_CLOSE":
+                            check_side = "call"
+                        elif stype == "PUT_CLOSE":
+                            check_side = "put"
+                        # else CLOSE means check both sides
+
+                        has_exact_match = _has_position_with_expiration(ib, symbol, expiration, check_side)
+
+                        if not has_exact_match:
+                            # Try flexible matching (±7 days)
+                            tol_days = getattr(args, "expiration_tolerance_days", 7)
+                            flex_atm, flex_oth, flex_exp, flex_right, flex_qty = find_spread_with_flexible_expiration(
+                                ib, symbol, expiration, days_tolerance=tol_days
+                            )
+
+                            if flex_exp:
+                                logger.warning(
+                                    f"[{symbol}] CSV expiration {expiration} not found in positions, but found "
+                                    f"spread at {flex_exp} (within ±{tol_days}d). "
+                                    f"Continuing with CSV expiration anyway (warn-only mode)."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[{symbol}] CSV expiration {expiration} not found in positions, and no spread "
+                                    f"found within ±{tol_days}d. Continuing anyway (warn-only mode)."
+                                )
+
                     # Attempt to close whichever spread we hold (call and/or put) by inspecting positions
                     closed_any = False
                     # Close call spread if present
