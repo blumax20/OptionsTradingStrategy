@@ -473,15 +473,6 @@ def parse_args():
                    help="When to enforce the OI gate for OPEN orders: 'off' (never), 'rth' (only during 09:30–16:00 NY), or 'always'.")
     p.add_argument("--fallback-individual-legs", action="store_true",
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
-    p.add_argument("--allow-market-fallback",
-                   choices=["never", "force-close-only", "always"],
-                   default="force-close-only",
-                   help="Control when market orders are allowed as fallback. "
-                        "'never': never use market fallback, "
-                        "'force-close-only': only in --mode force-close (default), "
-                        "'always': allow in all modes (legacy behavior)")
-    p.add_argument("--expiration-tolerance-days", type=int, default=7,
-                   help="Days tolerance for expiration matching when exact expiration not found (default: 7)")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -1561,108 +1552,6 @@ def find_approx_spread_to_close(ib: IB, symbol: str, expiration: str, right: str
     return (best[0], best[1], best[2]) if best[2] > 0 else (None, None, 0)
 
 
-def _has_position_with_expiration(ib: IB, symbol: str, expiration: str, side: str | None) -> bool:
-    """
-    Check if any positions exist for symbol with the given expiration.
-    If side is specified ('call' or 'put'), only check that side.
-
-    Returns True if at least one matching position found.
-    """
-    side_set = {side.lower()} if side else {"call", "put"}
-
-    for p in ib.positions():
-        c = getattr(p, "contract", None)
-        if not c or getattr(c, "secType", "") != "OPT":
-            continue
-        if getattr(c, "symbol", "").upper() != symbol.upper():
-            continue
-        pos_exp = getattr(c, "lastTradeDateOrContractMonth", "")
-        if pos_exp != expiration:
-            continue
-        right = getattr(c, "right", "").upper()
-        if right == "C" and "call" not in side_set:
-            continue
-        if right == "P" and "put" not in side_set:
-            continue
-        qty = float(getattr(p, "position", 0.0))
-        if abs(qty) > 1e-9:
-            return True
-    return False
-
-
-def find_spread_with_flexible_expiration(
-    ib: IB,
-    symbol: str,
-    target_expiration: str,
-    days_tolerance: int = 7,
-    max_qty: int = 50
-) -> tuple[float | None, float | None, str | None, str | None, int]:
-    """
-    Find vertical spread where expiration is within ±days_tolerance of target_expiration.
-    Returns closest matching spread by days difference.
-
-    Returns: (atm_strike, oth_strike, actual_exp, right, qty) or (None, None, None, None, 0)
-    """
-    from datetime import datetime, timedelta
-
-    try:
-        target_dt = datetime.strptime(target_expiration, "%Y%m%d")
-    except:
-        return (None, None, None, None, 0)
-
-    spreads = {}  # key: (exp, right, days_diff) -> {'longs': {}, 'shorts': {}}
-
-    for p in ib.positions():
-        c = getattr(p, 'contract', None)
-        if not c or getattr(c, 'symbol', '').upper() != symbol.upper():
-            continue
-        if getattr(c, 'secType', '') != 'OPT':
-            continue
-
-        exp = getattr(c, 'lastTradeDateOrContractMonth', '')
-        if not exp:
-            continue
-
-        # Check if within tolerance
-        try:
-            exp_dt = datetime.strptime(exp, "%Y%m%d")
-            days_diff = abs((exp_dt - target_dt).days)
-            if days_diff > days_tolerance:
-                continue
-        except:
-            continue
-
-        right = getattr(c, 'right', '').upper()
-        strike = float(getattr(c, 'strike', 0.0))
-        qty = float(getattr(p, 'position', 0.0))
-
-        key = (exp, right, days_diff)
-        if key not in spreads:
-            spreads[key] = {'longs': {}, 'shorts': {}}
-
-        if qty > 0:
-            spreads[key]['longs'][strike] = qty
-        elif qty < 0:
-            spreads[key]['shorts'][strike] = abs(qty)
-
-    # Find closest expiration with valid spread
-    for (exp, right, days_diff) in sorted(spreads.keys(), key=lambda x: x[2]):
-        d = spreads[(exp, right, days_diff)]
-        longs = d['longs']
-        shorts = d['shorts']
-
-        if not longs or not shorts:
-            continue
-
-        for ls, lq in longs.items():
-            for ss, sq in shorts.items():
-                n = int(min(lq, sq, max_qty))
-                if n > 0:
-                    return (float(ls), float(ss), exp, right, n)
-
-    return (None, None, None, None, 0)
-
-
 # --- Fallback: scan positions for any spread for this symbol and close via MARKET order ---
 def close_any_spread_for_symbol(
     ib: IB,
@@ -2725,69 +2614,7 @@ def run_from_csv():
                                             logger.info(f"[{symbol}] Submitted CLOSE PUT(approx) {approx_atm}/{approx_oth} exp {expiration} @ {put_close_limit}")
                                             closed_any = True
                                             placed += 1
-
-                    # Try expiration-flexible matching (within ±N days)
-                    if not closed_any and not pd.isna(expiration):
-                        days_tol = getattr(args, "expiration_tolerance_days", 7)
-                        logger.info(f"[{symbol}] Attempting expiration-flexible close (±{days_tol} days from {expiration})")
-                        flex_atm, flex_oth, flex_exp, flex_right, qty = find_spread_with_flexible_expiration(
-                            ib, symbol, expiration, days_tolerance=days_tol, max_qty=args.quantity
-                        )
-                        if qty > 0:
-                            # Determine which limit to use based on flex_right
-                            flex_limit = call_close_limit if flex_right == 'C' else put_close_limit
-                            if flex_limit is not None:
-                                logger.warning(
-                                    f"[{symbol}] CSV expiration {expiration} not found; "
-                                    f"using nearby expiration {flex_exp} (±7 days tolerance)"
-                                )
-                                if not args.dry_run:
-                                    tr = place_debit_spread(ib, symbol, flex_exp, flex_atm, flex_oth, flex_right,
-                                                          flex_limit, quantity=qty, action='SELL')
-                                    if tr is not None:
-                                        CLOSE_SEEN_KEYS.add(_close_key(symbol, flex_right, flex_exp))
-                                        logger.info(f"[{symbol}] Submitted CLOSE {flex_right} (flexible exp) {flex_atm}/{flex_oth} exp {flex_exp} @ {flex_limit}")
-                                        closed_any = True
-                                        placed += 1
-                                else:
-                                    vprint(args.verbose, f"[DRY-RUN] CLOSE {flex_right} (flexible exp) {symbol} {flex_atm}/{flex_oth} exp {flex_exp} @ {flex_limit}")
-                                    closed_any = True
-                                    placed += 1
-
                     if not closed_any:
-                        # Check if market fallback is allowed for this mode
-                        allow_market = getattr(args, "allow_market_fallback", "force-close-only")
-
-                        if allow_market == "never":
-                            logger.info(f"[{symbol}] Market fallback disabled by --allow-market-fallback=never")
-                            record_attempt(symbol, "close", "skipped", "market_fallback_disabled", exp=expiration)
-                            continue
-                        elif allow_market == "force-close-only" and args.mode != "force-close":
-                            logger.info(f"[{symbol}] Market fallback not allowed in mode={args.mode} (--allow-market-fallback=force-close-only)")
-                            record_attempt(symbol, "close", "skipped", "market_fallback_not_in_force_close", exp=expiration)
-                            continue
-
-                        # VALIDATE: Check expiration before allowing market fallback
-                        if not pd.isna(expiration) and expiration.strip():
-                            restrict = None
-                            if stype == "CALL_CLOSE":
-                                restrict = "call"
-                            elif stype == "PUT_CLOSE":
-                                restrict = "put"
-
-                            has_matching_exp = _has_position_with_expiration(ib, symbol, expiration, restrict)
-
-                            if not has_matching_exp:
-                                logger.warning(
-                                    f"[{symbol}] CSV signal specifies exp={expiration}, but no positions "
-                                    f"found with that expiration. Skipping market fallback to prevent "
-                                    f"closing wrong expiration."
-                                )
-                                record_attempt(symbol, "close", "skipped",
-                                              "csv_exp_mismatch_no_market_fallback",
-                                              exp=expiration)
-                                continue  # Skip this symbol entirely
-
                         # Final fallback: close any detected spread(s) for this symbol via MARKET orders,
                         # even if expiration/ATM are missing or mismatched.
                         restrict = None

@@ -490,8 +490,6 @@ class DailyCycleManagementMixin:
                 "--min-limit","0.01" if context == "preclose" else "0.05",
                 "--use-live-close","off",  # Don't override CSV limits with live quotes
                 "--quantity","50",
-                "--allow-market-fallback", "never",  # Never use market fallback in Stage 1
-                "--expiration-tolerance-days", "7",  # Allow ±7 days expiration matching
                 "--quiet"
             ])
 
@@ -529,7 +527,6 @@ class DailyCycleManagementMixin:
                     "--min-limit","0.01" if context == "preclose" else "0.05",
                     "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
                     "--quantity","50",
-                    "--allow-market-fallback", "force-close-only",  # Allow market fallback in force-close mode (default)
                     "--quiet"
                 ])
                 if self._has_working_close_order(sym):
