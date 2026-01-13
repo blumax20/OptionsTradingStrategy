@@ -1550,8 +1550,8 @@ class DailyCycleManagementMixin:
     def _has_working_close_order(self, sym: str) -> bool:
         """
         Return True if there is an existing working CLOSE order (SELL combo) for the given symbol.
-        Treats active working states as working, and also treats GTC orders that show as 'Inactive'
-        (because exchange is closed) as working/held-overnight.
+        Treats active working states as working, and also treats 'Inactive' orders as working
+        after hours (both GTC and DAY orders pause when market closes).
         """
         try:
             from ib_insync import IB
@@ -1570,6 +1570,17 @@ class DailyCycleManagementMixin:
             # states that indicate an order is still alive/working
             working_states = {"presubmitted", "submitted", "pendingsubmit", "apipending"}
 
+            # Check if we're after hours (market closed)
+            from datetime import time
+            is_after_hours = False
+            try:
+                t = self._now_ny().time()
+                # After 4:00 PM or before 9:30 AM ET
+                if (t >= time(16, 0)) or (t < time(9, 30)):
+                    is_after_hours = True
+            except Exception:
+                pass
+
             for tr in trades:
                 c = getattr(tr, "contract", None)
                 o = getattr(tr, "order", None)
@@ -1587,10 +1598,18 @@ class DailyCycleManagementMixin:
                 if st in ("filled", "cancelled", "apicancelled"):
                     continue
 
-                # consider GTC inactive as "working/held" after hours
+                # Consider inactive orders as "working/held" after hours
+                # (both GTC and DAY orders pause when market is closed)
                 is_gtc = (getattr(o, "tif", "") or "").upper() == "GTC"
-                if (st in working_states) or (st == "inactive" and is_gtc):
+                if st in working_states:
                     return True
+                if st == "inactive":
+                    # GTC is always working when inactive
+                    if is_gtc:
+                        return True
+                    # DAY orders are also working after hours (they'll activate at market open)
+                    if is_after_hours:
+                        return True
             return False
         finally:
             try:
