@@ -843,8 +843,9 @@ def place_debit_spread(
     """
     # --- HARD CLOSE GUARD ---
     if has_working_auto_close(symbol):
-        # For force_close role (3pm preclose), cancel existing limit order and proceed with market
-        if role == "force_close":
+        # For force_close role (3pm preclose), cancel existing limit order ONLY if placing a market order
+        # Don't cancel if we're placing a limit order (Stage 1.5 with live mid-pricing)
+        if role == "force_close" and order_type.upper() == "MKT":
             logger.info("[%s] force_close: cancelling existing working CLOSE to replace with MKT", symbol)
             try:
                 cxl_count = cancel_close_orders_for_symbol(ib, symbol)
