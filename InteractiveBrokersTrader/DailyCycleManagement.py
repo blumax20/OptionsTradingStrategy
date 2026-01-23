@@ -2631,17 +2631,20 @@ class DailyCycleManagementMixin:
                     # Best-effort; don't block risk exits if attempts logging fails
                     pass
 
-                # Delegate to PlaceAnOrder to place a CLOSE (it will use its own limit/market logic)
+                # Delegate to PlaceAnOrder to place a LIMIT CLOSE using join pricing
+                # The 3pm preclose cycle will convert to market if unfilled
+                # The fix in commit 174d769 ensures we won't cancel existing limit orders when placing limit orders
                 try:
                     self._run_place_an_order([
                         "--mode", "force-close",
                         "--symbols", sym,
                         "--quantity","50",
+                        "--use-live-close", "join",  # Use join pricing for limit orders instead of market
                         "--quiet"
                     ])
                     submitted += 1
                     LOG.info(
-                        "Risk exits: submitted CLOSE for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
+                        "Risk exits: submitted LIMIT CLOSE (join) for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
                         sym, right, strike_low, strike_high, (now - t0).days, entry, curr, width, reason
                     )
                 except Exception as e:
