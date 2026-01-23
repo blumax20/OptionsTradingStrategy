@@ -2909,6 +2909,14 @@ class DailyCycleManagementMixin:
                 o = getattr(tr, "order", None)
                 if not c or not s or not o:
                     continue
+
+                # Skip CLOSE orders (action=SELL) - let them fill naturally or get converted at 3pm preclose
+                # CLOSE orders have lower liquidity risk since they're exiting positions
+                # They will be handled by the 3pm preclose market conversion if still unfilled
+                order_action = (getattr(o, "action", "") or "").upper()
+                if order_action == "SELL":
+                    continue
+
                 if getattr(c, "secType", "") != "BAG":
                     continue
                 st = (getattr(s, "status", "") or "").lower()
