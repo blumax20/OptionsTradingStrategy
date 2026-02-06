@@ -588,11 +588,18 @@ def width_aligned_close_limit(row: pd.Series, right: str, width: float | None) -
     """Close (SELL) price: prefer width-aligned *limit* column; fall back to width-aligned *theo*."""
     wb = _width_bucket(width)
     if wb is None:
+        logger.warning(f"Cannot determine width bucket for width={width}")
         return None
     v = _width_aligned_value(row, right, "limit", wb)
     if v is not None:
         return v
-    return _width_aligned_value(row, right, "theo", wb)
+    # Fallback to theo
+    theo_v = _width_aligned_value(row, right, "theo", wb)
+    if theo_v is not None:
+        logger.info(f"Using theo fallback for {right} width={width}: {theo_v}")
+    else:
+        logger.warning(f"Both limit and theo are None for {right} width={width}")
+    return theo_v
 
 def width_aligned_theoretical(row: pd.Series, right: str, width: float | None) -> float | None:
     """OPEN (BUY) theoretical debit for a given width bucket."""
@@ -843,25 +850,22 @@ def place_debit_spread(
     """
     # --- HARD CLOSE GUARD ---
     if has_working_auto_close(symbol):
-        # For force_close role (3pm preclose), cancel existing limit order ONLY if placing a market order
-        # Don't cancel if we're placing a limit order (Stage 1.5 with live mid-pricing)
+        # For force_close role: KEEP existing limit orders, don't cancel for market orders
+        # This prevents replacing working limits with market orders after-hours
         if role == "force_close" and order_type.upper() == "MKT":
-            logger.info("[%s] force_close: cancelling existing working CLOSE to replace with MKT", symbol)
+            logger.info("[%s] force_close: existing working CLOSE found - KEEPING limit order instead of replacing with MKT", symbol)
             try:
-                cxl_count = cancel_close_orders_for_symbol(ib, symbol)
-                logger.info("[%s] force_close: cancelled %d existing CLOSE order(s)", symbol, cxl_count)
                 record_attempt(
                     symbol,
                     "force_close",
-                    "placed",
-                    "cancel_existing_close_for_mkt",
+                    "skipped",
+                    "keeping_existing_limit_order_not_replacing_with_mkt",
                     exp=str(expiration),
                     right=right.upper(),
-                    cancelled=cxl_count,
                 )
-            except Exception as e:
-                logger.warning("[%s] force_close: failed to cancel existing CLOSE: %s", symbol, e)
-            # Proceed to place market order (don't return)
+            except Exception:
+                pass
+            return None  # Keep existing limit, don't place market order
         else:
             logger.info("[%s] close-guard: existing working AUTO_CLOSE; skipping.", symbol)
             try:
@@ -1865,7 +1869,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         df_csv["symbol"] = df_csv["symbol"].astype(str).map(_clean_symbol)
                     rows = df_csv[df_csv["symbol"].astype(str).str.upper() == symbol.upper()]
                     if not rows.empty:
-                        row = rows.iloc[0]
+                        row = rows.iloc[-1]  # Use LATEST row (aligns with DailyCycleManagement)
                         width = abs(float(longK) - float(shortK))
                         csv_limit = width_aligned_close_limit(row, right, width)
                         if csv_limit is not None:
@@ -1958,7 +1962,20 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         f"found within ±{tol_days}d. Continuing anyway (warn-only mode)."
                     )
 
-        order_type = "LMT" if (limit is not None) else "MKT"
+        # Don't place market orders when all pricing fallbacks fail
+        if limit is None:
+            logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
+            record_attempt(
+                symbol,
+                "force_close",
+                "skipped",
+                "no_viable_limit_all_fallbacks_failed",
+                exp=str(exp),
+                right=right.upper(),
+            )
+            continue  # Skip this spread, don't place market order
+
+        order_type = "LMT"  # Only place limit orders (market orders prevented above)
         ckey = _close_key(symbol, right, exp)
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
@@ -2288,6 +2305,36 @@ def run_from_csv():
     only = None
     if args.symbols:
         only = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+
+    # --- Handle force-close mode FIRST (CSV-independent, uses live pricing) ---
+    # This allows 3pm preclose to work even when today's CSV hasn't been created yet.
+    if args.mode == "force-close" and args.symbols:
+        logger.info(f"Force-close mode (CSV-independent): symbols={sorted(list(only))}")
+        ib = IB()
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=101)
+            ib.reqMarketDataType(4)
+            ib.reqPositions()
+            ib.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Failed to connect to IB: {e}")
+            return
+        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
+        for _sym in sorted(_syms_req):
+            if args.dry_run:
+                record_attempt(_sym, "force_close", "skipped", "dry_run_positions_only")
+            else:
+                n_fc = force_close_symbol_via_positions(ib, _sym, args)
+                if n_fc > 0:
+                    logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) from positions (CSV-independent).")
+        try:
+            _attempts_append(ATTEMPTS)
+        except Exception:
+            pass
+        ib.disconnect()
+        return
+
+    # For other modes (from-signal, call, put, all), CSV is required
     csv_path = combined_csv_path_for_today(args.date)
     logger.info(f"Loading combined CSV: {csv_path} | mode={args.mode} | qty={args.quantity} | symbols={sorted(list(only)) if only else 'ALL'}")
     try:
@@ -2410,25 +2457,10 @@ def run_from_csv():
         logger.error(f"Failed to connect to IB: {e}")
         return
 
-    # --- Positions-driven force-close for explicitly requested symbols (CSV-independent) ---
-    # This runs even if today's CSV has ZERO rows for the requested tickers (e.g., ABR missing).
-    if args.mode == "force-close" and args.symbols:
-        _syms_req = {s.strip().upper() for s in str(args.symbols).split(",") if s.strip()}
-        for _sym in sorted(_syms_req):
-            if args.dry_run:
-                # still write a diagnostic attempt so attempts CSV is created
-                record_attempt(_sym, "force_close", "skipped", "dry_run_positions_only")
-            else:
-                n_fc = force_close_symbol_via_positions(ib, _sym, args)
-                if n_fc > 0:
-                    logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) directly from positions (CSV-independent).")
-        # Early finalize & return for force-close runs (prevents any opens/extra scanning)
-        try:
-            _attempts_append(ATTEMPTS)
-        except Exception:
-            pass
-        ib.disconnect()
-        return
+    # NOTE: Force-close mode with --symbols is now handled earlier (before CSV loading)
+    # to allow 3pm preclose to work even when today's CSV hasn't been created yet.
+    # See line 2308+ for the CSV-independent force-close handling.
+
     # If this batch contains CLOSE signals, proactively cancel any pending BUY combo orders for those tickers
     if 'close_set' in locals() or 'close_mask' in locals():
         # Defensive: try to find the set of tickers flagged for CLOSE
@@ -2811,19 +2843,27 @@ def run_from_csv():
                                             closed_any = True
                                             placed += 1
                     if not closed_any:
-                        # Final fallback: close any detected spread(s) for this symbol via MARKET orders,
-                        # even if expiration/ATM are missing or mismatched.
+                        # Exact/approx match failed (likely expiration mismatch: CSV exp != position exp).
+                        # Do NOT fall back to market orders here — defer to Stage 1.5 (force-close --use-live-close mid)
+                        # or Stage 2 (force-close --use-live-close off), which scan positions directly and use
+                        # CSV pricing regardless of expiration via force_close_symbol_via_positions().
                         restrict = None
                         if stype == "CALL_CLOSE":
                             restrict = "call"
                         elif stype == "PUT_CLOSE":
                             restrict = "put"
-                        n_closed = 0 if args.dry_run else close_any_spread_for_symbol(ib, symbol, side=restrict, max_qty=args.quantity)
-                        if n_closed > 0:
-                            logger.info(f"[{symbol}] Fallback MARKET close placed for {n_closed} spread(s) via positions scan")
-                            placed += n_closed
-                        else:
-                            vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
+                        logger.info(f"[{symbol}] from-signal CLOSE: exact/approx match failed for exp {expiration} "
+                                    f"(stype={stype}, side={restrict}); deferring to force-close Stage 1.5/2")
+                        try:
+                            record_attempt(
+                                symbol,
+                                ("close_call" if restrict == "call" else "close_put" if restrict == "put" else "close"),
+                                "skipped",
+                                "from_signal_exp_mismatch_defer_to_force_close",
+                                exp=str(expiration),
+                            )
+                        except Exception:
+                            pass
                     continue
                 else:
                     vprint(args.verbose, f"[{symbol}] No usable signal_type in CSV (stype='{stype}'); skipping in from-signal mode.")
@@ -3052,15 +3092,27 @@ def run_from_csv():
                                            oth=float(k_call) if not pd.isna(k_call) else None, scope=args.oi_check)
                     if oi_ok:
                         wb = _width_bucket(w_call_open)
-                        ordered = [f"call_debit_limit_{wb}"] if wb else []
+                        # Build ordered list: limit columns first, then theo columns as fallback
+                        ordered_limit = [f"call_debit_limit_{wb}"] if wb else []
                         for alt in ("1","2_5","5"):
                             col = f"call_debit_limit_{alt}"
-                            if col not in ordered:
-                                ordered.append(col)
+                            if col not in ordered_limit:
+                                ordered_limit.append(col)
+
+                        ordered_theo = [f"call_debit_theo_{wb}"] if wb else []
+                        for alt in ("1","2_5","5"):
+                            col = f"call_debit_theo_{alt}"
+                            if col not in ordered_theo:
+                                ordered_theo.append(col)
+
+                        # Combined order: try all limits first, then all theos
+                        ordered = ordered_limit + ordered_theo
+
                         for kk in ordered:
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue
+                            logger.info(f"[{symbol}] CALL_OPEN using {kk}={lv}")
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] CALL OPEN fallback limit {symbol} {atm}/{k_call} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
@@ -3211,15 +3263,27 @@ def run_from_csv():
                                            oth=float(k_put) if not pd.isna(k_put) else None, scope=args.oi_check)
                     if oi_ok:
                         wb = _width_bucket(w_put_open)
-                        ordered = [f"put_debit_limit_{wb}"] if wb else []
+                        # Build ordered list: limit columns first, then theo columns as fallback
+                        ordered_limit = [f"put_debit_limit_{wb}"] if wb else []
                         for alt in ("1","2_5","5"):
                             col = f"put_debit_limit_{alt}"
-                            if col not in ordered:
-                                ordered.append(col)
+                            if col not in ordered_limit:
+                                ordered_limit.append(col)
+
+                        ordered_theo = [f"put_debit_theo_{wb}"] if wb else []
+                        for alt in ("1","2_5","5"):
+                            col = f"put_debit_theo_{alt}"
+                            if col not in ordered_theo:
+                                ordered_theo.append(col)
+
+                        # Combined order: try all limits first, then all theos
+                        ordered = ordered_limit + ordered_theo
+
                         for kk in ordered:
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue
+                            logger.info(f"[{symbol}] PUT_OPEN using {kk}={lv}")
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] PUT OPEN fallback limit {symbol} {atm}/{k_put} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyP); placed += 1

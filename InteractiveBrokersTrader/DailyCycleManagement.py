@@ -4,6 +4,7 @@ from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 import logging
 import csv, os, uuid
+from ib_close_guard import has_working_auto_close
 
 LOG = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
@@ -1212,14 +1213,18 @@ class DailyCycleManagementMixin:
                 else:
                     bucket = "5"
                 # Try limit columns first, then theo
-                prefix = "call_debit" if right.upper() == "C" else "put_debit"
+                prefix = "call_debit" if right.upper().startswith("C") else "put_debit"
+                LOG.debug("[%s] _get_theo_limit: right=%s, width=%s, bucket=%s, prefix=%s", up, right, width, bucket, prefix)
                 for kind in ("limit", "theo"):
                     col = f"{prefix}_{kind}_{bucket}"
+                    LOG.debug("[%s] _get_theo_limit: trying column %s, exists=%s", up, col, col in df.columns)
                     if col in df.columns:
                         try:
                             v = row[col]
+                            LOG.debug("[%s] _get_theo_limit: %s raw value=%s, notna=%s", up, col, v, pd.notna(v))
                             if pd.notna(v):
                                 v = float(v)
+                                LOG.debug("[%s] _get_theo_limit: %s float value=%s, valid=%s", up, col, v, v > 0)
                                 if v > 0:
                                     LOG.info("direct-close: found theo limit for %s %s width=%s: %s from col %s", up, right, width, v, col)
                                     return round(v, 2)
@@ -1257,6 +1262,11 @@ class DailyCycleManagementMixin:
 
             # Helper to place a combo close
             def _place_combo(right: str, low: float, high: float, longConId: int, shortConId: int, is_long_vertical: bool) -> bool:
+                # Guard: Check for existing working orders before placing
+                if has_working_auto_close(up):
+                    LOG.info("direct-close: existing working CLOSE found for %s - skipping duplicate order placement", up)
+                    return False  # Skip placing order, already have working order
+
                 try:
                     bag = Contract()
                     bag.symbol = up

@@ -415,6 +415,69 @@ def _parse_signal_fields(message: str | None) -> Dict[str, object]:
     return result
 
 
+def _get_position_for_symbol(ib: IB, symbol: str) -> dict | None:
+    """
+    Look up held option positions for a symbol.
+    Returns dict with {expiration, atm_strike, right, width, strikes_all} or None if no position.
+    Used by get_option_data() to price CLOSE signals based on actual held positions.
+    """
+    try:
+        if not ib.isConnected():
+            return None
+        ib.reqPositions()
+        ib.sleep(0.3)
+        positions = list(ib.positions())
+
+        # Find option positions for this symbol
+        opts = []
+        for p in positions:
+            c = p.contract
+            if getattr(c, 'symbol', '').upper() == symbol.upper() and getattr(c, 'secType', '') == 'OPT':
+                opts.append({
+                    'expiration': getattr(c, 'lastTradeDateOrContractMonth', ''),
+                    'strike': getattr(c, 'strike', 0),
+                    'right': getattr(c, 'right', ''),  # C or P
+                    'qty': p.position,
+                })
+
+        if not opts:
+            return None
+
+        # Group by expiration and right to find spread structure
+        # Long leg (qty > 0) is ATM, short leg (qty < 0) is OTM
+        long_legs = [o for o in opts if o['qty'] > 0]
+        short_legs = [o for o in opts if o['qty'] < 0]
+
+        if not long_legs:
+            return None
+
+        # Use first long leg as ATM
+        atm = long_legs[0]
+        width = None
+        otm_strike = None
+        if short_legs:
+            # Find short leg with same right and expiration
+            matching_short = [s for s in short_legs if s['right'] == atm['right'] and s['expiration'] == atm['expiration']]
+            if matching_short:
+                otm_strike = matching_short[0]['strike']
+                width = abs(atm['strike'] - otm_strike)
+
+        # Collect all strikes from position for reference
+        strikes_all = sorted(set(o['strike'] for o in opts))
+
+        return {
+            'expiration': atm['expiration'],
+            'atm_strike': atm['strike'],
+            'otm_strike': otm_strike,
+            'right': atm['right'],
+            'width': width or 1.0,  # Default to $1 if can't determine
+            'strikes_all': strikes_all,
+        }
+    except Exception as e:
+        logger.warning(f"Position lookup failed for {symbol}: {e}")
+        return None
+
+
 def _dated_dir() -> Path:
     try:
         now_ny = datetime.now(ZoneInfo("America/New_York"))
@@ -662,7 +725,7 @@ def _safe_cancel_md(t):
     except Exception:
         pass
 
-def get_option_data(symbol: str, width: int = 5):
+def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
     symbol = _clean_symbol(symbol)
     ib = IB_SHARED
@@ -672,6 +735,14 @@ def get_option_data(symbol: str, width: int = 5):
         _ensure_ib_connected(ib, mkt_type=_preferred_md_type())
     except Exception as exc:
         logger.warning(f"IB connect failed (will attempt theo-only later if needed): {exc}")
+
+    # For CLOSE signals, try to use actual position's strikes/expiration
+    # This ensures we price the ACTUAL held spread, not a hypothetical new one
+    position_info = None
+    if signal_type == "CLOSE":
+        position_info = _get_position_for_symbol(ib, symbol)
+        if position_info:
+            logger.info(f"[CLOSE] Using position data for {symbol}: exp={position_info['expiration']}, atm={position_info['atm_strike']}, right={position_info['right']}, width={position_info.get('width')}")
 
     # Define the stock and try to get a current price; fall back to historical with polling first
     stage = "stock_price"
@@ -773,10 +844,15 @@ def get_option_data(symbol: str, width: int = 5):
         multiplier = multipliers[0] if multipliers else None
 
         # Choose expiry nearest to 30 calendar days (or fallback)
+        # For CLOSE signals with position data, use the position's expiration
         stage = "pick_expiry"
         target_date = datetime.now().date()
         expiry_str = None
-        if expirations:
+        if position_info and position_info.get('expiration'):
+            # Use actual position's expiration for CLOSE signals
+            expiry_str = position_info['expiration']
+            logger.info(f"[CLOSE] Using position expiration: {expiry_str}")
+        elif expirations:
             exps = []
             for d in expirations:
                 try:
@@ -797,8 +873,21 @@ def get_option_data(symbol: str, width: int = 5):
             expiry_str = _fallback_expiration_str(TARGET_DTE)
 
         # Choose ATM strike from available strikes (closest to current_price)
+        # For CLOSE signals with position data, use the position's actual strikes
         stage = "pick_strikes"
-        if not strikes_all:
+        if position_info and position_info.get('atm_strike'):
+            # Use actual position's strikes for CLOSE signals
+            atm_strike = position_info['atm_strike']
+            pos_width = position_info.get('width') or 1.0
+            pos_right = position_info.get('right', 'C')
+            if position_info.get('otm_strike'):
+                otm_strike = position_info['otm_strike']
+            elif pos_right == 'C':
+                otm_strike = atm_strike + pos_width
+            else:  # PUT
+                otm_strike = atm_strike - pos_width
+            logger.info(f"[CLOSE] Using position strikes: ATM={atm_strike}, OTM={otm_strike}, right={pos_right}")
+        elif not strikes_all:
             atm_strike = round(current_price)
             otm_strike = atm_strike + 1  # placeholder for width; real quote-based widths below may adjust
         else:
@@ -852,7 +941,13 @@ def get_option_data(symbol: str, width: int = 5):
 
         # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
         stage = "qualify_put_options"
-        put_otm_strike = _next_lower_existing(strikes_all, atm_strike) if strikes_all else max(atm_strike - 1, 0.01)
+        # For CLOSE signals with PUT position, use actual position's OTM strike
+        if position_info and position_info.get('right') == 'P' and position_info.get('otm_strike'):
+            put_otm_strike = position_info['otm_strike']
+        elif strikes_all:
+            put_otm_strike = _next_lower_existing(strikes_all, atm_strike)
+        else:
+            put_otm_strike = max(atm_strike - 1, 0.01)
         put_legs_info = []
         for strike, right in ((atm_strike, 'P'), (put_otm_strike, 'P')):
             try:
@@ -1136,7 +1231,7 @@ def signal_text():
     if not symbol:
         return _fail("payload", "ticker missing and could not extract from text", 400)
     sig = _parse_signal_fields(raw_text)
-    result = get_option_data(symbol)
+    result = get_option_data(symbol, signal_type=sig.get("signal_type"))
     if not result or result.get("_error"):
         return jsonify({
             "_error": True,
@@ -1163,7 +1258,7 @@ def signal_generic():
     if not symbol:
         return _fail("payload", "ticker missing (and text did not contain an extractable ticker)", 400)
     sig = _parse_signal_fields(raw_text)
-    result = get_option_data(symbol)
+    result = get_option_data(symbol, signal_type=sig.get("signal_type"))
     if not result or result.get("_error"):
         return jsonify({
             "_error": True,
@@ -1191,7 +1286,7 @@ def webhook():
     if not symbol:
         return _fail("payload", "ticker missing from payload and not found in text", 400)
     sig = _parse_signal_fields(msg)
-    result = get_option_data(symbol)
+    result = get_option_data(symbol, signal_type=sig.get("signal_type"))
     if not result or result.get("_error"):
         # bubble up stage & detail if available, but do not fail the HTTP call
         msg = (result or {}).get("detail", "unable to retrieve option data")
@@ -1251,7 +1346,7 @@ def webhook_batch():
         if not tick:
             continue
         sig = _parse_signal_fields(msg)
-        res = get_option_data(tick)
+        res = get_option_data(tick, signal_type=sig.get("signal_type") if sig else None)
         if not res or res.get("_error"):
             results.append({"symbol": tick or item, "error": (res or {}).get("detail", "unknown")})
             try:

@@ -1,0 +1,505 @@
+# Options Trading System - Architecture & Bug Fixes
+
+## Overview
+
+This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
+
+**Last Updated:** February 6, 2026
+
+---
+
+## System Architecture
+
+### Core Components
+
+1. **DailyCycleManagement.py**
+   - Orchestrates daily trading cycles (after-hours, preclose, RTH risk exits)
+   - Delegates to PlaceAnOrder.py for actual order placement
+   - Manages multi-stage close logic with pricing fallbacks
+
+2. **PlaceAnOrder.py**
+   - Core order placement logic
+   - Handles from-signal mode (CSV-driven) and force-close mode (position-driven)
+   - Implements pricing fallback chains for limit orders
+   - Contains CALL_OPEN, PUT_OPEN, and CLOSE handlers
+
+3. **ib_close_guard.py**
+   - Prevents duplicate order placement
+   - Checks for existing working close orders via ib_insync
+
+### Trading Cycles
+
+#### After-Hours Cycle (5:00 PM)
+- Triggered via `_after_hours_batch_placement()`
+- Opens new positions from CSV signals (CALL_OPEN, PUT_OPEN)
+- Closes positions via multi-stage delegation
+
+#### Preclose Cycle (3:00 PM)
+- Triggered via `_pre_close_market_conversion()`
+- Converts stubborn unfilled limit orders to market orders (during market hours)
+- Cancels existing limit orders and re-places with live pricing
+
+#### RTH Risk Exits (9:30 AM)
+- Triggered at market open
+- Force-closes high-risk positions
+- Uses live pricing (market is open)
+
+---
+
+## Multi-Stage Close Architecture
+
+**Location:** `DailyCycleManagement._delegate_close_from_csvs_within()`
+
+### Stage 1: from-signal CLOSE (CSV-driven)
+- Uses exact expiration + strike matching
+- Falls back to approximate matching (±7 days)
+- **FIX F APPLIED:** Skips instead of placing MARKET when no match found
+
+### Stage 1.5: force-close with live pricing
+- Triggered after Stage 1 completes
+- Uses `force_close_symbol_via_positions()` with `--use-live-close mid`
+- Scans positions by symbol (ignores expiration mismatch)
+- After-hours: Fails (market closed, no live quotes)
+- During market hours (preclose): Works correctly
+
+### Stage 2: force-close with CSV pricing
+- Triggered after Stage 1.5 completes
+- Uses `force_close_symbol_via_positions()` with `--use-live-close off`
+- Pricing fallback chain:
+  1. Live quotes (fails after-hours)
+  2. CSV theo limits (symbol-only lookup)
+  3. Stale position market prices (10% buffered)
+  4. **FIX C APPLIED:** Skips if all fail (no MARKET fallback)
+
+---
+
+## Pricing Fallback Logic
+
+### CLOSE Orders
+
+**Function:** `force_close_symbol_via_positions()` at PlaceAnOrder.py:1812-1978
+
+**Fallback Chain:**
+1. **Live Quotes** (lines 1834-1856)
+   - Uses `live_spread_price()` with `--use-live-close` scheme (mid/join/off)
+   - Fails after-hours (market closed)
+
+2. **CSV Theoretical Limits** (lines 1862-1883)
+   - Symbol-only lookup (no expiration filter)
+   - Uses `width_aligned_close_limit()` function
+   - Tries `call_debit_limit_*` or `put_debit_limit_*` first
+   - Falls back to `call_debit_theo_*` or `put_debit_theo_*`
+   - Applies 10% buffer: `limit * 0.90`
+   - Checks min_limit (0.05 or 0.01 for preclose)
+
+3. **Stale Position Prices** (lines 1881-1936)
+   - Uses IB portfolio position market values
+   - Applies 10% buffer: `stale_price * 0.90`
+   - Checks min_limit
+
+4. **Skip Order (FIX C)** (lines 1965-1976)
+   - If all pricing fails, skip instead of MARKET
+   - Records reason: `no_viable_limit_all_fallbacks_failed`
+   - Position carried to next trading day
+
+### OPEN Orders
+
+**Function:** CALL_OPEN handler at PlaceAnOrder.py:2639-3184, PUT_OPEN at 2667-3342
+
+**Pricing Logic:**
+- Tries limit columns first: `call_debit_limit_1`, `call_debit_limit_2_5`, `call_debit_limit_5`
+- **FIX D APPLIED:** Falls back to theo columns: `call_debit_theo_1`, `call_debit_theo_2_5`, `call_debit_theo_5`
+- Uses `enforce_min_limit()` to validate pricing
+- Skips with `no_viable_limit_or_conditions` if no valid pricing
+
+---
+
+## Bug Fixes Implemented
+
+### Fix A: Consistent Row Selection (Jan 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:1872
+
+**Issue:** Inconsistent CSV row selection when duplicates exist
+- DailyCycleManagement used `.iloc[-1]` (last row)
+- PlaceAnOrder used `.iloc[0]` (first row)
+
+**Fix:** Changed PlaceAnOrder to use `.iloc[-1]` for consistency
+
+**Impact:** Uses latest CSV data when symbol appears multiple times
+
+---
+
+### Fix B: Enhanced Logging (Jan 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:598-601 (width_aligned_close_limit function)
+
+**Issue:** Insufficient visibility into theo fallback behavior
+
+**Fix:** Added logging:
+- `Using theo fallback for {right} width={width}: {theo_v}` when theo used
+- `Both limit and theo are None for {right} width={width}` when both fail
+
+**Impact:** Better diagnostics for pricing failures
+
+---
+
+### Fix C: Skip When All Pricing Fails (Jan 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:1965-1976 (force_close_symbol_via_positions)
+
+**Issue:** Placed MARKET orders when all limit pricing fallbacks failed
+
+**Fix:**
+```python
+if limit is None:
+    logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order")
+    record_attempt(
+        symbol, "force_close", "skipped",
+        "no_viable_limit_all_fallbacks_failed",
+        exp=str(exp), right=right.upper(),
+    )
+    continue  # Skip this spread, don't place market order
+
+order_type = "LMT"  # Only place limit orders
+```
+
+**Impact:** Prevents bad market fills when pricing unavailable; position carried to next day
+
+---
+
+### Fix D: Theo Fallback for OPEN Orders (Jan 29)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:3071-3107 (CALL_OPEN), 3230-3268 (PUT_OPEN)
+
+**Issue:** OPEN orders skipped when CSV had theo values but no limit values
+
+**Fix:** Extended column search to include theo columns after limit columns
+
+**Impact:** OPEN orders now use theo values as fallback, matching CLOSE order behavior
+
+---
+
+### Fix F: Remove MARKET Fallback from from-signal CLOSE (Feb 3)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:2830-2844
+
+**Issue:** from-signal CLOSE handler called `close_any_spread_for_symbol()` when expiration mismatch occurred, which ALWAYS places MARKET orders (hardcoded at line 1755)
+
+**Root Cause:**
+```python
+# OLD CODE (REMOVED)
+if not closed_any:
+    n_closed = close_any_spread_for_symbol(ib, symbol, side=restrict, max_qty=args.quantity)
+    # This function has: order_type="MKT" hardcoded at line 1755
+```
+
+**Fix:**
+```python
+# NEW CODE
+if not closed_any:
+    # Defer to Stage 1.5/2 which use force_close_symbol_via_positions()
+    logger.info(f"[{symbol}] from-signal CLOSE: exact/approx match failed for exp {expiration}; deferring to force-close Stage 1.5/2")
+    record_attempt(symbol, "close", "skipped", "from_signal_exp_mismatch_defer_to_force_close", exp=str(expiration))
+continue
+```
+
+**Impact:**
+- Prevents MARKET orders from Stage 1 when CSV expiration doesn't match position expiration
+- Stage 1.5/2 handle these positions with proper pricing fallbacks
+- All 7 market orders on Feb 2-3 were from this bug
+
+---
+
+### Fix H: CSV-Independent Force-Close Mode (Feb 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:2305-2331
+
+**Issue:** Force-close mode with `--symbols` failed when today's CSV didn't exist, even though force-close is designed to be CSV-independent and uses live pricing.
+
+**Root Cause:**
+```python
+# OLD CODE - CSV loading happened BEFORE force-close handling
+csv_path = combined_csv_path_for_today(args.date)
+try:
+    df = pd.read_csv(csv_path)
+except FileNotFoundError:
+    logger.error(f"Combined CSV not found: {csv_path}")
+    return  # <-- BUG: exits before reaching force-close logic at line 2432
+```
+
+The CSV-independent force-close code at lines 2430-2448 was never reached because the CSV check happened first and exited early.
+
+**Fix:**
+```python
+# NEW CODE - Force-close with --symbols is handled FIRST
+if args.mode == "force-close" and args.symbols:
+    logger.info(f"Force-close mode (CSV-independent): symbols={sorted(list(only))}")
+    ib = IB()
+    ib.connect('127.0.0.1', 7497, clientId=101)
+    # ... process symbols using live pricing
+    return
+
+# For other modes, require CSV
+csv_path = combined_csv_path_for_today(args.date)
+# ...
+```
+
+**Impact:**
+- 3pm preclose now works even when today's CSV hasn't been created yet
+- Force-close uses live pricing from IB instead of requiring CSV
+- Attempts are properly logged even without CSV
+
+---
+
+### Fix I: Position-Aware CLOSE Signal Pricing (Feb 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py:418-474 (_get_position_for_symbol), listener.py:728-950 (get_option_data)
+
+**Issue:** When a CLOSE signal was received, listener.py populated the CSV with limit prices for **new hypothetical spreads** based on current stock price and ~30 DTE, instead of the **actual held position's strikes and expiration**. This made CSV limit prices useless for closing existing positions.
+
+**Root Cause:**
+```python
+# OLD CODE - get_option_data() ignored signal type
+def get_option_data(symbol: str, width: int = 5):
+    # Always calculated NEW strikes based on current price
+    atm_strike = _closest_existing(strikes_all, current_price)
+    # Always used ~30 DTE expiration
+    expiry_str = min(valid, key=lambda t: abs(t[1] - TARGET_DTE))[0]
+```
+
+**Fix:**
+```python
+# NEW CODE - get_option_data() checks signal type and uses position data for CLOSE
+def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
+    # For CLOSE signals, look up actual held position
+    if signal_type == "CLOSE":
+        position_info = _get_position_for_symbol(ib, symbol)
+        if position_info:
+            # Use position's actual expiration and strikes
+            expiry_str = position_info['expiration']
+            atm_strike = position_info['atm_strike']
+            # ...
+```
+
+**Helper function added:**
+- `_get_position_for_symbol(ib, symbol)` - Queries IB positions and returns actual expiration, strikes, right (C/P), and width for the held spread
+
+**Impact:**
+- CLOSE signals now generate CSV rows with prices for the ACTUAL held spread
+- PlaceAnOrder.py can use CSV theo prices as reliable fallback for after-hours closes
+- Falls back to current behavior if no position found for the symbol
+
+---
+
+## Operational Issues
+
+### Preclose Scheduler (Feb 4-5, 2026)
+
+**Issue:** ~~3pm preclose cycle did not run on Feb 4 or Feb 5~~ **RESOLVED (Feb 6)**
+
+The scheduled task WAS running correctly. The actual issue was Fix H above - force-close mode required CSV to exist.
+
+**Evidence from Feb 5 logs:**
+```
+2026-02-05 15:00:56 Launching PlaceAnOrder: --mode force-close --symbols PCG --use-live-close mid
+2026-02-05 15:01:00 [ERROR] Combined CSV not found: C:\OptionsHistory\26_02_05\combined_listener_spreads.csv
+```
+
+The preclose ran but PlaceAnOrder.py exited early before reaching the force-close logic.
+
+**Resolution:** Fix H (above) makes force-close mode CSV-independent.
+
+---
+
+## Key Design Principles
+
+### 1. Latest-Signal-Wins Policy
+- When opposite-side signal received (CALL_OPEN when holding PUT), system closes existing position first
+- Cancels working close orders to prevent conflicts
+- Uses market orders for opposite-side unwinding (design decision)
+
+### 2. Expiration Mismatch Handling
+- CSV may have newer expirations than held positions (strategy rolled, positions lagging)
+- System uses symbol-only CSV lookup (ignores expiration)
+- Positions at any expiration can be closed using CSV pricing for current signal
+
+### 3. Limit-First, Theo-Fallback
+- CLOSE orders: Try `*_limit_*` columns first, fall back to `*_theo_*` columns
+- OPEN orders: Same logic (after Fix D)
+- 10% buffer applied to make limit more likely to fill
+
+### 4. Never Place Market Orders After-Hours
+- Market is closed - fills are terrible
+- Use limit orders with aggressive pricing (10% buffer)
+- If limit doesn't fill, next day's preclose converts to market (during market hours with live pricing)
+
+---
+
+## Critical Functions
+
+### `force_close_symbol_via_positions()`
+**Location:** PlaceAnOrder.py:1812-1978
+
+**Purpose:** Close all spreads for a symbol using position scan + pricing fallbacks
+
+**Key Features:**
+- Scans positions by symbol (no expiration filter)
+- Tries 3 pricing sources: live → CSV → stale
+- Fix C: Skips if all pricing fails (no MARKET)
+- Records detailed attempt reasons for diagnostics
+
+### `close_any_spread_for_symbol()`
+**Location:** PlaceAnOrder.py:1663-1762
+
+**Purpose:** DEPRECATED - Close spreads using MARKET orders
+
+**Issues:**
+- Hardcoded `order_type="MKT"` at line 1755
+- No limit pricing attempted
+- Used by OPEN handlers for opposite-side unwinding (Fix G addresses this)
+
+**Status:** Should NOT be used for any new code; being replaced by force_close_symbol_via_positions()
+
+### `width_aligned_close_limit()`
+**Location:** PlaceAnOrder.py:587-602
+
+**Purpose:** Get limit price from CSV for CLOSE orders
+
+**Logic:**
+1. Determine width bucket: 1.0 → "1", 2.5 → "2_5", 5.0 → "5"
+2. Try `{call|put}_debit_limit_{bucket}` column
+3. Fall back to `{call|put}_debit_theo_{bucket}` column (Fix B logs this)
+4. Return None if both fail
+
+---
+
+## CSV Structure
+
+### combined_listener_spreads.csv Columns
+
+**Signal Columns:**
+- `symbol`: Stock ticker
+- `signal_type`: CALL_OPEN, PUT_OPEN, CLOSE, CALL_CLOSE, PUT_CLOSE
+- `strategy_position`: +1 (CALL_OPEN), -1 (PUT_OPEN), 0 (CLOSE)
+- `expiration`: YYYYMMDD format
+- `atm`: At-the-money strike price
+
+**Pricing Columns (CLOSE):**
+- `call_debit_limit`, `call_debit_limit_1`, `call_debit_limit_2_5`, `call_debit_limit_5`
+- `put_debit_limit`, `put_debit_limit_1`, `put_debit_limit_2_5`, `put_debit_limit_5`
+- `call_debit_theo`, `call_debit_theo_1`, `call_debit_theo_2_5`, `call_debit_theo_5`
+- `put_debit_theo`, `put_debit_theo_1`, `put_debit_theo_2_5`, `put_debit_theo_5`
+
+**Pricing Columns (OPEN):**
+- Same structure as CLOSE
+- Used for BUY debit spreads (opening positions)
+
+**Width Buckets:**
+- `_1`: $1 width spreads
+- `_2_5`: $2.50 width spreads
+- `_5`: $5 width spreads
+
+---
+
+## Testing & Verification
+
+### After-Hours Cycle Verification (5:00 PM)
+
+**Check logs for:**
+1. `from_signal_exp_mismatch_defer_to_force_close` in attempts CSV (Fix F working)
+2. `force_close,<exp>,SELL,LMT,1,success` (limit orders placed, not MARKET)
+3. `no_viable_limit_all_fallbacks_failed` (Fix C working - skipping instead of MARKET)
+4. `Using theo fallback for` in ib_cycle.log (Fix B logging, Fix D working for OPEN)
+
+**Should NOT see:**
+- `force_close,<exp>,SELL,MKT,1,success` from Stage 1 (Fix F prevents this)
+- `opposite_unwind_before_open` with MKT orders (Fix G will prevent this)
+
+### Preclose Verification (3:00 PM)
+
+**Check logs for:**
+1. `preclose_cancel_existing_close` in attempts CSV (cancelling unfilled limits)
+2. New LMT orders placed with live pricing (market is open)
+3. DailyCycleManagement session log exists for 3pm run
+
+---
+
+## Common Issues & Diagnostics
+
+### Market Orders Still Being Placed
+
+**Check:**
+1. Which stage? Look at timestamp in attempts CSV
+2. What reason? Check `reason` column in attempts CSV
+3. From CLOSE handler? Should see `from_signal_exp_mismatch_defer_to_force_close` skip
+4. From OPEN handler? May be opposite-side unwind (Fix G needed)
+
+**Diagnostic Commands:**
+```bash
+# Check for market orders in attempts CSV
+grep "MKT.*success" C:\OptionsHistory\26_XX_XX\attempts_26_XX_XX.csv
+
+# Check for Fix F working (should see skips, not MKT)
+grep "from_signal_exp_mismatch_defer_to_force_close" C:\OptionsHistory\26_XX_XX\attempts_26_XX_XX.csv
+
+# Check for Fix C working (should see skips when pricing fails)
+grep "no_viable_limit_all_fallbacks_failed" C:\OptionsHistory\26_XX_XX\attempts_26_XX_XX.csv
+```
+
+### Positions Not Closing
+
+**Check:**
+1. Preclose running? Check for DailyCycleManagement logs at 3pm
+2. CSV expiration vs position expiration? May have mismatch
+3. CSV pricing available? Check limit and theo columns in CSV
+4. Working orders already exist? Check TWS or ib_close_guard
+
+### Duplicate Orders
+
+**Check:**
+1. `ib_close_guard.has_working_auto_close()` called before placement?
+2. Stage 2 running multiple times? Check DailyCycleManagement logic
+3. Menu option 8 used? Guard added (Jan 26) should prevent duplicates
+
+---
+
+## Future Improvements
+
+### 1. Implement Fix G (Priority: HIGH)
+Replace `close_any_spread_for_symbol()` calls in OPEN handlers with limit-based close logic
+
+### 2. Add Preclose Monitoring (Priority: HIGH)
+Implement alerting when scheduled cycles don't run
+
+### 3. Expiration Reconciliation (Priority: MEDIUM)
+Add warnings when CSV expiration doesn't match position expiration
+
+### 4. Enhanced Diagnostics (Priority: MEDIUM)
+Add more detailed logging for pricing fallback decisions
+
+### 5. Automated Testing (Priority: LOW)
+Create test cases for pricing fallback scenarios
+
+---
+
+## Contact & References
+
+**Plan Files (Detailed Investigation Logs):**
+- `C:\Users\Administrator\.claude\plans\splendid-chasing-kernighan.md` - Main investigation (Jan 23-27, Feb 4-5)
+- `C:\Users\Administrator\.claude\plans\splendid-chasing-kernighan-jan29.md` - Fix D (OPEN theo fallback)
+- `C:\Users\Administrator\.claude\plans\feb2-all-market-orders.md` - Feb 2-3 market orders investigation
+
+**Key Files:**
+- `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\PlaceAnOrder.py`
+- `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\DailyCycleManagement.py`
+- `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
+
+**Last Updated:** February 6, 2026 by Claude (Sonnet 4.5)
