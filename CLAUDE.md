@@ -460,6 +460,39 @@ _AttemptLogger.write(
 
 ---
 
+### Fix R: Secdef Retry with Backoff (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py:164-210 (`_collect_secdef`)
+
+**Issue:** AMZN CALL_OPEN signal on 2/6/2026 was skipped because `_collect_secdef()` returned empty strikes list:
+1. No retry logic, only 250ms delay
+2. Without strikes list, ATM was guessed as `round(209.01) = 209` (doesn't exist!)
+3. OTM was guessed as `209 + 5 = 214` (also doesn't exist!)
+4. AMZN actual strikes are 205, 210, 215, 220... (5-wide spacing)
+5. IB contract qualification failed → order skipped with `no_viable_limit_or_conditions`
+
+**Fix:** Added retry with exponential backoff:
+```python
+def _collect_secdef(ib: IB, symbol: str, con_id: int, max_retries: int = 3):
+    delays = [0.5, 1.0, 2.0]  # Exponential backoff
+    for attempt in range(max_retries):
+        params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
+        ib.sleep(delays[attempt])
+        # ... parse params ...
+        if strikes_all:
+            return expirations, strikes_all, trading_classes, multipliers
+        # Log and retry if no strikes
+    return expirations, [], trading_classes, multipliers
+```
+
+**Impact:**
+- Retries up to 3 times with 0.5s, 1.0s, 2.0s delays
+- Logs warning on retry and final failure
+- Should resolve AMZN and other high-priced stocks with 5-wide strike spacing
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -680,4 +713,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 7, 2026 by Claude (Opus 4.5) - Added Fix P (dual IV theo pricing), Fix Q (low-OI cancellation enhancements)
+**Last Updated:** February 7, 2026 by Claude (Opus 4.5) - Added Fix P (dual IV theo pricing), Fix Q (low-OI cancellation enhancements), Fix R (secdef retry with backoff)

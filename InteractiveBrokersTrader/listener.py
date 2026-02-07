@@ -161,31 +161,52 @@ def _fallback_expiration_str(days: int = 30) -> str:
 from typing import Iterable
 _EXCHANGE_TRY_ORDER: tuple[str, ...] = ('SMART','BOX','CBOE','ISE','NASDAQOM','PHLX','BATS','AMEX')
 
-def _collect_secdef(ib: IB, symbol: str, con_id: int) -> tuple[list[str], list[float], list[str], list[str]]:
+def _collect_secdef(ib: IB, symbol: str, con_id: int, max_retries: int = 3) -> tuple[list[str], list[float], list[str], list[str]]:
     """
     Returns (expirations, strikes, tradingClasses, multipliers) from reqSecDefOptParams.
+    Retries with exponential backoff if strikes list is empty.
     """
-    params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
-    ib.sleep(0.25)
-    expirations: list[str] = []
-    strikes_all: list[float] = []
-    trading_classes: list[str] = []
-    multipliers: list[str] = []
-    for p in params:
-        if getattr(p, 'expirations', None):
-            expirations.extend(p.expirations)
-        if getattr(p, 'strikes', None):
-            strikes_all.extend([float(s) for s in p.strikes if s])
-        tc = getattr(p, 'tradingClass', None)
-        if tc:
-            trading_classes.append(tc)
-        mul = getattr(p, 'multiplier', None)
-        if mul:
-            multipliers.append(str(mul))
-    expirations = sorted(set(expirations))
-    strikes_all = sorted({s for s in strikes_all if s > 0})
-    trading_classes = sorted(set([t for t in trading_classes if t]))
-    multipliers = sorted(set([m for m in multipliers if m]))
+    delays = [0.5, 1.0, 2.0]  # Exponential backoff delays
+
+    for attempt in range(max_retries):
+        params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
+        delay = delays[attempt] if attempt < len(delays) else delays[-1]
+        ib.sleep(delay)
+
+        expirations: list[str] = []
+        strikes_all: list[float] = []
+        trading_classes: list[str] = []
+        multipliers: list[str] = []
+
+        for p in params:
+            if getattr(p, 'expirations', None):
+                expirations.extend(p.expirations)
+            if getattr(p, 'strikes', None):
+                strikes_all.extend([float(s) for s in p.strikes if s])
+            tc = getattr(p, 'tradingClass', None)
+            if tc:
+                trading_classes.append(tc)
+            mul = getattr(p, 'multiplier', None)
+            if mul:
+                multipliers.append(str(mul))
+
+        expirations = sorted(set(expirations))
+        strikes_all = sorted({s for s in strikes_all if s > 0})
+        trading_classes = sorted(set([t for t in trading_classes if t]))
+        multipliers = sorted(set([m for m in multipliers if m]))
+
+        # Success if we got strikes
+        if strikes_all:
+            if attempt > 0:
+                logger.info(f"[SECDEF] {symbol}: got {len(strikes_all)} strikes on attempt {attempt + 1}")
+            return expirations, list(strikes_all), trading_classes, multipliers
+
+        # Log retry
+        if attempt < max_retries - 1:
+            logger.warning(f"[SECDEF] {symbol}: no strikes on attempt {attempt + 1}, retrying in {delays[attempt + 1] if attempt + 1 < len(delays) else delays[-1]}s...")
+
+    # All retries exhausted - log and return empty
+    logger.warning(f"[SECDEF] {symbol}: no strikes after {max_retries} attempts")
     return expirations, list(strikes_all), trading_classes, multipliers
 
 def _pick_preferred_tc(symbol: str, tcs: Iterable[str]) -> str | None:
