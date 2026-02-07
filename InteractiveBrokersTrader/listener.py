@@ -621,6 +621,31 @@ def _append_csv_row(row: dict):
         w.writerow(rounded_row)
     logger.info(f"[CSV] Appended row to {out_csv}")
 
+def _prefer_theo_if_stale(quote_val, theo_val, symbol: str, label: str):
+    """If theo is <50% of quote, quote is likely stale/inflated. Use theo instead.
+
+    This catches after-hours wide bid-ask spreads where the quote is unrealistically high.
+    Example: BSY after-hours has quote=$1.30 (ask-bid from stale prices) but theo=$0.0
+    (Black-Scholes correctly says worthless). Since 0.0 < 1.30*0.5, we use theo.
+
+    Returns the preferred value (quote or theo).
+    """
+    if quote_val is None or _is_nan(quote_val):
+        return theo_val
+    if theo_val is None or _is_nan(theo_val):
+        return quote_val
+    try:
+        q = float(quote_val)
+        t = float(theo_val)
+    except Exception:
+        return quote_val
+    # If theo is significantly lower (< 50% of quote), quote is stale
+    if q > 0 and t < q * 0.5:
+        logger.info(f"[{symbol}] {label}: quote={q:.2f} appears stale (theo={t:.2f}). Using theo.")
+        return t
+    return q
+
+
 def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object] | None = None):
     """
     Normalize fields and append a row to combined dated CSV with quote-based and theoretical $1/$2.5/$5 spreads."
@@ -684,12 +709,19 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         "iv_otm": None if _is_nan(iv_otm) else iv_otm,
         "call_debit_limit": call_debit_q,
         "put_debit_limit":  put_debit_q,
-        "call_debit_limit_1": result.get("call_debit_limit_1"),
-        "put_debit_limit_1":  result.get("put_debit_limit_1"),
-        "call_debit_limit_2_5": result.get("call_debit_limit_2_5"),
-        "put_debit_limit_2_5":  result.get("put_debit_limit_2_5"),
-        "call_debit_limit_5": result.get("call_debit_limit_5"),
-        "put_debit_limit_5":  result.get("put_debit_limit_5"),
+        # Use theo if quote appears stale (theo << quote, e.g., after-hours wide spreads)
+        "call_debit_limit_1": _prefer_theo_if_stale(
+            result.get("call_debit_limit_1"), (theo or {}).get("call_debit_theo_1"), symbol, "call_limit_1"),
+        "put_debit_limit_1": _prefer_theo_if_stale(
+            result.get("put_debit_limit_1"), (theo or {}).get("put_debit_theo_1"), symbol, "put_limit_1"),
+        "call_debit_limit_2_5": _prefer_theo_if_stale(
+            result.get("call_debit_limit_2_5"), (theo or {}).get("call_debit_theo_2_5"), symbol, "call_limit_2_5"),
+        "put_debit_limit_2_5": _prefer_theo_if_stale(
+            result.get("put_debit_limit_2_5"), (theo or {}).get("put_debit_theo_2_5"), symbol, "put_limit_2_5"),
+        "call_debit_limit_5": _prefer_theo_if_stale(
+            result.get("call_debit_limit_5"), (theo or {}).get("call_debit_theo_5"), symbol, "call_limit_5"),
+        "put_debit_limit_5": _prefer_theo_if_stale(
+            result.get("put_debit_limit_5"), (theo or {}).get("put_debit_theo_5"), symbol, "put_limit_5"),
         "call_debit_theo_1": (theo or {}).get("call_debit_theo_1"),
         "put_debit_theo_1":  (theo or {}).get("put_debit_theo_1"),
         "call_debit_theo_2_5": (theo or {}).get("call_debit_theo_2_5"),

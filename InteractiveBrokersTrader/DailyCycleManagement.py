@@ -521,7 +521,8 @@ class DailyCycleManagementMixin:
                     )
                 except Exception:
                     pass
-                self._run_place_an_order([
+                # Build args for force-close
+                force_close_args = [
                     "--mode","force-close",  # Force-close scans positions directly
                     "--date", dated_folder,  # Ensure correct dated CSV directory
                     "--symbols", sym,
@@ -529,7 +530,11 @@ class DailyCycleManagementMixin:
                     "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
                     "--quantity","50",
                     "--quiet"
-                ])
+                ]
+                # In preclose (market open), allow MARKET fallback if all limit pricing fails
+                if context == "preclose":
+                    force_close_args.append("--allow-market-fallback")
+                self._run_place_an_order(force_close_args)
                 if self._has_working_close_order(sym):
                     try:
                         self._attempt(

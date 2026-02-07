@@ -473,6 +473,8 @@ def parse_args():
                    help="When to enforce the OI gate for OPEN orders: 'off' (never), 'rth' (only during 09:30–16:00 NY), or 'always'.")
     p.add_argument("--fallback-individual-legs", action="store_true",
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
+    p.add_argument("--allow-market-fallback", action="store_true", default=False,
+                   help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -1962,20 +1964,34 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         f"found within ±{tol_days}d. Continuing anyway (warn-only mode)."
                     )
 
-        # Don't place market orders when all pricing fallbacks fail
+        # Handle case when all pricing fallbacks fail
         if limit is None:
-            logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
-            record_attempt(
-                symbol,
-                "force_close",
-                "skipped",
-                "no_viable_limit_all_fallbacks_failed",
-                exp=str(exp),
-                right=right.upper(),
-            )
-            continue  # Skip this spread, don't place market order
-
-        order_type = "LMT"  # Only place limit orders (market orders prevented above)
+            if getattr(args, "allow_market_fallback", False):
+                # Preclose mode: market is open, MARKET order is acceptable as last resort
+                logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
+                order_type = "MKT"
+                record_attempt(
+                    symbol,
+                    "force_close",
+                    "placed",
+                    "market_fallback_preclose",
+                    exp=str(exp),
+                    right=right.upper(),
+                )
+            else:
+                # After-hours: skip to avoid bad MARKET fill
+                logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
+                record_attempt(
+                    symbol,
+                    "force_close",
+                    "skipped",
+                    "no_viable_limit_all_fallbacks_failed",
+                    exp=str(exp),
+                    right=right.upper(),
+                )
+                continue  # Skip this spread, don't place market order
+        else:
+            order_type = "LMT"
         ckey = _close_key(symbol, right, exp)
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
@@ -2753,6 +2769,10 @@ def run_from_csv():
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
                     w_call = _spread_width_from_strikes(atm, k_call)
                     call_close_raw = width_aligned_close_limit(row, 'C', w_call)
+                    # Apply 10% buffer to CSV limits for better fill rate (consistent with force-close)
+                    if call_close_raw is not None and live_close_limit_c is None:
+                        call_close_raw = round(call_close_raw * 0.90, 2)
+                        logger.info(f"[{symbol}] Applied 10% buffer to CSV CLOSE CALL limit: {call_close_raw:.2f}")
                     _raw_close_c = live_close_limit_c if (live_close_limit_c is not None) else call_close_raw
                     call_close_limit = enforce_close_limit(_raw_close_c)
                     logger.info(f"[{symbol}] CLOSE CALL limits: live={live_close_limit_c}, csv_raw={call_close_raw}, enforced={call_close_limit}, atm={atm}, k_call={k_call}, exp={expiration}")
@@ -2782,6 +2802,10 @@ def run_from_csv():
                                                                action='SELL', scheme=args.use_live_close, timeout=3.0)
                     w_put = _spread_width_from_strikes(atm, k_put)
                     put_close_raw = width_aligned_close_limit(row, 'P', w_put)
+                    # Apply 10% buffer to CSV limits for better fill rate (consistent with force-close)
+                    if put_close_raw is not None and live_close_limit_p is None:
+                        put_close_raw = round(put_close_raw * 0.90, 2)
+                        logger.info(f"[{symbol}] Applied 10% buffer to CSV CLOSE PUT limit: {put_close_raw:.2f}")
                     _raw_close_p = live_close_limit_p if (live_close_limit_p is not None) else put_close_raw
                     put_close_limit = enforce_close_limit(_raw_close_p)
                     logger.info(f"[{symbol}] CLOSE PUT limits: live={live_close_limit_p}, csv_raw={put_close_raw}, enforced={put_close_limit}, atm={atm}, k_put={k_put}, exp={expiration}")
