@@ -394,6 +394,72 @@ def _get_csv_paths_for_close(date_override: str | None = None) -> list[Path]:
 
 ---
 
+### Fix P: Theo Spread Pricing Uses Both IVs (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py:366-387 (`_theo_spread_debits`), listener.py:668-693 (call site)
+
+**Issue:** Theo spread pricing used a single IV for both legs. For symbols like FSK with 20% IV, both $2.5 and $5 spreads calculated to identical values (0.58) because far OTM options are essentially worthless at low IV.
+
+**Root Cause:**
+```python
+# OLD CODE - single sigma for both legs
+sigma = iv_atm or iv_otm or 0.25
+call_long = _bs_price(S, atm, T, r, sigma, call=True)
+call_short = _bs_price(S, atm + W, T, r, sigma, call=True)  # Same sigma!
+```
+
+**Fix:** Modified `_theo_spread_debits()` to accept separate IVs for ATM and OTM legs:
+```python
+def _theo_spread_debits(S, atm, T, sigma_atm, sigma_otm=None, ...):
+    if sigma_otm is None:
+        sigma_otm = sigma_atm
+    call_long = _bs_price(S, atm, T, r, sigma_atm, call=True)   # ATM IV
+    call_short = _bs_price(S, atm + W, T, r, sigma_otm, call=True)  # OTM IV
+```
+
+**Impact:**
+- When both `iv_atm` and `iv_otm` are present, each leg uses its own IV
+- Accounts for volatility skew (OTM options typically have higher IV)
+- Falls back to single IV when only one is available (same as before)
+
+---
+
+### Fix Q: Low-OI Cancellation Enhancements (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py:2940-2998 (`_cancel_low_oi_working_orders_from_csv`)
+
+**Issue:** The existing low-OI cancellation logic needed two enhancements:
+1. Should only cancel completely unfilled orders (not partially filled)
+2. Cancellations should be logged to attempts CSV for auditability
+
+**Fix 1:** Changed status filter from blacklist to whitelist:
+```python
+# OLD: if st in ("filled", "cancelled", "apicancelled"): continue
+# NEW: Only cancel unfilled orders
+if st not in ("presubmitted", "submitted"):
+    continue
+```
+
+**Fix 2:** Added attempts CSV logging after cancellation:
+```python
+_AttemptLogger.write(
+    symbol=sym,
+    action="cancel_open",
+    status="placed",
+    reason="low_oi_both_legs",
+    exp=exp, right=right, atm=str(atm), oth=str(oth),
+)
+```
+
+**Impact:**
+- Partially filled orders are no longer cancelled (only unfilled)
+- All low-OI cancellations appear in attempts CSV with reason `low_oi_both_legs`
+- Better auditability of RTH cleanup actions
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -614,4 +680,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 7, 2026 by Claude (Opus 4.5)
+**Last Updated:** February 7, 2026 by Claude (Opus 4.5) - Added Fix P (dual IV theo pricing), Fix Q (low-OI cancellation enhancements)

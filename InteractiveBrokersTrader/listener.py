@@ -363,13 +363,24 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool =
         return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
 
 
-def _theo_spread_debits(S: float, atm: float, T: float, sigma: float, r: float = 0.045, widths=(1.0, 2.5, 5.0)) -> Dict[str, float]:
+def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
+                        sigma_otm: float | None = None,
+                        r: float = 0.045, widths=(1.0, 2.5, 5.0)) -> Dict[str, float]:
+    """Calculate theoretical debit spread prices using Black-Scholes.
+
+    Args:
+        sigma_atm: IV for ATM (long) leg
+        sigma_otm: IV for OTM (short) leg - defaults to sigma_atm if None
+    """
+    if sigma_otm is None:
+        sigma_otm = sigma_atm
+
     out: Dict[str, float] = {}
     for W in widths:
-        call_long = _bs_price(S, atm, T, r, sigma, call=True)
-        call_short = _bs_price(S, atm + W, T, r, sigma, call=True)
-        put_long  = _bs_price(S, atm, T, r, sigma, call=False)
-        put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma, call=False)
+        call_long = _bs_price(S, atm, T, r, sigma_atm, call=True)
+        call_short = _bs_price(S, atm + W, T, r, sigma_otm, call=True)
+        put_long  = _bs_price(S, atm, T, r, sigma_atm, call=False)
+        put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma_otm, call=False)
         key = "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
         out[f"call_debit_theo_{key}"] = float(call_long - call_short)
         out[f"put_debit_theo_{key}"]  = float(put_long - put_short)
@@ -654,25 +665,30 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
     except Exception:
         pass
 
-    # Theo inputs (fallback for IV)
+    # Theo inputs - use separate IVs for ATM (long) and OTM (short) legs
     S   = result.get("current_price")
     atm = result.get("atm_strike")
     iv_atm = result.get("implied_volatility_atm")
     iv_otm = result.get("implied_volatility_otm")
-    sigma = None
+
+    # Parse ATM IV (for long leg)
+    sigma_atm = None
     if not _is_nan(iv_atm):
-        try: sigma = float(iv_atm)
-        except Exception: sigma = None
-    if sigma is None and not _is_nan(iv_otm):
-        try: sigma = float(iv_otm)
-        except Exception: sigma = None
-    if sigma is None or _is_nan(sigma):
-        sigma = 0.25
+        try: sigma_atm = float(iv_atm)
+        except Exception: sigma_atm = None
+    if sigma_atm is None or _is_nan(sigma_atm):
+        sigma_atm = 0.25  # default
+
+    # Parse OTM IV (for short leg) - None means _theo_spread_debits will use sigma_atm
+    sigma_otm = None
+    if not _is_nan(iv_otm):
+        try: sigma_otm = float(iv_otm)
+        except Exception: sigma_otm = None
 
     theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None}
     if not _is_nan(S) and not _is_nan(atm) and (days_to_exp is not None and days_to_exp > 0):
         try:
-            theo = _theo_spread_debits(float(S), float(atm), float(T), float(sigma))
+            theo = _theo_spread_debits(float(S), float(atm), float(T), float(sigma_atm), sigma_otm=sigma_otm)
         except Exception as e:
             logger.warning(f"[THEO] pricing error: {e}")
 

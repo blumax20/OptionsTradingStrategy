@@ -2938,7 +2938,8 @@ class DailyCycleManagementMixin:
                 if getattr(c, "secType", "") != "BAG":
                     continue
                 st = (getattr(s, "status", "") or "").lower()
-                if st in ("filled", "cancelled", "apicancelled"):
+                # Only cancel completely unfilled orders - skip filled, cancelled, and partially filled
+                if st not in ("presubmitted", "submitted"):
                     continue
                 legs = getattr(c, "comboLegs", None) or []
                 if len(legs) < 2:
@@ -2984,6 +2985,17 @@ class DailyCycleManagementMixin:
                         cancelled += 1
                         LOG.info("CSV OI cancel [%s]: cancelled %s %s %s atm/oth=%s/%s OI=%s/%s<thr(%d)",
                                  (src or "unknown"), sym, exp, right, atm, oth, oi_atm, oi_oth, threshold)
+                        # Log to attempts CSV
+                        _AttemptLogger.write(
+                            symbol=sym,
+                            action="cancel_open",
+                            status="placed",
+                            reason="low_oi_both_legs",
+                            exp=exp,
+                            right=right,
+                            atm=str(atm),
+                            oth=str(oth),
+                        )
                     except Exception as e:
                         LOG.warning("CSV OI cancel: cancel failed for %s %s %s: %s", sym, exp, right, e)
 
