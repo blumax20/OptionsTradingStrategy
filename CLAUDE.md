@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 6, 2026
+**Last Updated:** February 7, 2026
 
 ---
 
@@ -67,9 +67,9 @@ This document summarizes the architecture of the Interactive Brokers options tra
 - Uses `force_close_symbol_via_positions()` with `--use-live-close off`
 - Pricing fallback chain:
   1. Live quotes (fails after-hours)
-  2. CSV theo limits (symbol-only lookup)
-  3. Stale position market prices (10% buffered)
-  4. **FIX C APPLIED:** Skips if all fail (no MARKET fallback)
+  2. **FIX O APPLIED:** Previous trading day's CSV (has position strikes + live prices from 9:35 AM)
+  3. **FIX C APPLIED:** Skips if all fail (no MARKET fallback)
+  4. **FIX J APPLIED:** At 3pm preclose, MARKET order if `--allow-market-fallback` set
 
 ---
 
@@ -77,30 +77,27 @@ This document summarizes the architecture of the Interactive Brokers options tra
 
 ### CLOSE Orders
 
-**Function:** `force_close_symbol_via_positions()` at PlaceAnOrder.py:1812-1978
+**Function:** `force_close_symbol_via_positions()` at PlaceAnOrder.py:1812-1930
 
-**Fallback Chain:**
+**Fallback Chain (Updated Feb 7):**
 1. **Live Quotes** (lines 1834-1856)
    - Uses `live_spread_price()` with `--use-live-close` scheme (mid/join/off)
    - Fails after-hours (market closed)
 
-2. **CSV Theoretical Limits** (lines 1862-1883)
+2. **Previous Trading Day's CSV** (lines 1893-1922) - **FIX O**
+   - Uses `_get_csv_paths_for_close()` to get previous day's CSV
    - Symbol-only lookup (no expiration filter)
    - Uses `width_aligned_close_limit()` function
-   - Tries `call_debit_limit_*` or `put_debit_limit_*` first
-   - Falls back to `call_debit_theo_*` or `put_debit_theo_*`
+   - Previous day's CSV has position strikes (Fix I) + live prices (Fix N at 9:35 AM)
    - Applies 10% buffer: `limit * 0.90`
    - Checks min_limit (0.05 or 0.01 for preclose)
 
-3. **Stale Position Prices** (lines 1881-1936)
-   - Uses IB portfolio position market values
-   - Applies 10% buffer: `stale_price * 0.90`
-   - Checks min_limit
+3. **Skip or MARKET** (lines 1925-1945)
+   - If all pricing fails and `--allow-market-fallback` NOT set: skip order (Fix C)
+   - If `--allow-market-fallback` IS set (3pm preclose only): place MARKET order (Fix J)
+   - Records reason: `no_viable_limit_all_fallbacks_failed` or `market_fallback_preclose`
 
-4. **Skip Order (FIX C)** (lines 1965-1976)
-   - If all pricing fails, skip instead of MARKET
-   - Records reason: `no_viable_limit_all_fallbacks_failed`
-   - Position carried to next trading day
+**Note:** Stale position market prices fallback was removed - previous day's CSV with live prices is more reliable.
 
 ### OPEN Orders
 
@@ -299,6 +296,104 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
 
 ---
 
+### Fix J: Preclose MARKET Fallback (Feb 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:1925-1945, DailyCycleManagement.py:524-536
+
+**Issue:** At 3pm preclose, if all limit pricing fails, the order was skipped. But the market is OPEN at 3pm, so a MARKET order would fill at reasonable prices.
+
+**Fix:** Added `--allow-market-fallback` flag that DailyCycleManagement passes during preclose:
+```python
+if limit is None:
+    if getattr(args, "allow_market_fallback", False):
+        # Preclose mode: market is open, MARKET order is acceptable
+        logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback")
+        order_type = "MKT"
+    else:
+        # After-hours: skip to avoid bad MARKET fill
+        continue
+```
+
+**Impact:**
+- 3pm preclose uses MARKET as last resort (market is open, fills are reasonable)
+- 5pm after-hours still skips (market closed, fills would be terrible)
+
+---
+
+### Fix M: Always Use Theo Values After Hours (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py:624-724 (row assembly)
+
+**Issue:** After hours, quote-based limit prices are unreliable (stale bids/asks, wide spreads). The theo values calculated via Black-Scholes are more accurate.
+
+**Fix:** Simplified listener to always populate `*_limit_*` columns with theo values after hours:
+```python
+# In row assembly:
+"call_debit_limit_1": theo.get("call_debit_theo_1"),
+"put_debit_limit_1": theo.get("put_debit_theo_1"),
+# ... same for _2_5 and _5 widths
+```
+
+**Impact:**
+- After-hours signals always use Black-Scholes theo values in limit columns
+- Quote-based prices still logged for diagnostics but not used
+- Simpler code, more predictable behavior
+
+---
+
+### Fix N: Live Price Enrichment at Market Open (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** LiquidityFilter.py:559-685 (`_fetch_live_spread_price`, `enrich_live_spread_prices`)
+
+**Issue:** At market open, the CSV has theo-only prices from after-hours. Need to update limit columns with live market prices.
+
+**Fix:** Added live spread price fetching to LiquidityFilter.py (already called by DailyCycleManagement at 9:35 AM):
+- `_fetch_live_spread_price()` - Fetches debit spread price from IB (ask_long - bid_short)
+- `enrich_live_spread_prices()` - Updates all limit columns with live prices
+- Called automatically via `enrich_if_rth()` when `update_prices=True` (default)
+- Prices capped at spread width (a $1 spread can't exceed $1.00)
+
+**Impact:**
+- 9:35 AM enrichment updates previous day's CSV with fresh live prices
+- 3pm preclose can use these live prices via Fix O
+- Manual use: `python LiquidityFilter.py --day-dir C:\OptionsHistory\26_02_07 --update-prices`
+
+---
+
+### Fix O: Previous Trading Day CSV Fallback (Feb 7)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:492-522 (`_get_previous_trading_day_folder`, `_get_csv_paths_for_close`), PlaceAnOrder.py:1893-1922
+
+**Issue:** At 3pm preclose, if live pricing fails, the system only looked at today's CSV. But positions opened yesterday won't have a row in today's CSV.
+
+**Fix:** Changed CSV fallback to use only the previous trading day's CSV:
+```python
+def _get_csv_paths_for_close(date_override: str | None = None) -> list[Path]:
+    """Return CSV path: previous trading day only."""
+    paths = []
+    prev_folder = _get_previous_trading_day_folder()
+    if prev_folder:
+        prev_path = OUTPUT_BASE / prev_folder / "combined_listener_spreads.csv"
+        paths.append(prev_path)
+    return paths
+```
+
+**Why this works:**
+1. **5 PM (prev day):** Listener populates CSV with position-based strikes (Fix I)
+2. **9:35 AM (today):** LiquidityFilter updates CSV with live prices (Fix N)
+3. **3 PM (today):** Preclose uses these live prices for closing
+
+**Impact:**
+- 3pm preclose has reliable limit pricing from previous day's CSV
+- Stale position market prices fallback removed (not needed with live prices)
+- Simplified fallback chain: live quotes → previous day CSV → MARKET (preclose only)
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -341,19 +436,37 @@ The preclose ran but PlaceAnOrder.py exited early before reaching the force-clos
 - Use limit orders with aggressive pricing (10% buffer)
 - If limit doesn't fill, next day's preclose converts to market (during market hours with live pricing)
 
+### 5. After-Hours vs Market-Open Pricing (Feb 7)
+
+**After-Hours (5 PM):**
+- Listener uses Black-Scholes theo values in limit columns (Fix M)
+- Quote-based prices are unreliable (stale bids/asks)
+- CSV populated with position-based strikes (Fix I for CLOSE signals)
+
+**Market Open (9:35 AM):**
+- LiquidityFilter updates previous day's CSV with live prices (Fix N)
+- Uses actual position strikes from CSV (populated by Fix I)
+- Prices capped at spread width (can't exceed $1 for $1 spread)
+
+**Preclose (3 PM):**
+- First tries live quotes (market is open)
+- Falls back to previous day's CSV (has live prices from 9:35 AM via Fix N and Fix O)
+- Last resort: MARKET order with `--allow-market-fallback` (Fix J)
+
 ---
 
 ## Critical Functions
 
 ### `force_close_symbol_via_positions()`
-**Location:** PlaceAnOrder.py:1812-1978
+**Location:** PlaceAnOrder.py:1812-1930
 
 **Purpose:** Close all spreads for a symbol using position scan + pricing fallbacks
 
 **Key Features:**
 - Scans positions by symbol (no expiration filter)
-- Tries 3 pricing sources: live → CSV → stale
-- Fix C: Skips if all pricing fails (no MARKET)
+- Tries 2 pricing sources: live → previous day CSV (Fix O)
+- Fix C: Skips if all pricing fails (no MARKET) for after-hours
+- Fix J: Uses MARKET if `--allow-market-fallback` set (preclose only)
 - Records detailed attempt reasons for diagnostics
 
 ### `close_any_spread_for_symbol()`
@@ -476,16 +589,13 @@ grep "no_viable_limit_all_fallbacks_failed" C:\OptionsHistory\26_XX_XX\attempts_
 ### 1. Implement Fix G (Priority: HIGH)
 Replace `close_any_spread_for_symbol()` calls in OPEN handlers with limit-based close logic
 
-### 2. Add Preclose Monitoring (Priority: HIGH)
+### 2. Add Preclose Monitoring (Priority: MEDIUM)
 Implement alerting when scheduled cycles don't run
 
 ### 3. Expiration Reconciliation (Priority: MEDIUM)
 Add warnings when CSV expiration doesn't match position expiration
 
-### 4. Enhanced Diagnostics (Priority: MEDIUM)
-Add more detailed logging for pricing fallback decisions
-
-### 5. Automated Testing (Priority: LOW)
+### 4. Automated Testing (Priority: LOW)
 Create test cases for pricing fallback scenarios
 
 ---
@@ -500,6 +610,8 @@ Create test cases for pricing fallback scenarios
 **Key Files:**
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\PlaceAnOrder.py`
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\DailyCycleManagement.py`
+- `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\LiquidityFilter.py` - Live price enrichment (Fix N)
+- `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 6, 2026 by Claude (Sonnet 4.5)
+**Last Updated:** February 7, 2026 by Claude (Opus 4.5)
