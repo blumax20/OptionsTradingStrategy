@@ -555,13 +555,145 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
     if logger: logger(f"enrich_csv: updated={updates}")
     return updates > 0
 
+
+# ---- Fix N: Live spread price fetching ----
+
+def _fetch_live_spread_price(ib, symbol: str, expiration: str, atm: float,
+                              width: float, right: str = 'C') -> Optional[float]:
+    """Fetch live debit spread price from IB.
+
+    Args:
+        ib: Connected IB instance
+        symbol: Stock symbol
+        expiration: Expiration in YYYYMMDD format
+        atm: ATM strike price
+        width: Spread width (1.0, 2.5, or 5.0)
+        right: 'C' for call or 'P' for put
+
+    Returns:
+        Debit spread price (ask_long - bid_short), capped at spread width.
+        Returns None if quotes unavailable.
+    """
+    if ib is None or Option is None:
+        return None
+    try:
+        long_strike = atm
+        short_strike = atm + width if right == 'C' else atm - width
+        if short_strike <= 0:
+            return None
+
+        long_opt = Option(symbol, expiration, long_strike, right, 'SMART')
+        short_opt = Option(symbol, expiration, short_strike, right, 'SMART')
+
+        qualified = ib.qualifyContracts(long_opt, short_opt)
+        if len(qualified) < 2:
+            return None
+
+        # Request market data
+        long_ticker = ib.reqMktData(long_opt, snapshot=True)
+        short_ticker = ib.reqMktData(short_opt, snapshot=True)
+        ib.sleep(0.6)  # Wait for data
+
+        ask_long = long_ticker.ask
+        bid_short = short_ticker.bid
+
+        try:
+            ib.cancelMktData(long_opt)
+            ib.cancelMktData(short_opt)
+        except Exception:
+            pass
+
+        if ask_long and ask_long > 0 and bid_short is not None and bid_short >= 0:
+            debit = ask_long - bid_short
+            # Cap at spread width (can't exceed max value)
+            debit = min(debit, width)
+            return round(debit, 2)
+    except Exception:
+        pass
+    return None
+
+
+def enrich_live_spread_prices(day_dir: str, ib=None, logger=None) -> int:
+    """Update CSV limit columns with live market prices from IB.
+
+    Updates call_debit_limit_* and put_debit_limit_* columns for all rows.
+    This should be run during RTH (market open) to replace after-hours theo values
+    with actual live market prices.
+
+    Returns count of values updated.
+    """
+    csv_path, cols, rows = _read_combined_csv(day_dir)
+    if not rows:
+        if logger:
+            logger(f"enrich_live_prices: no rows in {day_dir}")
+        return 0
+
+    lc = {c.lower(): c for c in cols}
+    sym_col = lc.get("symbol")
+    exp_col = lc.get("expiration") or lc.get("exp")
+    atm_col = lc.get("atm_strike")
+
+    if not all([sym_col, exp_col, atm_col]):
+        if logger:
+            logger("enrich_live_prices: missing required columns (symbol, expiration, atm_strike)")
+        return 0
+
+    # Ensure limit columns exist
+    limit_cols = ['call_debit_limit_1', 'put_debit_limit_1',
+                  'call_debit_limit_2_5', 'put_debit_limit_2_5',
+                  'call_debit_limit_5', 'put_debit_limit_5']
+    _ensure_cols(cols, limit_cols)
+
+    updates = 0
+    for row in rows:
+        symbol = str(row.get(sym_col, "")).strip()
+        exp = str(row.get(exp_col, "")).strip()
+        atm = _parse_float(row.get(atm_col))
+
+        if not symbol or not exp or atm is None:
+            continue
+
+        if logger:
+            logger(f"[{symbol}] Fetching live spread prices for exp={exp}, atm={atm}")
+
+        # Fetch live prices for each width
+        for width, suffix in [(1.0, '1'), (2.5, '2_5'), (5.0, '5')]:
+            # CALL spread
+            call_live = _fetch_live_spread_price(ib, symbol, exp, atm, width, 'C')
+            if call_live is not None:
+                col = f'call_debit_limit_{suffix}'
+                old_val = row.get(col)
+                row[col] = call_live
+                if logger:
+                    logger(f"  [{symbol}] {col}: {old_val} -> {call_live}")
+                updates += 1
+
+            # PUT spread
+            put_live = _fetch_live_spread_price(ib, symbol, exp, atm, width, 'P')
+            if put_live is not None:
+                col = f'put_debit_limit_{suffix}'
+                old_val = row.get(col)
+                row[col] = put_live
+                if logger:
+                    logger(f"  [{symbol}] {col}: {old_val} -> {put_live}")
+                updates += 1
+
+    if updates > 0:
+        _write_combined_csv(csv_path, cols, rows)
+    if logger:
+        logger(f"enrich_live_prices: updated={updates}")
+    return updates
+
+
 def enrich_if_rth(day_dir: str,
                   ib_host: str = "127.0.0.1",
                   ib_port: int = 7497,
                   client_id: int = 915,
-                  logger=None) -> bool:
+                  logger=None,
+                  update_prices: bool = True) -> bool:
     """
     If current time is Regular Trading Hours (NY), connect to IB and enrich the combined CSV with OI/IV.
+    If update_prices=True (default), also updates limit columns with live spread prices.
     Returns True if any updates were written, False otherwise.
     """
     if not _is_rth():
@@ -580,6 +712,12 @@ def enrich_if_rth(day_dir: str,
             pass
         fetcher = _ib_fetcher_factory(ib)
         changed = enrich_combined_csv(day_dir, fetcher=fetcher, logger=logger)
+
+        # Fix N: Also update limit columns with live spread prices
+        if update_prices:
+            price_updates = enrich_live_spread_prices(day_dir, ib=ib, logger=logger)
+            changed = changed or (price_updates > 0)
+
         return bool(changed)
     finally:
         try: ib.disconnect()
@@ -664,6 +802,7 @@ if __name__ == "__main__":
     ap.add_argument("--day-dir", required=True, help="Folder like C:\\OptionsHistory\\YY_MM_DD")
     ap.add_argument("--only-rth", action="store_true", help="Only enrich when current time is RTH (09:30–16:00 NY).")
     ap.add_argument("--populate-strikes", action="store_true", help="Populate missing ATM/OTM strikes by fetching current prices from IB.")
+    ap.add_argument("--update-prices", action="store_true", help="Update limit columns with live spread prices from IB.")
     ap.add_argument("--ib-host", default="127.0.0.1")
     ap.add_argument("--ib-port", type=int, default=7497)
     ap.add_argument("--client-id", type=int, default=915)
@@ -677,6 +816,23 @@ if __name__ == "__main__":
         updated = populate_missing_strikes(args.day_dir, ib_host=args.ib_host, ib_port=args.ib_port,
                                            client_id=args.client_id + 1, logger=_log)
         print(f"Strike population: updated {updated} rows in: {args.day_dir}")
+    elif args.update_prices:
+        # Fix N: Update limit columns with live spread prices
+        if IB is None:
+            print("ERROR: ib_insync not available")
+        else:
+            ib = IB()
+            try:
+                ib.connect(args.ib_host, args.ib_port, clientId=args.client_id)
+                try:
+                    ib.reqMarketDataType(4)
+                except Exception:
+                    pass
+                updated = enrich_live_spread_prices(args.day_dir, ib=ib, logger=_log)
+                print(f"Live price update: updated {updated} values in: {args.day_dir}")
+            finally:
+                try: ib.disconnect()
+                except Exception: pass
     elif args.only_rth:
         changed = enrich_if_rth(args.day_dir, ib_host=args.ib_host, ib_port=args.ib_port, client_id=args.client_id, logger=_log)
         print(f"Enrichment {'made changes' if changed else 'no changes needed'} in: {args.day_dir} (mode=only_rth)")
