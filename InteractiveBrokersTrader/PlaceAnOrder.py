@@ -489,6 +489,40 @@ def today_folder_yy_mm_dd(override: str | None = None) -> str:
 def combined_csv_path_for_today(date_override: str | None = None) -> Path:
     return OUTPUT_BASE / today_folder_yy_mm_dd(date_override) / "combined_listener_spreads.csv"
 
+
+def _get_previous_trading_day_folder() -> str | None:
+    """Return the YY_MM_DD folder for the previous trading day, skipping weekends."""
+    try:
+        NY = ZoneInfo("America/New_York")
+        now = datetime.now(NY)
+    except Exception:
+        now = datetime.now()
+    from datetime import timedelta
+    prev = now - timedelta(days=1)
+    # Skip weekends (Sat=5, Sun=6)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    return prev.strftime("%y_%m_%d")
+
+
+def _get_csv_paths_for_close(date_override: str | None = None) -> list[Path]:
+    """Return CSV path to check for CLOSE pricing: previous trading day only.
+
+    Fix O: Use only the previous trading day's CSV which has:
+    - Position-based strikes (Fix I populated at 5pm)
+    - Live prices (Fix N updated at 9:35am today)
+
+    Today's CSV is not used because at 3pm preclose, positions opened yesterday
+    won't have a row in today's CSV unless a new signal arrived today.
+    """
+    paths = []
+    # Previous trading day's CSV only
+    prev_folder = _get_previous_trading_day_folder()
+    if prev_folder:
+        prev_path = OUTPUT_BASE / prev_folder / "combined_listener_spreads.csv"
+        paths.append(prev_path)
+    return paths
+
 def best_theoretical_limit(row: pd.Series, right: str) -> float | None:
     """
     Pick the best available theoretical debit for the requested right ('C' or 'P'):
@@ -1861,85 +1895,36 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 except Exception:
                     limit = None
 
-        # FALLBACK: If live quotes failed, try CSV theoretical limits
+        # FALLBACK: If live quotes failed, try CSV limits (today first, then previous trading day)
+        # Fix O: Check multiple CSVs - previous day has position-based strikes (Fix I) + live prices (Fix N)
         if limit is None:
-            try:
-                csv_path = combined_csv_path_for_today(args.date)
-                if csv_path.exists():
+            width = abs(float(longK) - float(shortK))
+            for csv_path in _get_csv_paths_for_close(args.date):
+                if not csv_path.exists():
+                    continue
+                try:
                     df_csv = pd.read_csv(csv_path)
                     if "symbol" in df_csv.columns:
                         df_csv["symbol"] = df_csv["symbol"].astype(str).map(_clean_symbol)
                     rows = df_csv[df_csv["symbol"].astype(str).str.upper() == symbol.upper()]
-                    if not rows.empty:
-                        row = rows.iloc[-1]  # Use LATEST row (aligns with DailyCycleManagement)
-                        width = abs(float(longK) - float(shortK))
-                        csv_limit = width_aligned_close_limit(row, right, width)
-                        if csv_limit is not None:
-                            # Apply conservative buffer (10%) for better fill rate
-                            buffered_csv_limit = csv_limit * 0.90
-                            if buffered_csv_limit >= args.min_limit:
-                                limit = buffered_csv_limit
-                                logger.info(f"[{symbol}] Force-close fallback: using CSV theoretical limit with 10% buffer: "
-                                            f"raw=${csv_limit:.2f}, buffered=${limit:.2f} (live quotes unavailable)")
-            except Exception as e:
-                logger.warning(f"[{symbol}] Failed to read CSV fallback for force-close: {e}")
-
-        # FALLBACK 3: Use stale position market prices (IB position data)
-        if limit is None:
-            try:
-                logger.info(f"[{symbol}] No CSV limit found, trying position market prices (stale fallback)")
-
-                # Get current positions from IB
-                positions = ib.positions()
-
-                # Find positions for this symbol's option legs
-                long_pos = None
-                short_pos = None
-
-                for p in positions:
-                    c = p.contract
-                    if getattr(c, 'symbol', '').upper() != symbol.upper():
+                    if rows.empty:
                         continue
-                    if getattr(c, 'secType', '') != 'OPT':
-                        continue
-
-                    strike = float(getattr(c, 'strike', 0.0))
-
-                    # Match to our spread legs
-                    if abs(strike - float(longK)) < 0.01:
-                        long_pos = p
-                    elif abs(strike - float(shortK)) < 0.01:
-                        short_pos = p
-
-                if long_pos and short_pos:
-                    # Use IB's market prices (last mark)
-                    long_market_price = getattr(long_pos, 'marketPrice', None)
-                    short_market_price = getattr(short_pos, 'marketPrice', None)
-
-                    if long_market_price and short_market_price:
-                        # Calculate spread value
-                        spread_value = long_market_price - short_market_price
-
+                    row = rows.iloc[-1]  # Use LATEST row (aligns with DailyCycleManagement)
+                    csv_limit = width_aligned_close_limit(row, right, width)
+                    if csv_limit is not None:
                         # Apply conservative buffer (10%) for better fill rate
-                        buffered_limit = spread_value * 0.90
+                        buffered_csv_limit = csv_limit * 0.90
+                        if buffered_csv_limit >= args.min_limit:
+                            limit = buffered_csv_limit
+                            logger.info(f"[{symbol}] Force-close fallback: using CSV limit with 10% buffer from {csv_path}: "
+                                        f"raw=${csv_limit:.2f}, buffered=${limit:.2f}")
+                            break  # Found valid limit, stop searching
+                except Exception as e:
+                    logger.warning(f"[{symbol}] Failed to read CSV fallback from {csv_path}: {e}")
+                    continue
 
-                        # Enforce minimum
-                        if buffered_limit >= args.min_limit:
-                            limit = round(buffered_limit, 2)
-                            logger.info(f"[{symbol}] Using stale position prices: long=${long_market_price:.2f}, "
-                                        f"short=${short_market_price:.2f}, spread=${spread_value:.2f}, "
-                                        f"buffered_limit=${limit:.2f} (10% buffer)")
-                        else:
-                            logger.warning(f"[{symbol}] Stale position limit ${buffered_limit:.2f} below min_limit "
-                                          f"${args.min_limit}, skipping")
-                    else:
-                        logger.debug(f"[{symbol}] Position market prices not available: "
-                                    f"long={long_market_price}, short={short_market_price}")
-                else:
-                    logger.debug(f"[{symbol}] Could not find both position legs for stale fallback")
-
-            except Exception as e:
-                logger.warning(f"[{symbol}] Failed to get stale position prices: {e}")
+        # Note: Stale position market prices fallback removed - previous trading day CSV
+        # should have reliable pricing from Fix I (position strikes) + Fix N (live prices at 9:35 AM)
 
         # Warn-only expiration validation (Option 3)
         if exp:  # CSV expiration provided
