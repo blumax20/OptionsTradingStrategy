@@ -529,7 +529,8 @@ class DailyCycleManagementMixin:
                     "--min-limit","0.01" if context == "preclose" else "0.05",
                     "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
                     "--quantity","50",
-                    "--quiet"
+                    "--quiet",
+                    "--fallback-individual-legs",  # Fix S: Enable worthless leg handling
                 ]
                 # In preclose (market open), allow MARKET fallback if all limit pricing fails
                 if context == "preclose":

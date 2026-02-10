@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 7, 2026
+**Last Updated:** February 9, 2026
 
 ---
 
@@ -493,6 +493,48 @@ def _collect_secdef(ib: IB, symbol: str, con_id: int, max_retries: int = 3):
 
 ---
 
+### Fix S: Close Worthless Spreads with Fixed Pricing (Feb 9)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:2001-2004, 2091-2111, 2289-2339, 2727-2743, 2766-2782, 3033-3037
+
+**Issue:** NWG and BSY had MARKET orders placed on 2/9/2026 at 5pm because:
+1. Both legs of the spread were nearly worthless (< $0.05)
+2. Combo close orders failed because spread value was negligible
+3. System fell back to `close_any_spread_for_symbol()` which always uses MARKET orders
+4. MARKET orders after-hours have poor fills
+
+**Root Causes Fixed:**
+1. `opposite_unwind_before_open` (BSY) - called `close_any_spread_for_symbol()` → MARKET
+2. `force-close` mode fallback (NWG) - called `close_any_spread_for_symbol()` → MARKET
+3. Both-legs-worthless case wasn't handled (only one-leg-worthless was)
+
+**Fix:** When both legs are worthless (< $0.05), close with guaranteed-fill fixed pricing:
+```python
+# In force_close_symbol_via_positions():
+elif long_worthless and short_worthless:
+    skip_combo = True
+    both_worthless = True
+    # ...then later:
+    # Long position: sell for $0.01
+    leg_order = LimitOrder("SELL", int(abs(pos)), 0.01)
+    # Short position: buy for $0.05
+    leg_order = LimitOrder("BUY", int(abs(pos)), 0.05)
+```
+
+**Additional Changes:**
+- DailyCycleManagement Stage 2 now passes `--fallback-individual-legs` by default
+- Removed MARKET fallback from force-close CSV mode (lines 3033-3041)
+- Replaced `close_any_spread_for_symbol()` in opposite_unwind_before_open with `force_close_symbol_via_positions()`
+
+**Impact:**
+- Worthless spreads (both legs < $0.05) close with fixed pricing: sell long @$0.01, buy short @$0.05
+- Net cost: $0.04 per contract (acceptable for worthless positions)
+- No more MARKET orders for worthless spread closes
+- Once legs submitted, symbol is free for new OPEN signals
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -713,4 +755,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 7, 2026 by Claude (Opus 4.5) - Added Fix P (dual IV theo pricing), Fix Q (low-OI cancellation enhancements), Fix R (secdef retry with backoff)
+**Last Updated:** February 9, 2026 by Claude (Opus 4.5) - Added Fix S (worthless spread fixed pricing)

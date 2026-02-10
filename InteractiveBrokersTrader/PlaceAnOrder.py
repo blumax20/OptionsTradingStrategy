@@ -2001,6 +2001,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         # Check if fallback-individual-legs is enabled
         use_fallback = getattr(args, "fallback_individual_legs", False)
         skip_combo = False
+        both_worthless = False  # Fix S: Track if both legs are worthless
 
         if use_fallback:
             # Check market values of both legs to see if one is worthless
@@ -2098,6 +2099,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
                         f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
                         f"will close individual valuable leg(s) only"
+                    )
+                elif long_worthless and short_worthless:
+                    # Fix S: Both legs worthless - close with fixed pricing ($0.01 for long, $0.05 for short)
+                    skip_combo = True
+                    both_worthless = True
+                    logger.info(
+                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
+                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
+                        f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
                     )
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
@@ -2275,6 +2285,56 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
             except Exception as e_legs:
                 logger.error(f"[{symbol}] Failed to close individual legs: {e_legs}")
+
+        # Fix S: Handle both-worthless-legs case with fixed pricing
+        if skip_combo and use_fallback and both_worthless:
+            # Close positions with guaranteed-fill pricing: long @ $0.01, short @ $0.05
+            legs_closed = 0
+            try:
+                for p in ib.positions():
+                    c = getattr(p, "contract", None)
+                    if not c or getattr(c, "secType", "") != "OPT":
+                        continue
+                    if getattr(c, "symbol", "").upper() != symbol.upper():
+                        continue
+                    if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
+                        continue
+                    if getattr(c, "right", "").upper() != right.upper():
+                        continue
+
+                    strike = float(getattr(c, "strike", 0.0))
+                    pos = float(getattr(p, "position", 0.0))
+
+                    # Long position: sell for $0.01
+                    if abs(strike - float(longK)) < 0.01 and pos > 0:
+                        leg_order = LimitOrder("SELL", int(abs(pos)), 0.01)
+                        leg_order.tif = "DAY"
+                        trade = ib.placeOrder(c, leg_order)
+                        legs_closed += 1
+                        submitted += 1
+                        CLOSE_SEEN_KEYS.add(ckey)
+                        logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {abs(pos):.0f} @ $0.01)")
+                        record_attempt(symbol, "close_individual_leg", "placed", "both_worthless_fixed_price",
+                                     exp=str(exp), right=right, longK=float(longK), limit=0.01,
+                                     qty=int(abs(pos)), order_action="SELL", leg_type="long")
+
+                    # Short position: buy for $0.05
+                    if abs(strike - float(shortK)) < 0.01 and pos < 0:
+                        leg_order = LimitOrder("BUY", int(abs(pos)), 0.05)
+                        leg_order.tif = "DAY"
+                        trade = ib.placeOrder(c, leg_order)
+                        legs_closed += 1
+                        submitted += 1
+                        logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {abs(pos):.0f} @ $0.05)")
+                        record_attempt(symbol, "close_individual_leg", "placed", "both_worthless_fixed_price",
+                                     exp=str(exp), right=right, shortK=float(shortK), limit=0.05,
+                                     qty=int(abs(pos)), order_action="BUY", leg_type="short")
+
+                if legs_closed > 0:
+                    logger.info(f"[{symbol}] Closed {legs_closed} worthless leg(s) with fixed pricing")
+
+            except Exception as e_worthless:
+                logger.error(f"[{symbol}] Failed to close worthless legs: {e_worthless}")
 
     if not any_pair:
         record_attempt(symbol, "force_close", "skipped", "no_spread_in_positions")
@@ -2664,13 +2724,23 @@ def run_from_csv():
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
-                    # Proactively unwind existing PUT spreads (opposite side)
+                    # Fix S: Proactively unwind existing PUT spreads (opposite side) using limit orders
                     if 'P' in sym_sides:
                         try:
-                            n_unw = close_any_spread_for_symbol(ib, symbol, side="put", max_qty=args.quantity)
+                            # Build args-like object with needed settings for force_close_symbol_via_positions
+                            class _UnwindArgs:
+                                use_live_close = "join"
+                                min_limit = 0.05
+                                bump_to_min = False
+                                quantity = args.quantity
+                                force_close_side = "put"
+                                fallback_individual_legs = True  # Enable worthless leg handling
+                                allow_market_fallback = False
+                                date = getattr(args, 'date', None)
+                            n_unw = force_close_symbol_via_positions(ib, symbol, _UnwindArgs())
                             if n_unw > 0:
-                                logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN")
-                                record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open", exp=None, right="P", qty=n_unw)
+                                logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN (limit order)")
+                                record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open_lmt", exp=None, right="P", qty=n_unw)
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
                     allow_call = True
@@ -2692,13 +2762,23 @@ def run_from_csv():
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
-                    # Proactively unwind existing CALL spreads (opposite side)
+                    # Fix S: Proactively unwind existing CALL spreads (opposite side) using limit orders
                     if 'C' in sym_sides:
                         try:
-                            n_unw = close_any_spread_for_symbol(ib, symbol, side="call", max_qty=args.quantity)
+                            # Build args-like object with needed settings for force_close_symbol_via_positions
+                            class _UnwindArgs:
+                                use_live_close = "join"
+                                min_limit = 0.05
+                                bump_to_min = False
+                                quantity = args.quantity
+                                force_close_side = "call"
+                                fallback_individual_legs = True  # Enable worthless leg handling
+                                allow_market_fallback = False
+                                date = getattr(args, 'date', None)
+                            n_unw = force_close_symbol_via_positions(ib, symbol, _UnwindArgs())
                             if n_unw > 0:
-                                logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN")
-                                record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open", exp=None, right="C", qty=n_unw)
+                                logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN (limit order)")
+                                record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open_lmt", exp=None, right="C", qty=n_unw)
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
                     allow_put = True
@@ -2970,15 +3050,10 @@ def run_from_csv():
                                         place_debit_spread(ib, symbol, expiration, a_atm, a_oth, 'P', limit, quantity=qty, action='SELL')
                                         logger.info(f"[{symbol}] Submitted FORCE-CLOSE PUT(approx) {a_atm}/{a_oth} exp {expiration} @ {limit}")
                                         placed += 1
-                # Force-close final fallback: MARKET close anything remaining for this symbol/side(s)
-                if not args.dry_run:
-                    sides = ["call","put"] if args.force_close_side == "both" else [args.force_close_side]
-                    total_fallback = 0
-                    for sside in sides:
-                        total_fallback += close_any_spread_for_symbol(ib, symbol, side=sside, max_qty=args.quantity)
-                    if total_fallback > 0:
-                        logger.info(f"[{symbol}] FORCE-CLOSE fallback MARKET close submitted for {total_fallback} spread(s)")
-                        placed += total_fallback
+                # Fix S: REMOVED MARKET fallback - close_any_spread_for_symbol always uses MARKET orders
+                # which have poor fills after-hours. The individual leg close logic
+                # (enabled by --fallback-individual-legs) handles worthless spreads properly
+                # with fixed pricing ($0.01 for long, $0.05 for short).
                 continue
 
             # --- CALL debit spread (ATM long / OTM short) ---
