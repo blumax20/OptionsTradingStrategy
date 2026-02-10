@@ -1232,8 +1232,10 @@ class DailyCycleManagementMixin:
                                 v = float(v)
                                 LOG.debug("[%s] _get_theo_limit: %s float value=%s, valid=%s", up, col, v, v > 0)
                                 if v > 0:
-                                    LOG.info("direct-close: found theo limit for %s %s width=%s: %s from col %s", up, right, width, v, col)
-                                    return round(v, 2)
+                                    # Apply 5% buffer for initial close (10% applied in preclose if unfilled)
+                                    buffered = round(v * 0.95, 2)
+                                    LOG.info("direct-close: applying 5%% buffer for %s %s: raw=%.2f, buffered=%.2f (col %s)", up, right, v, buffered, col)
+                                    return buffered
                         except Exception as ex:
                             LOG.debug("direct-close: failed to parse %s for %s: %s", col, up, ex)
                 LOG.debug("direct-close: no theo limit found for %s %s width=%s bucket=%s", up, right, width, bucket)

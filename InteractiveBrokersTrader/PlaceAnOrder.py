@@ -269,14 +269,22 @@ def _attempts_append(rows: list[dict], date_override: str | None = None) -> Path
     path = _attempts_dayrolled_path(date_override)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build a union header from the rows to preserve fields
-    header_keys: set[str] = set()
-    for r in rows:
-        if isinstance(r, dict):
-            header_keys.update(r.keys())
-    header = sorted(list(header_keys)) if header_keys else sorted(list(rows[0].keys()))
-
     file_exists = path.exists() and path.stat().st_size > 0
+
+    if file_exists:
+        # Read existing header from file to maintain consistency
+        try:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+            if not header:
+                header = ATTEMPT_FIELDS
+        except Exception:
+            header = ATTEMPT_FIELDS
+    else:
+        # New file: use canonical ATTEMPT_FIELDS order
+        header = ATTEMPT_FIELDS
+
     try:
         with path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
@@ -366,6 +374,7 @@ def log_decision(evt: str, symbol: str | None, reason: str, **fields):
 ATTEMPT_FIELDS = [
     "ts","symbol","action","status","reason",
     "exp","right","atm","oth",
+    "limit","longK","shortK",
     "order_type","order_action","qty","order_id","prev_status",
     "raw_theo","oi_atm","oi_otm","threshold",
 ]
