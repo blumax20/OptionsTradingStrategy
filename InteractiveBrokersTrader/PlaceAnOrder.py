@@ -2397,10 +2397,7 @@ def run_from_csv():
                 n_fc = force_close_symbol_via_positions(ib, _sym, args)
                 if n_fc > 0:
                     logger.info(f"[{_sym}] Force-closed {n_fc} spread(s) from positions (CSV-independent).")
-        try:
-            _attempts_append(ATTEMPTS)
-        except Exception:
-            pass
+        # Fix W: Removed duplicate flush - per-row writes in record_attempt() are sufficient
         ib.disconnect()
         return
 
@@ -3426,12 +3423,6 @@ def run_from_csv():
     except Exception as e:
         logger.warning(f"Could not write attempts CSV: {e}")
     ib.disconnect()
-    # --- Final attempts flush to day-rolled file ---
-    try:
-        out_path = _attempts_append(ATTEMPTS)
-        if out_path:
-            logger.info(f"Wrote attempts (append) to day-rolled file: {out_path}")
-    except Exception as _e:
-        logger.warning(f"Final attempts append failed: {_e}")
+    # Fix W: Removed duplicate final flush - per-row writes in record_attempt() are sufficient
 if __name__ == "__main__":
     run_from_csv()

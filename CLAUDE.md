@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 9, 2026
+**Last Updated:** February 10, 2026
 
 ---
 
@@ -535,6 +535,79 @@ elif long_worthless and short_worthless:
 
 ---
 
+### Fix U: Cross-ClientId Order Visibility + After-Hours Order Tagging (Feb 10)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (lines 127, 370, 1296, 1315, 1586), ib_close_guard.py (line 8)
+
+**Issue:** Three separate bugs caused the 5pm reconcile's buffered close orders to be invisible to downstream stages, resulting in unbuffered duplicate orders (CP at $1.54, MKC at $4.98, PFE at $0.83). The same root cause also prevented the 3pm preclose from cancelling and replacing stale close orders (TSM).
+
+**Bug U1: Three DCM functions missing `reqAllOpenOrders()`**
+
+In ib_insync, `openTrades()` on a fresh connection only returns trades from the current clientId. Orders placed by other clientIds (reconcile=880+random, PlaceAnOrder=101) are invisible unless `reqAllOpenOrders()` is called first.
+
+Three functions affected:
+- `_has_working_close_order` (clientId=883): Detection for skip/cancel decisions
+- `_working_close_limit_symbols` (clientId=887): Preclose candidate gathering
+- `_cancel_symbol_close_orders` (clientId=886): Used `reqOpenOrders()` instead of `reqAllOpenOrders()`
+
+**Fix:** Added `ib.reqAllOpenOrders()` + `ib.sleep(0.5)` before `ib.openTrades()` in all three functions.
+
+**Bug U2: `_place_combo` missing `outsideRth` and TIF**
+
+The reconcile's `_place_combo` created orders without `outsideRth=True`, causing IB to set them to "Inactive" status after hours. While DCM detected Inactive orders, the ib_close_guard only detected Inactive+GTC, not Inactive+DAY.
+
+**Fix:** Added `order.tif = "DAY"` and `order.outsideRth = True` to both LimitOrder and MarketOrder paths in `_place_combo`.
+
+**Bug U3: IB Close Guard ClientId Collision**
+
+Both DCM's `_has_working_close_order` and `ib_close_guard.has_working_auto_close` used clientId=883, causing connection failures when both ran concurrently.
+
+**Fix:** Changed `has_working_auto_close` default clientId from 883 to 884.
+
+**Impact:**
+- After-hours reconcile orders now visible to all downstream stages (no duplicate unbuffered orders)
+- 3pm preclose can now detect, cancel, and replace stale close orders with better pricing
+- Close guard no longer collides with DCM's order detection
+
+---
+
+### Fix V: Width Bucket Selection for Small Strikes (Feb 10)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py:1215 (`_get_theo_limit`)
+
+**Issue:** PFE with strikes 26.0/26.5 (width=$0.50) was assigned to the wrong width bucket. The boundary-based logic `abs(0.5-1.0) < 0.5` evaluates to `0.5 < 0.5` which is False, causing $0.50 widths to fall through to the "5" bucket. PFE got `call_debit_limit_5=$1.85` instead of `call_debit_limit_1=$0.83`.
+
+**Fix:** Replaced boundary-based bucket selection with nearest-neighbor approach matching PlaceAnOrder's `_width_bucket()`:
+```python
+_buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0)]
+bucket, _ = min(_buckets, key=lambda t: abs(width - t[1]))
+```
+
+**Impact:**
+- $0.50 width → bucket "1" (distance 0.5 from 1.0, closest)
+- $1.00 width → bucket "1" (exact match)
+- Consistent with PlaceAnOrder's existing `_width_bucket()` function
+
+---
+
+### Fix W: Duplicate Attempts CSV Entries (Feb 10)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:3429-3435, 2400-2403
+
+**Issue:** Every attempts CSV entry appeared twice because of double-write:
+1. `record_attempt()` (line 405): Immediately appends each row via `_attempts_append([row])`
+2. Final flush (line 3431): Re-writes ALL accumulated rows via `_attempts_append(ATTEMPTS)`
+3. Force-close flush (line 2401): Another redundant flush
+
+**Fix:** Removed the final bulk flush at line 3431 and the force-close flush at line 2401. The per-row writes in `record_attempt()` are sufficient and more crash-resilient.
+
+**Impact:** Each attempts entry now appears exactly once in the CSV.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -755,4 +828,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 9, 2026 by Claude (Opus 4.5) - Added Fix S (worthless spread fixed pricing)
+**Last Updated:** February 10, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)

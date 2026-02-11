@@ -5,7 +5,7 @@ from typing import Set
 LOG = logging.getLogger(__name__)
 
 def has_working_auto_close(symbol: str,
-                           client_id: int = 883,
+                           client_id: int = 884,  # Fix U3: was 883, avoid collision with DCM
                            host: str = "127.0.0.1",
                            port: int = 7497) -> bool:
     """

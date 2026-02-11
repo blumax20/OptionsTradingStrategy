@@ -124,6 +124,8 @@ class DailyCycleManagementMixin:
         out: set[str] = set()
         try:
             ib.connect('127.0.0.1', 7497, clientId=887, timeout=6)
+            ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+            ib.sleep(0.5)
             for tr in ib.openTrades() or []:
                 c = getattr(tr, 'contract', None)
                 o = getattr(tr, 'order', None)
@@ -366,10 +368,10 @@ class DailyCycleManagementMixin:
             return 0
 
         try:
-            # Refresh local view of open orders/trades
+            # Refresh local view of open orders/trades from ALL client IDs
             try:
-                ib.reqOpenOrders()
-                ib.sleep(0.25)
+                ib.reqAllOpenOrders()  # Fix U1: was reqOpenOrders() - need ALL client IDs
+                ib.sleep(0.5)
             except Exception:
                 pass
 
@@ -1211,13 +1213,9 @@ class DailyCycleManagementMixin:
                 if rows.empty:
                     return None
                 row = rows.iloc[-1]  # Use latest row for symbol
-                # Determine width bucket
-                if abs(width - 1.0) < 0.5:
-                    bucket = "1"
-                elif abs(width - 2.5) < 0.75:
-                    bucket = "2_5"
-                else:
-                    bucket = "5"
+                # Fix V: nearest-neighbor bucket selection (matches PlaceAnOrder._width_bucket)
+                _buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0)]
+                bucket, _ = min(_buckets, key=lambda t: abs(width - t[1]))
                 # Try limit columns first, then theo
                 prefix = "call_debit" if right.upper().startswith("C") else "put_debit"
                 LOG.debug("[%s] _get_theo_limit: right=%s, width=%s, bucket=%s, prefix=%s", up, right, width, bucket, prefix)
@@ -1294,6 +1292,8 @@ class DailyCycleManagementMixin:
                     if theo_limit is not None:
                         # Have CSV limit: use it
                         order = LimitOrder(action, 1, theo_limit)
+                        order.tif = "DAY"
+                        order.outsideRth = True  # Fix U2: allow after-hours execution
                         order_desc = f"LMT @ {theo_limit:.2f}"
                     else:
                         # No CSV limit: check position age before allowing market fallback
@@ -1313,6 +1313,7 @@ class DailyCycleManagementMixin:
                         if is_prev_day:
                             # Previous trading day: allow market fallback
                             order = MarketOrder(action, 1)
+                            order.outsideRth = True  # Fix U2: allow after-hours execution
                             order_desc = f"MKT (opened {position_open_date})"
                             LOG.info("direct-close: allowing market fallback for %s %s (opened %s)", up, right, position_open_date)
                         else:
@@ -1583,6 +1584,8 @@ class DailyCycleManagementMixin:
             return False
 
         try:
+            ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+            ib.sleep(0.5)
             trades = ib.openTrades() or []
             up = (sym or "").upper()
             # states that indicate an order is still alive/working
