@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 10, 2026
+**Last Updated:** February 11, 2026
 
 ---
 
@@ -608,6 +608,98 @@ bucket, _ = min(_buckets, key=lambda t: abs(width - t[1]))
 
 ---
 
+### Fix X1: Deduplicate CLOSE Symbols in from-signal Mode (Feb 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (place_debit_spread guard-skip path, from-signal CSV processing)
+
+**Issue:** ENB had 2 CLOSE rows in Feb 11 CSV (timestamps 16:07:03 and 16:16:12). PlaceAnOrder processed both rows. The `has_working_auto_close()` guard caught the first but failed on the second due to rapid IB disconnect/reconnect (7-second gap). Two close orders submitted = risk of reverse position.
+
+**Fix:** Two changes:
+1. When `has_working_auto_close()` skips a CLOSE order, add the symbol to `CLOSE_SEEN_KEYS` so subsequent CSV rows for the same symbol are caught by the in-memory set
+2. Pre-filter the CLOSE DataFrame with `drop_duplicates(subset="symbol", keep="last")` to keep only the most recent CLOSE row per symbol
+
+**Impact:** Each symbol gets at most one CLOSE order per invocation, regardless of CSV duplicates.
+
+---
+
+### Fix X2: MARKET Orders for Worthless Legs at Preclose (Feb 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (force_close_symbol_via_positions, both_worthless leg placement)
+
+**Issue:** Fix S placed individual leg orders at $0.01/$0.05 as DAY limit orders. These prices are too aggressive for illiquid options and the orders expire unfilled at 4pm.
+
+**Fix:** Check `--allow-market-fallback` flag (set during preclose when market is open):
+- **Preclose (market open):** Use MarketOrder for individual worthless legs (guaranteed fill)
+- **After-hours (market closed):** Keep LimitOrder at $0.01/$0.05 (no MARKET after-hours)
+
+Reason strings differentiate: `both_worthless_market_preclose` vs `both_worthless_fixed_price`
+
+**Impact:** Worthless positions (BSY, NLY, NWG) close at preclose via MARKET when limit pricing fails after-hours.
+
+---
+
+### Fix X3: Risk Exits Use avgCost + DTE Fallback (Feb 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_rth_risk_exits → _process_vertical)
+
+**Issue:** `_rth_risk_exits()` submitted 0 orders since Nov 2025 (~3 months). Root cause: `reqExecutions()` with `openClose == "O"` filter returned empty results (IB API limited retention, cleared on TWS restart). `_avg_open_price()` returned `(None, None)` for every leg → `_process_vertical()` returned early without evaluating stop/TP thresholds.
+
+**Fix:** Two changes:
+1. **Entry price:** Use `avgCost` from `ib.positions()` (always available) instead of `reqExecutions()`. `avgCost / 100.0` gives per-share cost; `long_entry - short_entry` = net debit entry.
+2. **Position age:** Try execution-based age first; fall back to DTE estimate (`estimated_age = 30 - current_dte`, assuming ~30 DTE at entry).
+
+Added diagnostic logging: `Risk exits: SYM C/P entry=X.XX curr=X.XX width=X.XX stop=T/F tp=T/F`
+
+**Impact:** Risk exits now functional. MNST (75% loss), ODFL (>100% gain), HRL (no close signal but caught by stop/TP) should trigger on next market day.
+
+---
+
+### Fix X4: Apply 5% Close Buffer + Width Cap (Feb 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (width_aligned_close_limit, force-close CSV fallback)
+
+**Issue:** 5% buffer only existed in DCM's `_get_theo_limit()` (direct-close path). The main close flow through PlaceAnOrder's from-signal mode used `width_aligned_close_limit()` with no buffer. Additionally, no width cap existed - T's $0.60 limit exceeded its $0.50 spread width.
+
+**Fix:** In `width_aligned_close_limit()`:
+1. **5% buffer:** `buffered = round(v * 0.95, 2)`
+2. **Width cap:** `capped = min(buffered, round(width, 2))`
+
+Also changed force-close CSV fallback from 10% buffer to 5% (since `width_aligned_close_limit` now applies 5% internally, preventing double-buffering).
+
+**Impact:**
+- TSM (width=2.50): $2.47 × 0.95 = $2.35 (was $2.47)
+- T (width=0.50): min($0.57, $0.50) = $0.50 (was $0.60, exceeding width!)
+- All close limits now bounded by actual spread width
+
+---
+
+### Fix X5: Listener - Separate Theo and Limit Columns (Feb 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py (row assembly, lines 727-736)
+
+**Issue:** Fix M made `*_limit_*` columns = `*_theo_*` values. Both columns were identical, losing the distinction between model prices (Black-Scholes) and live market prices.
+
+**Fix:** Set all limit columns to `None` in row assembly:
+- `call_debit_limit_1`: None (was theo value)
+- `put_debit_limit_1`: None (was theo value)
+- Same for `_2_5`, `_5`, and non-width-specific `call_debit_limit`/`put_debit_limit`
+
+Theo columns remain unchanged (still populated with Black-Scholes values).
+
+**Pricing flow after Fix X5:**
+- **5 PM (listener):** Limit=None, Theo=Black-Scholes → PlaceAnOrder falls back to theo (Fix B)
+- **9:35 AM (LiquidityFilter):** Limit updated with live prices (Fix N) → PlaceAnOrder uses limit
+- **3 PM (preclose):** Limit has live prices from 9:35 AM → PlaceAnOrder uses these
+
+**Impact:** Clean separation of model vs market prices. Live prices only appear after LiquidityFilter enrichment.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -643,7 +735,7 @@ The preclose ran but PlaceAnOrder.py exited early before reaching the force-clos
 ### 3. Limit-First, Theo-Fallback
 - CLOSE orders: Try `*_limit_*` columns first, fall back to `*_theo_*` columns
 - OPEN orders: Same logic (after Fix D)
-- 10% buffer applied to make limit more likely to fill
+- 5% buffer applied to close limits (Fix X4), capped at spread width
 
 ### 4. Never Place Market Orders After-Hours
 - Market is closed - fills are terrible
@@ -653,8 +745,8 @@ The preclose ran but PlaceAnOrder.py exited early before reaching the force-clos
 ### 5. After-Hours vs Market-Open Pricing (Feb 7)
 
 **After-Hours (5 PM):**
-- Listener uses Black-Scholes theo values in limit columns (Fix M)
-- Quote-based prices are unreliable (stale bids/asks)
+- Listener populates theo columns with Black-Scholes values; limit columns are None (Fix X5)
+- PlaceAnOrder falls back to theo columns when limit is empty (Fix B)
 - CSV populated with position-based strikes (Fix I for CLOSE signals)
 
 **Market Open (9:35 AM):**
@@ -828,4 +920,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 10, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)
+**Last Updated:** February 11, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)
