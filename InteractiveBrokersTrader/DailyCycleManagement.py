@@ -2490,13 +2490,18 @@ class DailyCycleManagementMixin:
             return
 
         def _mid(t: Ticker) -> float | None:
-            # Handle worthless options: if both bid and ask are 0, treat as 0 value
-            if t.bid is not None and t.ask is not None:
+            import math
+            # Fix Z1: Guard against NaN values from Error 10091 (market data subscription)
+            # ib_insync sets bid/ask/last to float('nan') when MD subscription fails;
+            # nan is NOT None, and max(0.0, nan-nan) silently returns 0.0 in Python.
+            def _valid(v):
+                return v is not None and not math.isnan(v)
+            if _valid(t.bid) and _valid(t.ask):
                 if t.bid == 0 and t.ask == 0:
                     return 0.0  # Worthless option
                 if t.ask > 0 and t.bid >= 0:
                     return (t.bid + t.ask) / 2
-            return t.last if t.last is not None else None
+            return t.last if _valid(t.last) else None
 
         # Build current positions per symbol, split by rights and strikes to detect vertical debits
         try:
@@ -2691,6 +2696,26 @@ class DailyCycleManagementMixin:
                     # Best-effort; don't block risk exits if attempts logging fails
                     pass
 
+                # Fix Z4: Check for existing working close orders before placing
+                # Reuse the risk-exit IB connection to avoid clientId conflicts
+                try:
+                    ib.reqAllOpenOrders()
+                    ib.sleep(0.5)
+                    sym_upper = sym.upper()
+                    has_working = False
+                    for t in ib.openTrades():
+                        tc = t.contract
+                        if getattr(tc, "secType", "") in ("OPT", "BAG") and getattr(tc, "symbol", "").upper() == sym_upper:
+                            st = t.orderStatus.status.lower()
+                            if st in ("presubmitted", "submitted"):
+                                has_working = True
+                                break
+                    if has_working:
+                        LOG.info("Risk exits: %s already has working close order; skipping", sym)
+                        return
+                except Exception as e:
+                    LOG.debug("Risk exits: guard check failed for %s: %s (proceeding anyway)", sym, e)
+
                 # Delegate to PlaceAnOrder to place a LIMIT CLOSE using join pricing
                 # The 3pm preclose cycle will convert to market if unfilled
                 # The fix in commit 174d769 ensures we won't cancel existing limit orders when placing limit orders
@@ -2701,12 +2726,15 @@ class DailyCycleManagementMixin:
                         "--quantity","50",
                         "--use-live-close", "join",  # Use join pricing for limit orders instead of market
                         "--live-timeout", "8",        # Fix Y1: longer timeout at market open
+                        "--close-reason", reason,     # Fix Z5: pass TP/SL reason to PlaceAnOrder attempts
                         "--quiet"
                     ])
                     submitted += 1
+                    # Fix Z2: Guard against t0=None (age unknown)
+                    age_str = f"{(now - t0).days}d" if t0 else "?"
                     LOG.info(
-                        "Risk exits: submitted LIMIT CLOSE (join) for %s %s vertical %s/%s (age %dd) entry=%.2f curr=%.2f width=%.2f reason=%s",
-                        sym, right, strike_low, strike_high, (now - t0).days, entry, curr, width, reason
+                        "Risk exits: submitted LIMIT CLOSE (join) for %s %s vertical %s/%s (age %s) entry=%.2f curr=%.2f width=%.2f reason=%s",
+                        sym, right, strike_low, strike_high, age_str, entry, curr, width, reason
                     )
                 except Exception as e:
                     LOG.warning("Risk exits: failed to submit CLOSE for %s: %s", sym, e)

@@ -377,7 +377,11 @@ ATTEMPT_FIELDS = [
     "limit","longK","shortK",
     "order_type","order_action","qty","order_id","prev_status",
     "raw_theo","oi_atm","oi_otm","threshold",
+    "close_reason",  # Fix Z5: TP/SL reason from DCM risk exits
 ]
+
+# Fix Z5: Module-level close reason, set from --close-reason CLI arg
+_CLOSE_REASON: str | None = None
 
 def record_attempt(symbol: str, action: str, status: str, reason: str, **fields):
     """
@@ -397,6 +401,10 @@ def record_attempt(symbol: str, action: str, status: str, reason: str, **fields)
     for k in ATTEMPT_FIELDS:
         if k not in row and k in fields:
             row[k] = fields[k]
+
+    # Fix Z5: Auto-include close_reason if set and not already provided
+    if _CLOSE_REASON and "close_reason" not in row:
+        row["close_reason"] = _CLOSE_REASON
 
     ATTEMPTS.append(row)
     log_decision("attempt", symbol, reason, action=action, status=status, **fields)
@@ -486,6 +494,8 @@ def parse_args():
                    help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
     p.add_argument("--live-timeout", type=float, default=3.0,
                    help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
+    p.add_argument("--close-reason", type=str, default=None,
+                   help="Fix Z5: reason for close (e.g. 'STOP(>=50%% loss)' or 'TP(>=50%% max profit)') — passed from DCM risk exits.")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -2160,22 +2170,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
             submitted += 1
-            record_attempt(
-                symbol,
-                "force_close",
-                "placed",
-                "positions_fallback",
-                exp=str(exp),
-                right=right,
-                longK=float(longK),
-                shortK=float(shortK),
-                order_type=order_type,
-                limit=(float(limit) if limit is not None else None),
-                qty=int(qty),
-                scheme=scheme,
-                orientation=("debit" if is_debit else "credit"),
-                order_action=action,
-            )
+            # Fix Z3: record_attempt already logged by place_debit_spread() with reason="success".
+            # Don't log a second "positions_fallback" entry for the same order.
         else:
             record_attempt(
                 symbol,
@@ -2333,20 +2329,12 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     strike = float(getattr(c, "strike", 0.0))
                     pos = float(getattr(p, "position", 0.0))
 
-                    # Fix X2: Use MARKET at preclose (market open), LimitOrder after-hours
-                    use_market = getattr(args, "allow_market_fallback", False)
-
-                    # Long position: sell
+                    # Long position: sell at fixed price $0.01
                     if abs(strike - float(longK)) < 0.01 and pos > 0:
                         qty = int(abs(pos))
-                        if use_market:
-                            leg_order = MarketOrder("SELL", qty)
-                            reason = "both_worthless_market_preclose"
-                            price_str = "MKT"
-                        else:
-                            leg_order = LimitOrder("SELL", qty, 0.01)
-                            reason = "both_worthless_fixed_price"
-                            price_str = "$0.01"
+                        leg_order = LimitOrder("SELL", qty, 0.01)
+                        reason = "both_worthless_fixed_price"
+                        price_str = "$0.01"
                         leg_order.tif = "DAY"
                         trade = ib.placeOrder(c, leg_order)
                         legs_closed += 1
@@ -2355,20 +2343,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
                         record_attempt(symbol, "close_individual_leg", "placed", reason,
                                      exp=str(exp), right=right, longK=float(longK),
-                                     limit=None if use_market else 0.01,  # Fix Y5: MKT orders have no limit
+                                     limit=0.01,
                                      qty=qty, order_action="SELL", leg_type="long")
 
-                    # Short position: buy
+                    # Short position: buy at fixed price $0.05
                     if abs(strike - float(shortK)) < 0.01 and pos < 0:
                         qty = int(abs(pos))
-                        if use_market:
-                            leg_order = MarketOrder("BUY", qty)
-                            reason = "both_worthless_market_preclose"
-                            price_str = "MKT"
-                        else:
-                            leg_order = LimitOrder("BUY", qty, 0.05)
-                            reason = "both_worthless_fixed_price"
-                            price_str = "$0.05"
+                        leg_order = LimitOrder("BUY", qty, 0.05)
+                        reason = "both_worthless_fixed_price"
+                        price_str = "$0.05"
                         leg_order.tif = "DAY"
                         trade = ib.placeOrder(c, leg_order)
                         legs_closed += 1
@@ -2376,7 +2359,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
                         record_attempt(symbol, "close_individual_leg", "placed", reason,
                                      exp=str(exp), right=right, shortK=float(shortK),
-                                     limit=None if use_market else 0.05,  # Fix Y5: MKT orders have no limit
+                                     limit=0.05,
                                      qty=qty, order_action="BUY", leg_type="short")
 
                 if legs_closed > 0:
@@ -2391,7 +2374,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     return submitted
 
 def run_from_csv():
+    global _CLOSE_REASON
     args = parse_args()
+    # Fix Z5: Set module-level close reason so all record_attempt calls include it
+    _CLOSE_REASON = getattr(args, "close_reason", None)
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     # Quiet console noise if requested

@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 12, 2026
+**Last Updated:** February 13, 2026
 
 ---
 
@@ -623,20 +623,19 @@ bucket, _ = min(_buckets, key=lambda t: abs(width - t[1]))
 
 ---
 
-### Fix X2: MARKET Orders for Worthless Legs at Preclose (Feb 11)
-**Status:** ✓ IMPLEMENTED
+### Fix X2: Fixed-Price LimitOrders for Worthless Legs (Feb 11, corrected Feb 12)
+**Status:** ✓ IMPLEMENTED (CORRECTED)
 
 **Location:** PlaceAnOrder.py (force_close_symbol_via_positions, both_worthless leg placement)
 
-**Issue:** Fix S placed individual leg orders at $0.01/$0.05 as DAY limit orders. These prices are too aggressive for illiquid options and the orders expire unfilled at 4pm.
+**Issue:** Fix S placed individual leg orders at $0.01/$0.05 as DAY limit orders. Fix X2 originally changed preclose to use MarketOrder, but MarketOrders logged `limit=0.0` and risk bad fills on illiquid worthless options.
 
-**Fix:** Check `--allow-market-fallback` flag (set during preclose when market is open):
-- **Preclose (market open):** Use MarketOrder for individual worthless legs (guaranteed fill)
-- **After-hours (market closed):** Keep LimitOrder at $0.01/$0.05 (no MARKET after-hours)
+**Fix (corrected):** Always use LimitOrder with fixed pricing regardless of preclose or after-hours:
+- **Long leg (SELL):** LimitOrder at $0.01
+- **Short leg (BUY):** LimitOrder at $0.05
+- Reason: `both_worthless_fixed_price` (unified, no more `both_worthless_market_preclose`)
 
-Reason strings differentiate: `both_worthless_market_preclose` vs `both_worthless_fixed_price`
-
-**Impact:** Worthless positions (BSY, NLY, NWG) close at preclose via MARKET when limit pricing fails after-hours.
+**Impact:** Worthless legs always close with predictable fixed pricing. Attempts CSV logs correct limit values ($0.01/$0.05).
 
 ---
 
@@ -763,16 +762,19 @@ Negative theo caused `_get_theo_limit()` in DailyCycleManagement to return `None
 
 ---
 
-### Fix Y5: Worthless Legs limit=0.0 Logging (Feb 12)
-**Status:** ✓ IMPLEMENTED
+### Fix Y5: Worthless Legs — Always Use Fixed-Price LimitOrders (Feb 12, corrected)
+**Status:** ✓ IMPLEMENTED (CORRECTED)
 
-**Location:** PlaceAnOrder.py (force_close_symbol_via_positions, worthless leg record_attempt calls)
+**Location:** PlaceAnOrder.py (force_close_symbol_via_positions, both_worthless leg placement)
 
-**Issue:** When `use_market=True` at preclose, `record_attempt()` passed `limit=0.0` for MarketOrders on worthless legs. BSY and NLY showed `limit=0.0` in the attempts CSV, looking like a $0.00 limit order instead of a market order.
+**Issue:** Original Fix Y5 only changed logging from `limit=0.0` to `limit=None`. The actual order type at preclose was still MarketOrder (from Fix X2), which submits $0.00 and won't fill.
 
-**Fix:** Changed `limit=0.0 if use_market else 0.05` to `limit=None if use_market else 0.05` (and same for 0.01 long leg). MKT orders now show empty limit field in attempts CSV.
+**Fix:** Removed the `use_market` branching entirely. Worthless legs always use LimitOrder:
+- Long leg: `LimitOrder("SELL", qty, 0.01)` with `limit=0.01` logged
+- Short leg: `LimitOrder("BUY", qty, 0.05)` with `limit=0.05` logged
+- Unified reason: `both_worthless_fixed_price` (removed `both_worthless_market_preclose`)
 
-**Impact:** Attempts CSV correctly distinguishes between limit orders ($0.01/$0.05) and market orders (no limit).
+**Impact:** Worthless legs always close with predictable $0.01/$0.05 pricing. Attempts CSV shows correct limit values.
 
 ---
 
@@ -813,6 +815,85 @@ NWG has NO entries in any CSV or attempts file (Feb 11 or 12). The position exis
 - Risk exits (either not detected as a vertical, or filtered out by age/entry/market-data)
 
 **Action:** Check NWG position in TWS. If worthless, manually close or add to force-close list.
+
+---
+
+### Fix Z1: NaN Guard in `_mid()` — False Stop-Loss Prevention (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py:2492-2504 (`_mid` function inside `_rth_risk_exits`)
+
+**Issue:** On Feb 13 at 9:48 AM, `_rth_risk_exits()` submitted 15 CLOSE orders — ALL were false stop-loss triggers. IB returned Error 10091 (market data subscription required) for all option contracts. ib_insync set bid/ask/last to `float('nan')`. Python's NaN has dangerous comparison behavior:
+- `nan is not None` → `True` (NaN is not None!)
+- `max(0.0, nan - nan)` → `0.0` (Python NaN comparison quirk)
+- Every symbol got `curr=0.00` → false stop-loss detected
+
+**Root Cause:** `_mid()` returned `nan` (via `t.last`), which passed the `is not None` check. `max(0.0, ml - ms)` silently produced `0.0`.
+
+**Fix:** Added `math.isnan()` guard to `_mid()`. NaN bid/ask/last values now return `None` instead of `nan`. The existing `curr is None` guard at line 2659 then correctly skips the symbol.
+
+**Impact:** Risk exits no longer trigger false stop-losses when market data subscription fails. Symbols with Error 10091 are properly skipped with "no valid market data" log message.
+
+---
+
+### Fix Z2: TypeError Guard in Risk Exit Logging (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py:2713 (success logging in `_rth_risk_exits`)
+
+**Issue:** After PlaceAnOrder placed an order, the success log line computed `(now - t0).days` where `t0` could be None (when both execution-based and DTE-based age calculations failed). This TypeError was caught but logged "failed to submit CLOSE" — misleading, since the order WAS actually placed.
+
+**Fix:** Changed `(now - t0).days` to `f"{(now - t0).days}d" if t0 else "?"`.
+
+**Impact:** No more TypeError exceptions masking successful order submissions. Log accurately shows "age ?" when age is unknown.
+
+---
+
+### Fix Z3: Remove Duplicate Attempts CSV Entries (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py:2160-2178 (force_close_symbol_via_positions)
+
+**Issue:** Every successful force-close order produced TWO entries in the attempts CSV:
+1. `place_debit_spread()` internally logs `record_attempt(reason="success")`
+2. `force_close_symbol_via_positions()` logs another `record_attempt(reason="positions_fallback")`
+
+Same order, same limit, same strikes — duplicate entries.
+
+**Fix:** Removed the redundant `record_attempt` at lines 2163-2178. The `place_debit_spread()` "success" entry is sufficient. Kept `CLOSE_SEEN_KEYS.add()` and `submitted += 1` logic.
+
+**Impact:** Each force-close order now appears exactly once in the attempts CSV.
+
+---
+
+### Fix Z4: Risk Exit Deduplication Guard (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (inside `_process_vertical()` in `_rth_risk_exits()`)
+
+**Issue:** The 10:30 AM retry (Fix Y6) called `_rth_risk_exits()` fresh, re-evaluating all positions and placing new orders without checking if working close orders already existed from the 9:48 run. PBR, T, TSM, ZBH each got duplicate orders.
+
+**Fix:** Before calling `_run_place_an_order()`, check for existing working close orders using the already-established risk-exit IB connection (clientId=878). Uses `ib.reqAllOpenOrders()` + `ib.openTrades()` to find PreSubmitted/Submitted orders for the symbol.
+
+**Impact:** 10:30 retry skips symbols that already have working close orders from the 9:48 run.
+
+---
+
+### Fix Z5: TP/SL Reason in PlaceAnOrder Attempts CSV (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (argparse, record_attempt, run_from_csv), DailyCycleManagement.py (_rth_risk_exits)
+
+**Issue:** Risk exit close orders appeared in the attempts CSV as generic `force_close,placed,success` with no indication of WHY the exit was triggered (stop-loss vs take-profit).
+
+**Fix:**
+1. Added `--close-reason` CLI argument to PlaceAnOrder.py
+2. DCM passes `--close-reason "STOP(>=50% loss)"` or `"TP(>=50% max profit)"` from risk exits
+3. Added `close_reason` column to `ATTEMPT_FIELDS`
+4. Module-level `_CLOSE_REASON` variable auto-populates all `record_attempt` calls
+5. Set via `global _CLOSE_REASON` in `run_from_csv()` from args
+
+**Impact:** Attempts CSV now shows the TP/SL trigger reason in the `close_reason` column for risk exit orders.
 
 ---
 
@@ -1036,4 +1117,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 12, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)
+**Last Updated:** February 13, 2026 by Claude (Opus 4.6) - Added Fix Z1 (NaN guard), Fix Z2 (TypeError), Fix Z3 (double-logging), Fix Z4 (dedup), Fix Z5 (TP/SL reason)
