@@ -403,8 +403,9 @@ def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
         put_long  = _bs_price(S, atm, T, r, sigma_atm, call=False)
         put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma_otm, call=False)
         key = "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
-        out[f"call_debit_theo_{key}"] = float(call_long - call_short)
-        out[f"put_debit_theo_{key}"]  = float(put_long - put_short)
+        # Fix Y2b: clamp to >= 0 (debit spread value cannot be negative)
+        out[f"call_debit_theo_{key}"] = max(0.0, float(call_long - call_short))
+        out[f"put_debit_theo_{key}"]  = max(0.0, float(put_long - put_short))
     return out
 
 # --- Parse TradingView/alert message for signal side and strategy position ---
@@ -692,19 +693,20 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
     iv_atm = result.get("implied_volatility_atm")
     iv_otm = result.get("implied_volatility_otm")
 
+    # Parse OTM IV (for short leg) first - needed for ATM fallback below
+    sigma_otm = None
+    if not _is_nan(iv_otm):
+        try: sigma_otm = float(iv_otm)
+        except Exception: sigma_otm = None
+
     # Parse ATM IV (for long leg)
     sigma_atm = None
     if not _is_nan(iv_atm):
         try: sigma_atm = float(iv_atm)
         except Exception: sigma_atm = None
     if sigma_atm is None or _is_nan(sigma_atm):
-        sigma_atm = 0.25  # default
-
-    # Parse OTM IV (for short leg) - None means _theo_spread_debits will use sigma_atm
-    sigma_otm = None
-    if not _is_nan(iv_otm):
-        try: sigma_otm = float(iv_otm)
-        except Exception: sigma_otm = None
+        # Fix Y2a: prefer iv_otm over hardcoded 0.25 when iv_atm is missing
+        sigma_atm = sigma_otm if (sigma_otm is not None and not _is_nan(sigma_otm)) else 0.25
 
     theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None}
     if not _is_nan(S) and not _is_nan(atm) and (days_to_exp is not None and days_to_exp > 0):
@@ -724,16 +726,17 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         "otm_strike_put": result.get("put_otm_strike"),
         "iv_atm": None if _is_nan(iv_atm) else iv_atm,
         "iv_otm": None if _is_nan(iv_otm) else iv_otm,
-        "call_debit_limit": call_debit_q,
-        "put_debit_limit":  put_debit_q,
-        # Fix M: Always use theo values for limit columns (after-hours quotes are unreliable)
-        # Live prices will be backfilled at market open via backfill_theo.py --live
-        "call_debit_limit_1": theo.get("call_debit_theo_1"),
-        "put_debit_limit_1": theo.get("put_debit_theo_1"),
-        "call_debit_limit_2_5": theo.get("call_debit_theo_2_5"),
-        "put_debit_limit_2_5": theo.get("put_debit_theo_2_5"),
-        "call_debit_limit_5": theo.get("call_debit_theo_5"),
-        "put_debit_limit_5": theo.get("put_debit_theo_5"),
+        "call_debit_limit": None,
+        "put_debit_limit":  None,
+        # Fix X5: Limit columns reserved for live market prices (populated by
+        # LiquidityFilter at 9:35 AM).  Theo columns carry Black-Scholes values.
+        # PlaceAnOrder falls back to theo when limit is empty (Fix B).
+        "call_debit_limit_1": None,
+        "put_debit_limit_1": None,
+        "call_debit_limit_2_5": None,
+        "put_debit_limit_2_5": None,
+        "call_debit_limit_5": None,
+        "put_debit_limit_5": None,
         "call_debit_theo_1": (theo or {}).get("call_debit_theo_1"),
         "put_debit_theo_1":  (theo or {}).get("put_debit_theo_1"),
         "call_debit_theo_2_5": (theo or {}).get("call_debit_theo_2_5"),

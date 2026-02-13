@@ -1311,11 +1311,18 @@ class DailyCycleManagementMixin:
                         is_prev_day = self._is_previous_trading_day_position(position_open_date)
 
                         if is_prev_day:
-                            # Previous trading day: allow market fallback
+                            # Fix Y3: only allow MKT fallback during market hours
+                            now_ny = self._now_ny()
+                            market_open = (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30)) and now_ny.hour < 16
+                            if not market_open:
+                                LOG.info("direct-close: skipping %s %s - no theo limit and market closed (opened %s); deferring to after-hours batch",
+                                         up, right, position_open_date)
+                                return False  # Defer to after-hours batch placement with proper fallback chain
+                            # Market is open: allow market fallback
                             order = MarketOrder(action, 1)
                             order.outsideRth = True  # Fix U2: allow after-hours execution
                             order_desc = f"MKT (opened {position_open_date})"
-                            LOG.info("direct-close: allowing market fallback for %s %s (opened %s)", up, right, position_open_date)
+                            LOG.info("direct-close: allowing market fallback for %s %s (opened %s, market open)", up, right, position_open_date)
                         else:
                             # Same-day OR unknown age: limit orders only
                             age_desc = f"opened {position_open_date}" if position_open_date else "unknown age"
@@ -2524,6 +2531,10 @@ class DailyCycleManagementMixin:
             except: pass
             return
 
+        # Fix Y4: log position summary for diagnostics
+        LOG.info("Risk exits: scanning %d symbols with option positions: %s",
+                 len(legs_by_sym), ", ".join(sorted(legs_by_sym.keys())))
+
         # Pull executions for last 30 days to infer OPEN entry prices and age
         since = (now.astimezone(ZoneInfo("UTC")) - timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
         try:
@@ -2580,17 +2591,41 @@ class DailyCycleManagementMixin:
                 nonlocal submitted, checked
                 checked += 1
 
-                # Determine age from earliest OPEN exec across the two legs
-                long_avg, long_t0 = _avg_open_price(long_leg["conId"])
-                short_avg, short_t0 = _avg_open_price(short_leg["conId"])
+                # --- Age check: try execution history first, fall back to DTE estimate ---
+                _, long_t0 = _avg_open_price(long_leg["conId"])
+                _, short_t0 = _avg_open_price(short_leg["conId"])
                 t0 = min([t for t in [long_t0, short_t0] if t is not None], default=None)
-                if t0 is None or (now - t0) < timedelta(days=days_old):
-                    return  # ignore if too new or no exec time
 
-                # Entry net (debit) = long_avg - short_avg
-                if long_avg is None or short_avg is None:
-                    return
-                entry = max(0.0, (long_avg - short_avg))
+                if t0 is not None:
+                    if (now - t0) < timedelta(days=days_old):
+                        LOG.debug("Risk exits: %s %s %.0f/%.0f skipped - too new (age=%dd, min=%dd)",
+                                  sym, right, strike_low, strike_high, (now - t0).days, days_old)
+                        return  # too new
+                else:
+                    # Fallback: estimate age from contract expiration (assume ~30 DTE at entry)
+                    try:
+                        exp_str = getattr(long_leg.get("contract"), "lastTradeDateOrContractMonth", "") or ""
+                        if exp_str:
+                            from datetime import datetime as _dt_cls
+                            exp_date = _dt_cls.strptime(exp_str, "%Y%m%d").date()
+                            dte = (exp_date - now.date()).days
+                            estimated_age = max(0, 30 - dte)
+                            if estimated_age < days_old:
+                                LOG.debug("Risk exits: %s %s %.0f/%.0f skipped - estimated too new (est_age=%dd, dte=%d, min=%dd)",
+                                          sym, right, strike_low, strike_high, estimated_age, dte, days_old)
+                                return  # estimated too new
+                    except Exception:
+                        pass  # skip age check if we can't determine it
+
+                # --- Entry price: use avgCost from positions (always available) ---
+                long_entry = long_leg["avgCost"] / 100.0   # avgCost is per-contract; /100 for per-share
+                short_entry = short_leg["avgCost"] / 100.0
+                entry = max(0.0, long_entry - short_entry)
+
+                if entry <= 0.01:
+                    LOG.info("Risk exits: %s %s %.0f/%.0f skipped - entry=%.4f (<=0.01, avgCost long=%.2f short=%.2f)",
+                             sym, right, strike_low, strike_high, entry, long_leg["avgCost"], short_leg["avgCost"])
+                    return  # can't evaluate P&L on zero/negligible entry
 
                 # Current net using mid prices
                 try:
@@ -2617,7 +2652,8 @@ class DailyCycleManagementMixin:
                     if ml is not None and ms is not None:
                         curr = max(0.0, ml - ms)
                     if curr is None:
-                        LOG.debug("Risk exits: skipping %s %s - no valid market data (ml=%s, ms=%s)", sym, right, ml, ms)
+                        LOG.info("Risk exits: %s %s %.0f/%.0f skipped - no valid market data (ml=%s, ms=%s)",
+                                 sym, right, strike_low, strike_high, ml, ms)
                         return
                 except Exception as e:
                     LOG.warning("Risk exits: MD error for %s %s strikes(%s,%s): %s", sym, right, strike_low, strike_high, e)
@@ -2628,6 +2664,9 @@ class DailyCycleManagementMixin:
                 stop_hit = curr <= (1.0 - loss_frac) * entry
                 # take-profit: current >= entry + gain_frac * (width - entry)
                 tp_hit = curr >= entry + gain_frac * max(0.0, (width - entry))
+
+                LOG.info("Risk exits: %s %s %.0f/%.0f entry=%.2f curr=%.2f width=%.2f stop=%s tp=%s",
+                         sym, right, strike_low, strike_high, entry, curr, width, stop_hit, tp_hit)
 
                 if not (stop_hit or tp_hit):
                     return
@@ -2661,6 +2700,7 @@ class DailyCycleManagementMixin:
                         "--symbols", sym,
                         "--quantity","50",
                         "--use-live-close", "join",  # Use join pricing for limit orders instead of market
+                        "--live-timeout", "8",        # Fix Y1: longer timeout at market open
                         "--quiet"
                     ])
                     submitted += 1
@@ -3281,6 +3321,8 @@ if __name__ == "__main__":
                         help="After-hours batch: delegate opens and enforce CLOSE signals.")
     parser.add_argument("--enforce-closes", type=int, default=0,
                         help="If >0: enforce recent CLOSE signals for last N days (fallback path).")
+    parser.add_argument("--risk-exits-only", action="store_true",
+                        help="Re-run RTH risk exits only (mid-day retry for failed market-open attempts).")
     parser.add_argument("--verbose", action="store_true", help="Enable INFO logging.")
     args = parser.parse_args()
 
@@ -3313,6 +3355,16 @@ if __name__ == "__main__":
 
         if args.reconcile:
             host._reconcile_positions_with_signals_lookback(days=21)
+
+        if args.risk_exits_only:
+            # Fix Y6: mid-day retry for risk exits that failed at market open
+            now_ny = host._now_ny()
+            hh = now_ny.hour
+            if 9 <= hh < 16:
+                LOG.info("Risk exits retry: running at %s ET", now_ny.strftime("%H:%M"))
+                host._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
+            else:
+                LOG.warning("--risk-exits-only blocked: market not open at %s ET", now_ny.strftime("%H:%M"))
 
         if args.enforce_closes and args.enforce_closes > 0:
             host._enforce_recent_closes(days=args.enforce_closes)

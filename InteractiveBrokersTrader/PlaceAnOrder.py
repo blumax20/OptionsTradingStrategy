@@ -484,6 +484,8 @@ def parse_args():
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     p.add_argument("--allow-market-fallback", action="store_true", default=False,
                    help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
+    p.add_argument("--live-timeout", type=float, default=3.0,
+                   help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -630,21 +632,31 @@ def _width_aligned_value(row: pd.Series, right: str, kind: str, width_bucket: st
     return None
 
 def width_aligned_close_limit(row: pd.Series, right: str, width: float | None) -> float | None:
-    """Close (SELL) price: prefer width-aligned *limit* column; fall back to width-aligned *theo*."""
+    """Close (SELL) price: prefer width-aligned *limit* column; fall back to width-aligned *theo*.
+    Applies 5% buffer and caps at actual spread width."""
     wb = _width_bucket(width)
     if wb is None:
         logger.warning(f"Cannot determine width bucket for width={width}")
         return None
     v = _width_aligned_value(row, right, "limit", wb)
-    if v is not None:
-        return v
-    # Fallback to theo
-    theo_v = _width_aligned_value(row, right, "theo", wb)
-    if theo_v is not None:
-        logger.info(f"Using theo fallback for {right} width={width}: {theo_v}")
+    if v is None:
+        # Fallback to theo
+        v = _width_aligned_value(row, right, "theo", wb)
+        if v is not None:
+            logger.info(f"Using theo fallback for {right} width={width}: {v}")
+        else:
+            logger.warning(f"Both limit and theo are None for {right} width={width}")
+            return None
+    # Fix X4: apply 5% buffer for better fill rate and cap at spread width
+    raw = v
+    buffered = round(v * 0.95, 2)
+    if width is not None and width > 0:
+        capped = min(buffered, round(width, 2))
     else:
-        logger.warning(f"Both limit and theo are None for {right} width={width}")
-    return theo_v
+        capped = buffered
+    if capped != raw:
+        logger.info(f"[close-limit] {right} w={width} bucket={wb} raw={raw:.2f} buffered={buffered:.2f} capped={capped:.2f}")
+    return capped
 
 def width_aligned_theoretical(row: pd.Series, right: str, width: float | None) -> float | None:
     """OPEN (BUY) theoretical debit for a given width bucket."""
@@ -895,6 +907,13 @@ def place_debit_spread(
     """
     # --- HARD CLOSE GUARD ---
     if has_working_auto_close(symbol):
+        # Fix X1: Mark symbol as seen so subsequent CSV rows for the same symbol
+        # are caught by CLOSE_SEEN_KEYS without needing another IB guard check
+        try:
+            ckey = _close_key(symbol, right, str(expiration))
+            CLOSE_SEEN_KEYS.add(ckey)
+        except Exception:
+            pass
         # For force_close role: KEEP existing limit orders, don't cancel for market orders
         # This prevents replacing working limits with market orders after-hours
         if role == "force_close" and order_type.upper() == "MKT":
@@ -1891,7 +1910,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 shortK,
                 action="SELL",  # price using SELL-close convention
                 scheme=scheme,
-                timeout=3.0,
+                timeout=getattr(args, "live_timeout", 3.0),  # Fix Y1: configurable timeout
             )
             if lim is not None:
                 try:
@@ -1921,12 +1940,12 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     row = rows.iloc[-1]  # Use LATEST row (aligns with DailyCycleManagement)
                     csv_limit = width_aligned_close_limit(row, right, width)
                     if csv_limit is not None:
-                        # Apply conservative buffer (10%) for better fill rate
-                        buffered_csv_limit = csv_limit * 0.90
+                        # Apply additional 5% buffer (width_aligned_close_limit already applies 5% + width cap)
+                        buffered_csv_limit = csv_limit * 0.95
                         if buffered_csv_limit >= args.min_limit:
                             limit = buffered_csv_limit
-                            logger.info(f"[{symbol}] Force-close fallback: using CSV limit with 10% buffer from {csv_path}: "
-                                        f"raw=${csv_limit:.2f}, buffered=${limit:.2f}")
+                            logger.info(f"[{symbol}] Force-close fallback: CSV limit from {csv_path}: "
+                                        f"csv=${csv_limit:.2f} (already 5%+cap), additional 5%=${limit:.2f}")
                             break  # Found valid limit, stop searching
                 except Exception as e:
                     logger.warning(f"[{symbol}] Failed to read CSV fallback from {csv_path}: {e}")
@@ -2314,30 +2333,51 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     strike = float(getattr(c, "strike", 0.0))
                     pos = float(getattr(p, "position", 0.0))
 
-                    # Long position: sell for $0.01
+                    # Fix X2: Use MARKET at preclose (market open), LimitOrder after-hours
+                    use_market = getattr(args, "allow_market_fallback", False)
+
+                    # Long position: sell
                     if abs(strike - float(longK)) < 0.01 and pos > 0:
-                        leg_order = LimitOrder("SELL", int(abs(pos)), 0.01)
+                        qty = int(abs(pos))
+                        if use_market:
+                            leg_order = MarketOrder("SELL", qty)
+                            reason = "both_worthless_market_preclose"
+                            price_str = "MKT"
+                        else:
+                            leg_order = LimitOrder("SELL", qty, 0.01)
+                            reason = "both_worthless_fixed_price"
+                            price_str = "$0.01"
                         leg_order.tif = "DAY"
                         trade = ib.placeOrder(c, leg_order)
                         legs_closed += 1
                         submitted += 1
                         CLOSE_SEEN_KEYS.add(ckey)
-                        logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {abs(pos):.0f} @ $0.01)")
-                        record_attempt(symbol, "close_individual_leg", "placed", "both_worthless_fixed_price",
-                                     exp=str(exp), right=right, longK=float(longK), limit=0.01,
-                                     qty=int(abs(pos)), order_action="SELL", leg_type="long")
+                        logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
+                        record_attempt(symbol, "close_individual_leg", "placed", reason,
+                                     exp=str(exp), right=right, longK=float(longK),
+                                     limit=None if use_market else 0.01,  # Fix Y5: MKT orders have no limit
+                                     qty=qty, order_action="SELL", leg_type="long")
 
-                    # Short position: buy for $0.05
+                    # Short position: buy
                     if abs(strike - float(shortK)) < 0.01 and pos < 0:
-                        leg_order = LimitOrder("BUY", int(abs(pos)), 0.05)
+                        qty = int(abs(pos))
+                        if use_market:
+                            leg_order = MarketOrder("BUY", qty)
+                            reason = "both_worthless_market_preclose"
+                            price_str = "MKT"
+                        else:
+                            leg_order = LimitOrder("BUY", qty, 0.05)
+                            reason = "both_worthless_fixed_price"
+                            price_str = "$0.05"
                         leg_order.tif = "DAY"
                         trade = ib.placeOrder(c, leg_order)
                         legs_closed += 1
                         submitted += 1
-                        logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {abs(pos):.0f} @ $0.05)")
-                        record_attempt(symbol, "close_individual_leg", "placed", "both_worthless_fixed_price",
-                                     exp=str(exp), right=right, shortK=float(shortK), limit=0.05,
-                                     qty=int(abs(pos)), order_action="BUY", leg_type="short")
+                        logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
+                        record_attempt(symbol, "close_individual_leg", "placed", reason,
+                                     exp=str(exp), right=right, shortK=float(shortK),
+                                     limit=None if use_market else 0.05,  # Fix Y5: MKT orders have no limit
+                                     qty=qty, order_action="BUY", leg_type="short")
 
                 if legs_closed > 0:
                     logger.info(f"[{symbol}] Closed {legs_closed} worthless leg(s) with fixed pricing")
@@ -2467,6 +2507,12 @@ def run_from_csv():
 
     if only:
         df = df[df["symbol"].str.upper().isin(only)]
+
+    # Fix X1: Deduplicate CSV - keep only the last row per symbol to prevent
+    # processing duplicate CLOSE signals for the same symbol (e.g., ENB appearing
+    # twice causes the IB guard to be called twice in rapid succession, failing on the second)
+    if not df.empty:
+        df = df.drop_duplicates(subset="symbol", keep="last").reset_index(drop=True)
 
     # Quick stats for CLOSE signals (for debugging)
     if "signal_type" in df.columns:

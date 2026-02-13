@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 11, 2026
+**Last Updated:** February 12, 2026
 
 ---
 
@@ -700,6 +700,122 @@ Theo columns remain unchanged (still populated with Black-Scholes values).
 
 ---
 
+### Fix Y1: Increase Live Pricing Timeout for Risk Exits (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (argparse + force_close_symbol_via_positions), DailyCycleManagement.py (_rth_risk_exits)
+
+**Issue:** At 9:39 AM on Feb 12, risk exits correctly identified positions for stop-loss/take-profit but `live_spread_price()` used a 3-second timeout. IB option market data for low-liquidity strikes doesn't populate within 3s at market open. 8 of 15 symbols skipped with `no_viable_limit_all_fallbacks_failed`.
+
+**Fix:**
+- Added `--live-timeout` CLI argument to PlaceAnOrder.py (default 3.0)
+- `force_close_symbol_via_positions()` now uses `args.live_timeout` instead of hardcoded 3.0
+- `_rth_risk_exits()` passes `"--live-timeout", "8"` to PlaceAnOrder for longer polling at market open
+
+**Impact:** Risk exit close orders get 8 seconds for live market data instead of 3, reducing failures at market open.
+
+---
+
+### Fix Y2: Negative Theo Values — IV Fallback + Clamp (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** listener.py (_theo_spread_debits, IV assignment block)
+
+**Issue:** AMT CLOSE signal had `iv_atm=None` (defaulted to 0.25) and `iv_otm=0.37`. With this IV mismatch, the OTM put at 170 (37% IV) was worth MORE than the ATM put at 175 (25% IV), producing negative put debit theo values: -0.8, -1.31, -1.65. MNST had similar issue (iv_atm=0.28 vs iv_otm=0.38 with 8 DTE).
+
+Negative theo caused `_get_theo_limit()` in DailyCycleManagement to return `None` (check `if v > 0`), which triggered the MKT fallback at 5pm — placing an AMT MARKET order after hours.
+
+**Fix — two changes:**
+1. **IV fallback order:** When `iv_atm` is None/NaN, use `iv_otm` instead of hardcoded 0.25. Moved OTM IV parsing before ATM IV fallback.
+2. **Clamp outputs:** `max(0.0, float(call_long - call_short))` — debit spread closing value cannot be negative.
+
+**Impact:** All theo values are now >= 0. `_get_theo_limit()` returns valid limit prices for CLOSE signals. No more MKT fallback due to negative theos.
+
+---
+
+### Fix Y3: _place_combo — No MKT After Hours (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_place_combo, line ~1313)
+
+**Issue:** When `_get_theo_limit()` returned None (due to negative theos from Fix Y2), `_place_combo` fell back to MarketOrder for "previous day" positions after hours. This placed AMT MKT SELL at 5:05 PM.
+
+**Fix:** Added market-hours check before allowing MKT fallback. If market is closed and no theo limit available, skip the order (return False) and defer to the after-hours batch placement which has a more robust fallback chain via `force_close_symbol_via_positions()`.
+
+**Impact:** Safety net — even if theo values are somehow invalid, no MKT orders after hours from the reconcile path.
+
+---
+
+### Fix Y4: Risk Exits Diagnostic Logging (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_process_vertical, _rth_risk_exits)
+
+**Issue:** BK (CALL spread 130/135, stock at 115.12) was deeply OTM and nearly worthless but never appeared in the 9:39 AM risk exit attempts. The function returned silently at three filter points without any logging, making diagnosis impossible.
+
+**Fix:**
+1. Added LOG.debug for "too new" age filter (execution-based and DTE-estimated)
+2. Added LOG.info for "entry <= 0.01" skip (likely BK's issue — avgCost calculation produced negligible entry)
+3. Upgraded market data failure from LOG.debug to LOG.info with strike info
+4. Added position scan summary at start: "scanning N symbols: SYM1, SYM2, ..."
+
+**Impact:** Next time a symbol is silently filtered, the log shows exactly why. BK's root cause (likely avgCost-based entry = 0) will be visible.
+
+---
+
+### Fix Y5: Worthless Legs limit=0.0 Logging (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (force_close_symbol_via_positions, worthless leg record_attempt calls)
+
+**Issue:** When `use_market=True` at preclose, `record_attempt()` passed `limit=0.0` for MarketOrders on worthless legs. BSY and NLY showed `limit=0.0` in the attempts CSV, looking like a $0.00 limit order instead of a market order.
+
+**Fix:** Changed `limit=0.0 if use_market else 0.05` to `limit=None if use_market else 0.05` (and same for 0.01 long leg). MKT orders now show empty limit field in attempts CSV.
+
+**Impact:** Attempts CSV correctly distinguishes between limit orders ($0.01/$0.05) and market orders (no limit).
+
+---
+
+### Fix Y6: Mid-Day Risk Exit Retry at 10:30 AM (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (__main__ CLI), Windows Task Scheduler
+
+**Issue:** Risk exits run once at 9:35 AM. If live pricing fails (common at market open), positions aren't retried until 3:00 PM preclose — a 5.5-hour gap. XP, PG, PYPL, SYY all sat unclosed from 9:40 AM to 3:00 PM.
+
+**Fix:**
+1. Added `--risk-exits-only` CLI flag that runs just `_rth_risk_exits()` with market-hours guard
+2. Created Windows scheduled task `IB_RiskExits_Retry_1030` running daily at 10:30 AM
+
+**Impact:** Positions that fail risk exit at 9:35 AM get a second attempt at 10:30 AM when market data is more reliable.
+
+---
+
+### Fix Y7: IB-DCM-Preclose Task Disabled (Feb 12)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** Windows Task Scheduler
+
+**Issue:** `IB-DCM-Preclose` had `Start In: N/A` and `Last Result: 2` (failed). It ran `python.exe DailyCycleManagement.py --preclose` without a working directory. However, `IB_ForceClose_MarketOrders_1500` (ForceMktClose.cmd) covers the same 3pm preclose and works (Last Result: 0).
+
+**Fix:** Disabled the broken `IB-DCM-Preclose` task. `ForceMktClose.cmd` handles preclose.
+
+**Impact:** Eliminates confusing duplicate task with different error states.
+
+---
+
+### NWG Investigation Note (Feb 12)
+
+**Status:** MANUAL INVESTIGATION NEEDED
+
+NWG has NO entries in any CSV or attempts file (Feb 11 or 12). The position exists but was not picked up by:
+- 21-day reconcile (no CLOSE signal in any CSV within 21 days)
+- Risk exits (either not detected as a vertical, or filtered out by age/entry/market-data)
+
+**Action:** Check NWG position in TWS. If worthless, manually close or add to force-close list.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -920,4 +1036,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 11, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)
+**Last Updated:** February 12, 2026 by Claude (Opus 4.6) - Added Fix U (cross-clientId order visibility), Fix V (width bucket), Fix W (duplicate CSV)
