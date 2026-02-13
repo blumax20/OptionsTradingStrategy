@@ -897,6 +897,91 @@ Same order, same limit, same strikes — duplicate entries.
 
 ---
 
+### Fix AA1: Block OPEN When Opposite-Side Unwind Fails (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (CALL_OPEN path lines 2766-2784, PUT_OPEN path lines 2804-2822)
+
+**Issue:** When a CALL_OPEN signal was received and the account held PUT spreads, the system tried to unwind the PUT first via `force_close_symbol_via_positions()`. But `allow_call = True` at line 2784 was **unconditional** — it was set even when the unwind returned 0 (no spreads closed) or threw an exception.
+
+**Impact on Feb 13:**
+- HRL: CALL spread not closed (no_viable_limit), but PUT_OPEN placed anyway → simultaneous CALL + PUT positions
+- KEY: CALL partially closed (worthless_leg_fallback for one leg), but PUT_OPEN placed anyway
+
+**Fix:** Moved `allow_call = True` (and `allow_put = True` for PUT_OPEN path) inside the `if n_unw > 0:` branch. When unwind returns 0 or throws, the OPEN is now skipped with `opposite_unwind_failed` or `opposite_unwind_exception` logged to attempts CSV.
+
+**Impact:** No more simultaneous opposite-side positions when unwind fails. OPEN is blocked until opposite position is actually closed.
+
+---
+
+### Fix AA2: Remove Double-Logging for OPEN Orders (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (CALL_OPEN handler lines 3173-3195, PUT_OPEN handler lines 3340-3375, fallback paths)
+
+**Issue:** When an OPEN order succeeded, `place_debit_spread()` already logged a `record_attempt` internally (line 1213-1226 with full details: longK, shortK, order_type, limit, qty, order_action). The CALL_OPEN/PUT_OPEN handlers then logged a SECOND `record_attempt` with less detail.
+
+**Fix:** Removed the redundant `record_attempt` calls in the CALL_OPEN and PUT_OPEN handlers. Kept only in dry-run paths (where `place_debit_spread()` is not called). The internal logging from `place_debit_spread()` has richer data and is sufficient.
+
+**Impact:** Each OPEN order now appears exactly once in the attempts CSV.
+
+---
+
+### Fix AA3: Skip Expired Options in Reconcile Close (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_try_close_from_positions()`, line ~1260)
+
+**Issue:** The 5 PM reconcile iterated through all positions and submitted close orders without checking if the options had already expired. HRL with exp=20260213 (Feb 13, today) got a combo close order at 5 PM — but those options expired at 4 PM. This "working close" order then blocked downstream stages from properly re-processing HRL.
+
+**Fix:** Added `exp` field to each opt_leg dict entry, then filtered out legs where `exp <= today_str` (YYYYMMDD format). Expired legs are logged and skipped.
+
+**Impact:** Reconcile won't try to close expired options that IB can't execute. These positions are automatically removed by IB's expiration processing.
+
+---
+
+### Fix AA4: Round Limit Prices to 2 Decimal Places (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (`place_debit_spread()`, line 1183)
+
+**Issue:** `LimitOrder(action.upper(), quantity, float(limit_price))` passed unrounded floats. Python floating-point arithmetic produced values like:
+- KEY: `0.17099999999999999` (should be `0.17`)
+- ADM: `1.311` (should be `1.31`)
+- SYY: `2.2609999999999997` (should be `2.26`)
+
+IB may reject or silently round these, or they may cause order status issues.
+
+**Fix:** Changed to `round(float(limit_price), 2)` for both the LimitOrder constructor and `actual_limit`.
+
+**Impact:** All limit orders submitted with clean 2-decimal-place prices.
+
+---
+
+### Fix AA5: Reconcile Force-Close Fallback (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_reconcile_positions_with_signals_lookback`, line ~2455)
+
+**Issue:** When the reconcile detected a position that needed closing (flip scenario), it only used `_try_close_from_positions()` which places a direct combo LMT close. After hours, this fails when:
+- No theo pricing in CSV for the symbol → `_get_theo_limit()` returns None
+- Market is closed → MKT fallback blocked by Fix Y3
+- Result: returns False, symbol NOT added to `_submitted_close_syms`, no downstream processing
+
+This left positions like BSY (worthless CALL 40/45) and KEY (CALL 23/24) stuck indefinitely at 5 PM.
+
+**Fix:** When `_try_close_from_positions()` returns False, fall back to `force_close_symbol_via_positions()` via PlaceAnOrder.py with `--fallback-individual-legs`. This fallback has:
+- Worthless detection (both legs < $0.05 → fixed-price individual leg orders)
+- CSV-based pricing from previous trading day
+- Live pricing (if market open)
+- `--force-close-side` to close only the relevant side
+
+After the fallback, checks `_has_working_close_order()` to verify success. If successful, adds to `_submitted_close_syms` so downstream OPEN delegation can proceed (flip scenario).
+
+**Impact:** Reconcile-detected flips now have a robust close path after hours, using all available pricing fallbacks including worthless detection.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -1117,4 +1202,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 13, 2026 by Claude (Opus 4.6) - Added Fix Z1 (NaN guard), Fix Z2 (TypeError), Fix Z3 (double-logging), Fix Z4 (dedup), Fix Z5 (TP/SL reason)
+**Last Updated:** February 13, 2026 by Claude (Opus 4.6) - Added Fix AA1-AA5: block OPEN on failed unwind, OPEN double-logging, expired options, limit price rounding, reconcile force-close fallback

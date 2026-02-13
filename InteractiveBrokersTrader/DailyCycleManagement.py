@@ -1261,10 +1261,19 @@ class DailyCycleManagementMixin:
                         'conId': c.conId,
                         'right': getattr(c, 'right', '').upper(),
                         'strike': float(getattr(c, 'strike', 0.0)),
-                        'qty': q
+                        'qty': q,
+                        'exp': getattr(c, 'lastTradeDateOrContractMonth', ''),
                     })
                 elif getattr(c, 'secType', '') == 'STK':
                     stk_leg = (q, c)
+
+            # Fix AA3: Filter out expired option legs (expiring today or earlier)
+            today_str = self._now_ny().strftime("%Y%m%d")
+            expired = [l for l in opt_legs if l['exp'] and l['exp'] <= today_str]
+            if expired:
+                LOG.info("direct-close: %s has %d expired option leg(s) (exp <= %s); skipping",
+                         up, len(expired), today_str)
+            opt_legs = [l for l in opt_legs if not l['exp'] or l['exp'] > today_str]
 
             # Helper to place a combo close
             def _place_combo(right: str, low: float, high: float, longConId: int, shortConId: int, is_long_vertical: bool) -> bool:
@@ -2444,13 +2453,48 @@ class DailyCycleManagementMixin:
                         except Exception:
                             pass
                     else:
-                        LOG.info("Reconcile: no verticals closed for %s in positions-based CLOSE.", sym)
+                        # Fix AA5: Fallback to force_close_symbol_via_positions via PlaceAnOrder
+                        # when _try_close_from_positions fails (no theo pricing after hours).
+                        # force_close has worthless detection + CSV-based pricing fallbacks.
+                        LOG.info("Reconcile: direct close failed for %s; trying force-close via PlaceAnOrder (fallback-individual-legs).", sym)
                         try:
-                            _AttemptLogger.write(symbol=sym, action="close", status="skipped",
-                                                reason="no_vertical_in_positions", exp="",
-                                                right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
-                        except Exception:
-                            pass
+                            fc_side_arg = []
+                            if try_side:
+                                fc_side_arg = ["--force-close-side", try_side]
+                            self._run_place_an_order([
+                                "--mode", "force-close",
+                                "--symbols", sym,
+                                "--quantity", "1",
+                                "--use-live-close", "join",
+                                "--live-timeout", "5",
+                                "--fallback-individual-legs",
+                                "--quiet",
+                            ] + fc_side_arg)
+                            # Check if PlaceAnOrder managed to submit something
+                            if self._has_working_close_order(sym):
+                                ok = True
+                                LOG.info("Reconcile: force-close fallback succeeded for %s.", sym)
+                            else:
+                                LOG.info("Reconcile: force-close fallback also failed for %s.", sym)
+                        except Exception as _fc_e:
+                            LOG.warning("Reconcile: force-close fallback error for %s: %s", sym, _fc_e)
+
+                        if ok:
+                            self._submitted_close_syms.add(sym)
+                            submitted += 1
+                            try:
+                                _AttemptLogger.write(symbol=sym, action="close", status="placed",
+                                                    reason=f"{reason}_force_close_fallback", exp="",
+                                                    right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                _AttemptLogger.write(symbol=sym, action="close", status="skipped",
+                                                    reason="no_vertical_in_positions", exp="",
+                                                    right=(try_side.upper() if try_side else ""), source="dcm-reconcile")
+                            except Exception:
+                                pass
 
                     if latest_is_close:
                         try:
@@ -2485,6 +2529,7 @@ class DailyCycleManagementMixin:
         ib = IB()
         try:
             ib.connect('127.0.0.1', 7497, clientId=878, timeout=6)
+            ib.reqMarketDataType(1)  # 1=Live — required to get real-time option quotes via API
         except Exception as e:
             LOG.warning("Risk exits: could not connect to IB: %s", e)
             return

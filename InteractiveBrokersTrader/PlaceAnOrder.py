@@ -1180,7 +1180,7 @@ def place_debit_spread(
 
         # --- LMT path ---
         else:
-            order = LimitOrder(action.upper(), quantity, float(limit_price))
+            order = LimitOrder(action.upper(), quantity, round(float(limit_price), 2))  # Fix AA4: round to 2 dp
             try:
                 order.tif = "DAY"
             except Exception:
@@ -1188,7 +1188,7 @@ def place_debit_spread(
             _tag_after_hours_limit(order)
             trade = ib.placeOrder(combo, order)
             actual_order_type = "LMT"
-            actual_limit = float(limit_price)
+            actual_limit = round(float(limit_price), 2)  # Fix AA4: round to 2 dp
             logger.info(
                 f"[{symbol}] Placed {right} LMT"
                 f"{'' if action.upper() == 'BUY' else ' CLOSE'} "
@@ -2762,7 +2762,8 @@ def run_from_csv():
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
-                    # Fix S: Proactively unwind existing PUT spreads (opposite side) using limit orders
+                    # Fix S / Fix AA1: Proactively unwind existing PUT spreads (opposite side) using limit orders
+                    # Fix AA1: Only allow CALL_OPEN if unwind succeeds; block if unwind fails or returns 0
                     if 'P' in sym_sides:
                         try:
                             # Build args-like object with needed settings for force_close_symbol_via_positions
@@ -2779,9 +2780,17 @@ def run_from_csv():
                             if n_unw > 0:
                                 logger.info(f"[{symbol}] Unwound {n_unw} existing PUT spread(s) prior to CALL_OPEN (limit order)")
                                 record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open_lmt", exp=None, right="P", qty=n_unw)
+                                allow_call = True  # Fix AA1: only allow open if unwind succeeded
+                            else:
+                                logger.warning(f"[{symbol}] Opposite-side unwind (PUT) returned 0 spreads closed; blocking CALL_OPEN")
+                                record_attempt(symbol, "open_call", "skipped", "opposite_unwind_failed", exp=expiration, right="C")
+                                continue  # Fix AA1: skip CALL_OPEN for this symbol
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
-                    allow_call = True
+                            record_attempt(symbol, "open_call", "skipped", "opposite_unwind_exception", exp=expiration, right="C")
+                            continue  # Fix AA1: skip CALL_OPEN for this symbol
+                    else:
+                        allow_call = True  # No opposite position — proceed normally
                     # Guard: if OTM strike is still missing after inference, skip with logged reason
                     if pd.isna(k_call) or k_call is None:
                         record_attempt(symbol, "open_call", "skipped", "missing_otm_strike",
@@ -2800,7 +2809,8 @@ def run_from_csv():
                     cxl_close = cancel_close_orders_for_symbol(ib, symbol)
                     if cxl_close > 0:
                         logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
-                    # Fix S: Proactively unwind existing CALL spreads (opposite side) using limit orders
+                    # Fix S / Fix AA1: Proactively unwind existing CALL spreads (opposite side) using limit orders
+                    # Fix AA1: Only allow PUT_OPEN if unwind succeeds; block if unwind fails or returns 0
                     if 'C' in sym_sides:
                         try:
                             # Build args-like object with needed settings for force_close_symbol_via_positions
@@ -2817,9 +2827,17 @@ def run_from_csv():
                             if n_unw > 0:
                                 logger.info(f"[{symbol}] Unwound {n_unw} existing CALL spread(s) prior to PUT_OPEN (limit order)")
                                 record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open_lmt", exp=None, right="C", qty=n_unw)
+                                allow_put = True  # Fix AA1: only allow open if unwind succeeded
+                            else:
+                                logger.warning(f"[{symbol}] Opposite-side unwind (CALL) returned 0 spreads closed; blocking PUT_OPEN")
+                                record_attempt(symbol, "open_put", "skipped", "opposite_unwind_failed", exp=expiration, right="P")
+                                continue  # Fix AA1: skip PUT_OPEN for this symbol
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
-                    allow_put = True
+                            record_attempt(symbol, "open_put", "skipped", "opposite_unwind_exception", exp=expiration, right="P")
+                            continue  # Fix AA1: skip PUT_OPEN for this symbol
+                    else:
+                        allow_put = True  # No opposite position — proceed normally
                     # Guard: if OTM strike is still missing after inference, skip with logged reason
                     if pd.isna(k_put) or k_put is None:
                         record_attempt(symbol, "open_put", "skipped", "missing_otm_strike",
@@ -3170,8 +3188,7 @@ def run_from_csv():
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyC); placed += 1; attempted = True
-                            record_attempt(symbol, "open_call", "placed", "success",
-                                           exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
+                            # Fix AA2: record_attempt already called inside place_debit_spread()
                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                         else:
                             # Retry once with refreshed expiration; then derive live limit
@@ -3181,8 +3198,6 @@ def run_from_csv():
                                 tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
-                                    record_attempt(symbol, "open_call", "placed", "success",
-                                                   exp=new_exp, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
                                     OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
@@ -3191,8 +3206,6 @@ def run_from_csv():
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', live_limit, quantity=args.quantity)
                                         if tr is not None:
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
-                                            record_attempt(symbol, "open_call", "placed", "success",
-                                                           exp=new_exp, atm=float(atm), oth=float(k_call), limit=live_limit)
                                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                 # 2) Fallback to debit_limit only when both legs have OI ≥ threshold (respects --oi-check)
                 if not attempted:
@@ -3252,11 +3265,7 @@ def run_from_csv():
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', lv2, quantity=args.quantity)
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
-                                used_exp = new_exp if 'new_exp' in locals() and new_exp else expiration
-                                used_limit = lv2 if 'lv2' in locals() and lv2 is not None else lv
-                                record_attempt(symbol, "open_call", "placed", "success",
-                                               exp=(used_exp),
-                                               atm=float(atm), oth=float(k_call), limit=used_limit)
+                                # Fix AA2: record_attempt already called inside place_debit_spread()
                                 OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 break
                 if allow_call and not attempted:
@@ -3337,8 +3346,7 @@ def run_from_csv():
                         tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
-                            record_attempt(symbol, "open_put", "placed", "success",
-                                           exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
+                            # Fix AA2: record_attempt already called inside place_debit_spread()
                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                         else:
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
@@ -3347,8 +3355,6 @@ def run_from_csv():
                                 tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
-                                    record_attempt(symbol, "open_put", "placed", "success",
-                                                   exp=new_exp, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
                                     OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 else:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
@@ -3359,11 +3365,6 @@ def run_from_csv():
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol, 'P', new_exp, float(atm), float(k_put)))
                                             placed += 1
                                             attempted = True
-                                            used_exp = new_exp if new_exp else expiration
-                                            record_attempt(
-                                                symbol, "open_put", "placed", "success",
-                                                exp=used_exp, atm=float(atm), oth=float(k_put), limit=live_limit
-                                            )
                                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                 # 2) Fallback to debit_limit only when both legs have OI ≥ threshold (respects --oi-check)
                 if not attempted:
@@ -3422,14 +3423,9 @@ def run_from_csv():
                                     if lv2 is not None:
                                         tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', lv2, quantity=args.quantity)
                             if tr:
-                                used_exp = new_exp if 'new_exp' in locals() and new_exp else expiration
-                                used_limit = lv2 if 'lv2' in locals() and lv2 is not None else lv
                                 OPEN_SEEN_KEYS.add(keyP)
                                 placed += 1
-                                record_attempt(
-                                    symbol, "open_put", "placed", "success",
-                                    exp=used_exp, atm=float(atm), oth=float(k_put), limit=used_limit
-                                )
+                                # Fix AA2: record_attempt already called inside place_debit_spread()
                                 OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 break
                 if allow_put and not attempted:
