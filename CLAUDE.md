@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 13, 2026
+**Last Updated:** February 15, 2026
 
 ---
 
@@ -1137,6 +1137,35 @@ Additionally, the MKT order path in `place_debit_spread()` never set `outsideRth
 
 ---
 
+### Fix AB6: One-Leg-Worthless Combo + Close Guard + Exchange Fix (Feb 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (worthless detection, individual leg paths), ib_close_guard.py
+
+**Issue:** After Fix AB5, BSY (both-worthless + MKT) successfully placed a BAG combo visible in TWS. But KEY and MNST still failed with `place_failed_positions` + `worthless_leg_fallback`. Three compounding root causes:
+
+1. **AB6a — One-leg-worthless skipped combo for LMT:** Fix AB5 only bypassed `skip_combo` when `order_type=="MKT"`. KEY got LMT ($0.2755 from CSV) and MNST got LMT ($0.845), so `skip_combo=True` → individual leg path used instead of BAG combo.
+
+2. **AB6b — Close guard false positive:** `ib_close_guard.py` treated both BUY and SELL BAG orders as "close-related". KEY had an existing PUT OPEN order (BUY BAG). The guard found this BUY BAG and returned True, blocking KEY's CALL close (SELL BAG).
+
+3. **AB6c — Error 321 "Missing order exchange":** Contracts from `ib.positions()` don't include `exchange` field. Individual leg orders using these contracts directly were rejected by IB with Error 321.
+
+4. **AB6d — Floating-point limit prices:** Force-close limit prices had floating-point artifacts (e.g., `0.27549999999999997` instead of `0.28`).
+
+**Fix — four changes:**
+1. **AB6a:** Always try BAG combo first for one-leg-worthless, regardless of order_type (LMT or MKT). BAG combo resolves conIds via `qualifyContracts()` and handles pricing correctly.
+2. **AB6b:** Changed `ib_close_guard.py` to only match SELL BAG orders as close orders. BUY BAG = OPEN order, should not block close placement. Also added Inactive+DAY recognition (matching DCM's `_has_working_close_order` behavior).
+3. **AB6c:** Added `if not getattr(c, 'exchange', ''): c.exchange = "SMART"` before every individual leg `ib.placeOrder()` call (6 locations: both-worthless combo-failure fallback, one-leg-worthless, both-worthless fixed-pricing).
+4. **AB6d:** Added `limit = round(limit, 2)` in `force_close_symbol_via_positions()` when order_type is LMT.
+
+**Impact:**
+- KEY: Close guard no longer falsely blocks (PUT OPEN is BUY BAG, ignored). One-leg-worthless with LMT → BAG combo placed.
+- MNST: One-leg-worthless with LMT → BAG combo placed.
+- Individual leg fallback (safety net) no longer hits Error 321.
+- All force-close limit prices have clean 2-decimal-place values.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -1357,4 +1386,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 15, 2026 by Claude (Opus 4.6) - Added Fix AB3-AB5: weekday check, outsideRth, BAG combo MKT for worthless closes
+**Last Updated:** February 15, 2026 by Claude (Opus 4.6) - Added Fix AB6: one-leg-worthless combo, close guard SELL-only, exchange fix, limit rounding

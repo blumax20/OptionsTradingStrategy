@@ -56,9 +56,10 @@ def has_working_auto_close(symbol: str,
             if (getattr(c, "symbol", "") or "").upper() != sym_u:
                 continue
 
-            # We’ll treat both BUY and SELL BAG orders as “close-related” for the guard.
+            # Fix AB6: Only SELL BAG orders are closes (debit spread unwind).
+            # BUY BAG = OPEN order; should NOT block close placement.
             act = (getattr(o, "action", "") or "").upper()
-            if act not in ("BUY", "SELL"):
+            if act != "SELL":
                 continue
 
             st = (getattr(s, "status", "") or "").lower()
@@ -66,8 +67,9 @@ def has_working_auto_close(symbol: str,
                 continue
 
             # GTC but "inactive" after-hours should still count as working/held.
-            is_gtc = (getattr(o, "tif", "") or "").upper() == "GTC"
-            if (st in working_states) or (st == "inactive" and is_gtc):
+            # DAY orders with outsideRth also go Inactive after hours (Fix AB5/AB6).
+            tif = (getattr(o, "tif", "") or "").upper()
+            if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
                 return True
 
         return False

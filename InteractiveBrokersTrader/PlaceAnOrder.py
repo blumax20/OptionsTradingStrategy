@@ -76,13 +76,12 @@ def _next_trading_date_ny(start_dt=None):
 
 def _tag_after_hours_limit(order):
     """
-    For after-hours placements, optionally mark limit orders as GTC/outsideRth.
+    For after-hours placements, set outsideRth so IB accepts the order.
 
-    Policy:
+    Policy (Fix AB6e):
       - All orders are DAY by default (we set tif='DAY' when creating orders).
-      - Only Sunday weekly CLOSE orders (SELL combos placed on Sunday) should be GTC,
-        so they can work across sessions as part of weekly cleanup.
-      - No after-hours BUY (OPEN) orders should be forced to GTC.
+      - TIF is never changed — all orders stay DAY.
+      - outsideRth=True is set for all after-hours orders so IB accepts them.
     """
     try:
         try:
@@ -90,21 +89,13 @@ def _tag_after_hours_limit(order):
         except Exception:
             now_ny = datetime.now()
         t = now_ny.time()
-        wd = now_ny.weekday()  # Monday=0 .. Sunday=6
-        # Only consider adjustments outside RTH
+        # Set outsideRth for all after-hours orders
         if (t >= time(16, 0)) or (t < time(9, 30)):
-            act = (getattr(order, "action", "") or "").upper()
-            # Only Sunday CLOSE (SELL) orders should be forced to GTC
-            if wd == 6 and act == "SELL":
-                try:
-                    order.tif = "GTC"
-                except Exception:
-                    pass
-                try:
-                    order.outsideRth = True
-                except Exception:
-                    pass
-        # All other orders keep their explicitly set TIF (usually 'DAY').
+            try:
+                order.outsideRth = True
+            except Exception:
+                pass
+        # TIF stays as caller set it (always 'DAY').
     except Exception:
         pass
 
@@ -2020,6 +2011,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 continue  # Skip this spread, don't place market order
         else:
             order_type = "LMT"
+            limit = round(limit, 2)  # Fix AB6d: clean 2-decimal-place prices
         ckey = _close_key(symbol, right, exp)
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
@@ -2137,21 +2129,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     logger.warning(f"[{symbol}] Could not get market prices for either leg; will attempt combo close")
                     skip_combo = False
                 elif (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
-                    if order_type.upper() == "MKT":
-                        # Fix AB5: BAG combo MKT handles worthless spreads better than individual legs
-                        skip_combo = False
-                        logger.info(
-                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
-                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
-                            f"MKT available — will attempt BAG combo MKT close"
-                        )
-                    else:
-                        skip_combo = True
-                        logger.info(
-                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
-                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                            f"will close individual valuable leg(s) only"
-                        )
+                    # Fix AB6: Always try BAG combo first for one-leg-worthless.
+                    # BAG combo resolves conIds properly (fixes Error 321) and handles
+                    # pricing correctly regardless of LMT or MKT.
+                    skip_combo = False
+                    logger.info(
+                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
+                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
+                        f"will attempt BAG combo close ({order_type})"
+                    )
                 elif long_worthless and short_worthless:
                     both_worthless = True
                     if order_type.upper() == "MKT":
@@ -2242,6 +2228,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder("SELL", qty_leg, 0.01)
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True
+                        if not getattr(c, 'exchange', ''):  # Fix AB6c
+                            c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
                         logger.info(f"[{symbol}] Fallback worthless long leg status: ok={ok_leg}, reason={why_leg}")
@@ -2259,6 +2247,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder("BUY", qty_leg, 0.05)
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True
+                        if not getattr(c, 'exchange', ''):  # Fix AB6c
+                            c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
                         logger.info(f"[{symbol}] Fallback worthless short leg status: ok={ok_leg}, reason={why_leg}")
@@ -2326,6 +2316,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             raise ValueError(f"Could not qualify long leg contract for {symbol} {longK}")
                         long_opt_to_close = qualified[0]
 
+                    if not getattr(long_opt_to_close, 'exchange', ''):  # Fix AB6c
+                        long_opt_to_close.exchange = "SMART"
                     trade = ib.placeOrder(long_opt_to_close, leg_order)
                     ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                     logger.info(f"[{symbol}] Individual long leg order status: ok={ok}, reason={why}")
@@ -2370,6 +2362,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             raise ValueError(f"Could not qualify short leg contract for {symbol} {shortK}")
                         short_opt_to_close = qualified[0]
 
+                    if not getattr(short_opt_to_close, 'exchange', ''):  # Fix AB6c
+                        short_opt_to_close.exchange = "SMART"
                     trade = ib.placeOrder(short_opt_to_close, leg_order)
                     ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                     logger.info(f"[{symbol}] Individual short leg order status: ok={ok}, reason={why}")
@@ -2433,6 +2427,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         price_str = "$0.01"
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                        if not getattr(c, 'exchange', ''):  # Fix AB6c
+                            c.exchange = "SMART"
                         trade = ib.placeOrder(c, leg_order)
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                         logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
@@ -2453,6 +2449,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         price_str = "$0.05"
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                        if not getattr(c, 'exchange', ''):  # Fix AB6c
+                            c.exchange = "SMART"
                         trade = ib.placeOrder(c, leg_order)
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                         logger.info(f"[{symbol}] Worthless short leg order status: ok={ok}, reason={why}")
