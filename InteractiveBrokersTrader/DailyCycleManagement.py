@@ -1322,7 +1322,9 @@ class DailyCycleManagementMixin:
                         if is_prev_day:
                             # Fix Y3: only allow MKT fallback during market hours
                             now_ny = self._now_ny()
-                            market_open = (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30)) and now_ny.hour < 16
+                            market_open = (now_ny.weekday() < 5  # Fix AB3: Mon-Fri only
+                                           and (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30))
+                                           and now_ny.hour < 16)
                             if not market_open:
                                 LOG.info("direct-close: skipping %s %s - no theo limit and market closed (opened %s); deferring to after-hours batch",
                                          up, right, position_open_date)
@@ -1387,19 +1389,30 @@ class DailyCycleManagementMixin:
 
             # If no vertical combo placed, flatten orphan option legs (optionally side-filtered)
             if not submitted and opt_legs:
-                for leg in opt_legs:
-                    if side is not None and leg["right"] != side.upper()[0]:
-                        # Skip legs on the other side when we are asked to close only CALL or only PUT
-                        continue
-                    try:
-                        c = Contract(conId=leg['conId'])
-                        action = 'SELL' if leg['qty'] > 0 else 'BUY'
-                        order = MarketOrder(action, int(abs(leg['qty'])))
-                        ib.placeOrder(c, order)
-                        submitted = True
-                        LOG.info("direct-close: flattened single leg %s %s @ strike %.2f via %s", up, leg['right'], leg['strike'], action)
-                    except Exception as e:
-                        LOG.warning("direct-close: failed to flatten leg %s %s %.2f: %s", up, leg['right'], leg['strike'], e)
+                # Fix AB1: Only place individual-leg MKT orders during market hours.
+                # After hours, return False so Fix AA5 force-close fallback runs
+                # (which has worthless detection + fixed-price LimitOrders at $0.01/$0.05).
+                now_ny = self._now_ny()
+                market_open = (now_ny.weekday() < 5  # Fix AB3: Mon-Fri only
+                              and (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30))
+                              and now_ny.hour < 16)
+                if not market_open:
+                    relevant = [l for l in opt_legs if side is None or l["right"] == side.upper()[0]]
+                    LOG.info("direct-close: %s has %d orphan leg(s) but market closed; deferring to force-close fallback",
+                             up, len(relevant))
+                else:
+                    for leg in opt_legs:
+                        if side is not None and leg["right"] != side.upper()[0]:
+                            continue
+                        try:
+                            c = Contract(conId=leg['conId'])
+                            action = 'SELL' if leg['qty'] > 0 else 'BUY'
+                            order = MarketOrder(action, int(abs(leg['qty'])))
+                            ib.placeOrder(c, order)
+                            submitted = True
+                            LOG.info("direct-close: flattened single leg %s %s @ strike %.2f via %s", up, leg['right'], leg['strike'], action)
+                        except Exception as e:
+                            LOG.warning("direct-close: failed to flatten leg %s %s %.2f: %s", up, leg['right'], leg['strike'], e)
 
             # Flatten stock position if present
             if stk_leg:
@@ -2188,9 +2201,12 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=882, timeout=6)
+            # Fix AA9: Randomize clientId to avoid collision with scheduled 5PM task
+            import random as _rnd
+            _cid = 882 + _rnd.randint(0, 9)
+            ib.connect('127.0.0.1', 7497, clientId=_cid, timeout=6)
         except Exception as e:
-            LOG.warning("Reconcile: could not connect to IB: %s", e)
+            LOG.warning("Reconcile: could not connect to IB (clientId=%s): %s", _cid, e)
             return
 
         held_info: dict[str, int | None] = {}
@@ -2285,6 +2301,21 @@ class DailyCycleManagementMixin:
                         else:
                             sign = None
 
+                else:
+                    # Fix AA6: Single-leg residual (after partial close) — determine side from the one leg.
+                    # Without this, single-leg symbols get has_call_vert=False, sign=None,
+                    # causing the flip logic to say "matches current orientation" and skip the close.
+                    single_right = legs[0][0]  # 'C' or 'P'
+                    single_qty = legs[0][2]
+                    if single_right == 'C':
+                        has_call_vert = True
+                        sign = +1 if single_qty > 0 else -1
+                    elif single_right == 'P':
+                        has_put_vert = True
+                        sign = -1 if single_qty > 0 else +1
+                    LOG.info("Reconcile: %s has single %s leg (qty=%.0f); treating as %s exposure",
+                             sym, single_right, single_qty, single_right)
+
                 # Persist side-level information so reconcile logic can flip only the opposite side when needed.
                 side_info[sym] = {
                     "call_vert": bool(has_call_vert),
@@ -2298,6 +2329,10 @@ class DailyCycleManagementMixin:
                 ib.disconnect()
             except Exception:
                 pass
+
+        # Fix AA7: Log which symbols were found in positions scan
+        LOG.info("Reconcile: found %d held symbol(s): %s", len(held_info),
+                 ", ".join(sorted(held_info.keys())) if held_info else "(none)")
 
         if not held_info:
             LOG.info("Reconcile: no open option positions detected.")
@@ -2340,6 +2375,14 @@ class DailyCycleManagementMixin:
             prev = latest_row_by_sym.get(sym)
             if prev is None or order_key > prev["okey"]:
                 latest_row_by_sym[sym] = {"row": r, "okey": order_key}
+
+        # Fix AA7: Log signal match summary
+        LOG.info("Reconcile: matched signals for %d/%d held symbol(s) in %dd lookback: %s",
+                 len(latest_row_by_sym), len(held_info), days,
+                 ", ".join(sorted(latest_row_by_sym.keys())) if latest_row_by_sym else "(none)")
+        unmatched = sorted(set(held_info.keys()) - set(latest_row_by_sym.keys()))
+        if unmatched:
+            LOG.info("Reconcile: no signal found for: %s", ", ".join(unmatched))
 
         looked = 0
         submitted = 0
@@ -2468,6 +2511,7 @@ class DailyCycleManagementMixin:
                                 "--use-live-close", "join",
                                 "--live-timeout", "5",
                                 "--fallback-individual-legs",
+                                "--allow-market-fallback",  # Fix AB2: MKT last resort when all limit pricing fails
                                 "--quiet",
                             ] + fc_side_arg)
                             # Check if PlaceAnOrder managed to submit something

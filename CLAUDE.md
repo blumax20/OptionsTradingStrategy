@@ -982,6 +982,161 @@ After the fallback, checks `_has_working_close_order()` to verify success. If su
 
 ---
 
+### Fix AA6: Single-Leg Position Handling in Reconcile (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_reconcile_positions_with_signals_lookback, lines 2288-2302)
+
+**Issue:** After partial closes (one leg of a spread fills, one doesn't), symbols have 1 residual option leg. The reconcile's position scan at line 2219 (`if len(legs) >= 2:`) skips vertical detection for single-leg positions, leaving them with default values: `has_call_vert=False`, `has_put_vert=False`, `sign=None`. The flip logic at lines 2399-2407 then fails:
+- `latest_open_sign == -1 and has_call_vert` → False
+- `cur_sign is not None` → False (cur_sign=None)
+- Falls through to "matches current orientation; holding" → WRONG
+
+**Affected on Feb 13:** BSY (CALL 40/45, worthless, partially closed at 15:01) and KEY (CALL 23/24, partially closed at 17:08) — both had PUT_OPEN signals but reconcile skipped them.
+
+**Fix:** Added `else` block after `if len(legs) >= 2:` for single-leg positions:
+- Determines side from the single leg's right (C or P)
+- Sets `has_call_vert=True` or `has_put_vert=True` accordingly
+- Sets `sign` based on the leg's quantity direction
+
+**Impact:** Single-leg orphans from partially-closed spreads now trigger proper flip detection and close orders.
+
+---
+
+### Fix AA7: Reconcile Diagnostic Logging (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_reconcile_positions_with_signals_lookback)
+
+**Issue:** When BSY/KEY were absent from the attempts CSV, diagnosis was impossible — no log of which symbols were found in positions, which had signals, or why they were skipped.
+
+**Fix:** Added three LOG.info lines:
+1. After position scan: "found N held symbol(s): SYM1, SYM2, ..."
+2. After CSV signal loading: "matched signals for M/N held symbol(s) in 21d lookback: SYM1, SYM2, ..."
+3. Unmatched symbols: "no signal found for: SYM3, SYM4"
+
+**Impact:** Reconcile runs now show exactly which symbols were detected, matched, and processed.
+
+---
+
+### Fix AA8: Redirect DCM Stdout to Session Log (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PushButtonMenu.ps1 (lines 384-406)
+
+**Issue:** Menu option 8→3 declared a session log path (`DailyCycleManagement_session_*.log`) but Start-Process lacked `-RedirectStandardOutput`. DCM output went to console only; session log was never created.
+
+**Fix:** Added `-RedirectStandardOutput $log -RedirectStandardError $logErr` to Start-Process. After completion, displays log content to user via Get-Content.
+
+**Impact:** DCM session logs now persist for post-mortem analysis.
+
+---
+
+### Fix AA9: Unique ClientId for Reconcile (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (_reconcile_positions_with_signals_lookback, line 2191)
+
+**Issue:** Reconcile used fixed `clientId=882`. If the scheduled 5PM task was still running (which also uses 882 via `daily_trading_cycle()`), the user's Menu 8→3 connection failed silently.
+
+**Fix:** Randomized clientId: `882 + random.randint(0, 9)` (882-891). The reconcile disconnects after ~2 seconds, so the window for collision is minimal.
+
+**Impact:** Manual reconcile runs no longer silently fail when concurrent with scheduled tasks.
+
+---
+
+### Fix AB1: Gate Individual-Leg MKT Fallback on Market Hours (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_try_close_from_positions()`, lines 1388-1410)
+
+**Issue:** After Fixes AA6-AA9, the reconcile correctly detected BSY and KEY as `reconcile_flip_call_to_put`. But `_try_close_from_positions()` placed individual-leg **MarketOrders** after hours (18:50 ET) as a fallback when the combo LMT close failed. These MKT orders sat as PendingSubmit/Inactive and didn't fill. Since the function returned `True`, the Fix AA5 force-close fallback (`force_close_symbol_via_positions()` with worthless detection and fixed-price LimitOrders) was **never invoked**.
+
+**Root Cause:** Lines 1388-1402 had an unconditional individual-leg MarketOrder fallback that fires whenever `_place_combo()` returns False, regardless of market hours. After hours, these MKT orders are useless but the function reports success.
+
+**Fix:** Added market-hours check before the individual-leg MKT fallback. After hours, skips the MKT fallback and logs "deferring to force-close fallback", so the function returns `False`. This lets Fix AA5's `force_close_symbol_via_positions()` handle the close with proper pricing (worthless detection at $0.01/$0.05, CSV-based pricing, etc.). During market hours, individual-leg MKT orders still work as before.
+
+**Impact:** Reconcile-detected flips after hours now reach the force-close fallback path, which handles worthless spreads correctly.
+
+---
+
+### Fix AB2: Allow Market Fallback in Reconcile Force-Close (Feb 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_reconcile_positions_with_signals_lookback`, line ~2503)
+
+**Issue:** Fix AB1 correctly routes after-hours reconcile closes to the force-close fallback (Fix AA5), but the fallback call was missing `--allow-market-fallback`. When all limit pricing failed (live quotes unavailable after hours, no CSV pricing for the symbol), the order was skipped with `no_viable_limit_all_fallbacks_failed`. BSY (worthless CALL 40/45) hit this exact failure in the 20:37 session.
+
+**Fix:** Added `"--allow-market-fallback"` to the `_run_place_an_order()` args in the reconcile force-close fallback. This allows MKT orders as a last resort when all limit pricing sources fail.
+
+**Impact:** Reconcile force-close now has full fallback chain: live pricing → CSV pricing → worthless detection (fixed-price LMT) → MKT last resort.
+
+---
+
+### Fix AB3: Market Hours Check Must Include Weekday (Feb 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_place_combo` line ~1325, `_try_close_from_positions` line ~1396)
+
+**Issue:** Fix AB1 gated individual-leg MKT orders on "market hours" but only checked time-of-day, not day-of-week. On Sunday Feb 15 at 12:57 PM, `hour > 9` and `hour < 16` → `market_open = True`. Individual-leg MKT orders were placed for BSY on a Sunday, `_try_close_from_positions()` returned True, and the force-close fallback (with worthless detection) was never reached.
+
+**Fix:** Added `now_ny.weekday() < 5` (Mon-Fri only) to both `market_open` checks:
+```python
+market_open = (now_ny.weekday() < 5  # Fix AB3: Mon-Fri only
+               and (now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 30))
+               and now_ny.hour < 16)
+```
+
+**Impact:** Weekend runs correctly defer to force-close fallback with worthless detection and fixed-price LimitOrders.
+
+---
+
+### Fix AB4: outsideRth + Sleep for Individual Leg Orders (Feb 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (`force_close_symbol_via_positions`, both-worthless path lines ~2335-2372, one-leg-worthless path lines ~2228-2312)
+
+**Issue:** Worthless individual leg orders placed by PlaceAnOrder subprocess were not visible in TWS/portal because:
+1. No `outsideRth=True` — orders may not be accepted/kept active outside regular trading hours
+2. No `ib.sleep()` after `placeOrder()` — subprocess exited immediately, dropping connection before IB confirmed the orders
+
+Compare with `place_debit_spread()` which has both `outsideRth=True` and `ib.sleep(0.3)` after placing.
+
+**Fix:** Four changes across both individual-leg order paths:
+1. **Both-worthless long leg:** Added `leg_order.outsideRth = True`
+2. **Both-worthless short leg:** Added `leg_order.outsideRth = True`
+3. **One-leg-worthless long leg:** Added `leg_order.outsideRth = True`
+4. **One-leg-worthless short leg:** Added `leg_order.outsideRth = True`
+5. **Both paths:** Added `ib.sleep(0.5)` after placing legs to let IB confirm before disconnect
+
+**Impact:** Individual leg orders now persist in TWS/portal as pending orders even when placed outside regular trading hours.
+
+---
+
+### Fix AB5: BAG Combo MKT Orders for Worthless/Fallback Closes (Feb 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** PlaceAnOrder.py (`_await_working`, `place_debit_spread`, `force_close_symbol_via_positions`)
+
+**Issue:** After Fixes AB3+AB4, BSY/KEY/MNST close orders appeared as "placed" in the attempts CSV but none were visible in TWS/portal. Root cause: the worthless detection at lines 2134-2149 set `skip_combo = True`, which skipped the well-tested BAG combo path (`place_debit_spread()`) and instead placed individual OPT leg orders. These individual leg orders:
+1. Lacked `_await_working()` — no confirmation IB accepted them
+2. Used contracts from `ib.positions()` without building a proper BAG with resolved conIds
+3. IB may not accept individual option orders on weekends the same way it accepts BAG combos
+
+Additionally, the MKT order path in `place_debit_spread()` never set `outsideRth=True`, and `_await_working()` only accepted `Inactive+GTC` (not `Inactive+DAY`).
+
+**Fix — six changes:**
+1. **`_await_working()`:** Accept `Inactive+DAY` after hours (DAY orders with `outsideRth=True` go Inactive after hours but activate at market open)
+2. **`place_debit_spread()` MKT paths:** Added `outsideRth=True` to both force_close MKT and legacy MKT MarketOrders
+3. **Worthless detection:** When `order_type=="MKT"` (market fallback active), don't set `skip_combo=True` — let the BAG combo MKT order go through `place_debit_spread()` which resolves conIds, builds BAG, and calls `_await_working()`
+4. **Individual leg fallback:** Added `_await_working()` after every `ib.placeOrder()` in both one-leg-worthless and both-worthless individual leg paths
+5. **Failure reason:** Differentiated `place_failed_worthless_combo` from generic `place_failed_positions`
+6. **Combo-failure fallback:** When BAG combo MKT is attempted for worthless spread but fails (contract qualification, close guard), fall back to individual fixed-price legs with `_await_working()` confirmation
+
+**Impact:** Worthless/fallback closes now use the standard BAG combo approach (same as `place_debit_spread()`), which properly resolves conIds, builds a BAG contract, and confirms order acceptance. Individual legs remain as a safety net with proper order confirmation.
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -1202,4 +1357,4 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 13, 2026 by Claude (Opus 4.6) - Added Fix AA1-AA5: block OPEN on failed unwind, OPEN double-logging, expired options, limit price rounding, reconcile force-close fallback
+**Last Updated:** February 15, 2026 by Claude (Opus 4.6) - Added Fix AB3-AB5: weekday check, outsideRth, BAG combo MKT for worthless closes

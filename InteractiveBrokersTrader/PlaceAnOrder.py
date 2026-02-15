@@ -334,6 +334,9 @@ def _await_working(trade, timeout=3.0) -> tuple[bool, str]:
         # treat after-hours held GTC as "working"
         if st == "Inactive" and tif == "GTC":
             return True, "Inactive(GTC)"
+        # Fix AB5: DAY orders with outsideRth go Inactive after hours but activate at open
+        if st == "Inactive" and tif == "DAY" and _is_after_hours():
+            return True, "Inactive(DAY_AH)"
         # riskless-combo detection is handled elsewhere, but bail early if we see it
         try:
             for le in getattr(trade, "log", []) or []:
@@ -1048,6 +1051,7 @@ def place_debit_spread(
                     order.tif = "DAY"
                 except Exception:
                     pass
+                order.outsideRth = True  # Fix AB5: accept order outside RTH
                 trade = ib.placeOrder(combo, order)
                 actual_order_type = "MKT"
                 actual_limit = None
@@ -1071,6 +1075,7 @@ def place_debit_spread(
                         order.tif = "DAY"
                     except Exception:
                         pass
+                    order.outsideRth = True  # Fix AB5: accept order outside RTH
                     trade = ib.placeOrder(combo, order)
                     actual_order_type = "MKT"
                     actual_limit = None
@@ -2132,21 +2137,39 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     logger.warning(f"[{symbol}] Could not get market prices for either leg; will attempt combo close")
                     skip_combo = False
                 elif (long_worthless and not short_worthless) or (short_worthless and not long_worthless):
-                    skip_combo = True
-                    logger.info(
-                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
-                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                        f"will close individual valuable leg(s) only"
-                    )
+                    if order_type.upper() == "MKT":
+                        # Fix AB5: BAG combo MKT handles worthless spreads better than individual legs
+                        skip_combo = False
+                        logger.info(
+                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
+                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
+                            f"MKT available — will attempt BAG combo MKT close"
+                        )
+                    else:
+                        skip_combo = True
+                        logger.info(
+                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: one leg worthless "
+                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
+                            f"will close individual valuable leg(s) only"
+                        )
                 elif long_worthless and short_worthless:
-                    # Fix S: Both legs worthless - close with fixed pricing ($0.01 for long, $0.05 for short)
-                    skip_combo = True
                     both_worthless = True
-                    logger.info(
-                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
-                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                        f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
-                    )
+                    if order_type.upper() == "MKT":
+                        # Fix AB5: BAG combo MKT handles worthless spreads better than individual legs
+                        skip_combo = False
+                        logger.info(
+                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
+                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
+                            f"MKT available — will attempt BAG combo MKT close"
+                        )
+                    else:
+                        # Fix S: Both legs worthless with LMT - close with fixed pricing
+                        skip_combo = True
+                        logger.info(
+                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
+                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
+                            f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
+                        )
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
                 skip_combo = False
@@ -2173,11 +2196,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             # Fix Z3: record_attempt already logged by place_debit_spread() with reason="success".
             # Don't log a second "positions_fallback" entry for the same order.
         else:
+            # Fix AB5: distinguish combo failure for worthless spreads
+            fail_reason = "place_failed_positions"
+            if both_worthless:
+                fail_reason = "place_failed_worthless_combo"
             record_attempt(
                 symbol,
                 "force_close",
                 "error",
-                "place_failed_positions",
+                fail_reason,
                 exp=str(exp),
                 right=right,
                 longK=float(longK),
@@ -2188,6 +2215,65 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 orientation=("debit" if is_debit else "credit"),
                 order_action=action,
             )
+
+        # Fix AB5: If BAG combo was attempted for worthless spread but failed,
+        # fall back to individual fixed-price leg orders as last resort.
+        if tr is None and use_fallback and both_worthless and not skip_combo:
+            logger.info(f"[{symbol}] BAG combo MKT failed for worthless spread; "
+                       f"falling back to individual fixed-price leg orders")
+            legs_closed = 0
+            try:
+                for p in ib.positions():
+                    c = getattr(p, "contract", None)
+                    if not c or getattr(c, "secType", "") != "OPT":
+                        continue
+                    if getattr(c, "symbol", "").upper() != symbol.upper():
+                        continue
+                    if getattr(c, "lastTradeDateOrContractMonth", "") != exp:
+                        continue
+                    if getattr(c, "right", "").upper() != right.upper():
+                        continue
+
+                    strike = float(getattr(c, "strike", 0.0))
+                    pos = float(getattr(p, "position", 0.0))
+
+                    if abs(strike - float(longK)) < 0.01 and pos > 0:
+                        qty_leg = int(abs(pos))
+                        leg_order = LimitOrder("SELL", qty_leg, 0.01)
+                        leg_order.tif = "DAY"
+                        leg_order.outsideRth = True
+                        trade_leg = ib.placeOrder(c, leg_order)
+                        ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
+                        logger.info(f"[{symbol}] Fallback worthless long leg status: ok={ok_leg}, reason={why_leg}")
+                        legs_closed += 1
+                        submitted += 1
+                        CLOSE_SEEN_KEYS.add(ckey)
+                        logger.info(f"[{symbol}] Fallback: closed worthless LONG {right} {longK} exp {exp} (SELL {qty_leg} @ $0.01)")
+                        record_attempt(symbol, "close_individual_leg", "placed",
+                                     "both_worthless_combo_failed_fallback",
+                                     exp=str(exp), right=right, longK=float(longK),
+                                     limit=0.01, qty=qty_leg, order_action="SELL", leg_type="long")
+
+                    if abs(strike - float(shortK)) < 0.01 and pos < 0:
+                        qty_leg = int(abs(pos))
+                        leg_order = LimitOrder("BUY", qty_leg, 0.05)
+                        leg_order.tif = "DAY"
+                        leg_order.outsideRth = True
+                        trade_leg = ib.placeOrder(c, leg_order)
+                        ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
+                        logger.info(f"[{symbol}] Fallback worthless short leg status: ok={ok_leg}, reason={why_leg}")
+                        legs_closed += 1
+                        submitted += 1
+                        logger.info(f"[{symbol}] Fallback: closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty_leg} @ $0.05)")
+                        record_attempt(symbol, "close_individual_leg", "placed",
+                                     "both_worthless_combo_failed_fallback",
+                                     exp=str(exp), right=right, shortK=float(shortK),
+                                     limit=0.05, qty=qty_leg, order_action="BUY", leg_type="short")
+
+                if legs_closed > 0:
+                    logger.info(f"[{symbol}] Closed {legs_closed} worthless leg(s) via individual fallback after combo failure")
+            except Exception as e_fb:
+                logger.error(f"[{symbol}] Failed individual leg fallback for worthless spread: {e_fb}")
 
         # If combo was skipped, close individual valuable legs
         if skip_combo and use_fallback:
@@ -2227,6 +2313,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     leg_action = "SELL" if long_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
                     leg_order.tif = "DAY"
+                    leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
 
                     if long_contract is not None:
                         long_opt_to_close = long_contract
@@ -2240,6 +2327,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         long_opt_to_close = qualified[0]
 
                     trade = ib.placeOrder(long_opt_to_close, leg_order)
+                    ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                    logger.info(f"[{symbol}] Individual long leg order status: ok={ok}, reason={why}")
                     legs_closed += 1
                     submitted += 1
 
@@ -2268,6 +2357,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     leg_action = "SELL" if short_qty > 0 else "BUY"
                     leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
                     leg_order.tif = "DAY"
+                    leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
 
                     if short_contract is not None:
                         short_opt_to_close = short_contract
@@ -2281,6 +2371,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         short_opt_to_close = qualified[0]
 
                     trade = ib.placeOrder(short_opt_to_close, leg_order)
+                    ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                    logger.info(f"[{symbol}] Individual short leg order status: ok={ok}, reason={why}")
                     legs_closed += 1
                     submitted += 1
 
@@ -2306,6 +2398,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                 if legs_closed > 0:
                     logger.info(f"[{symbol}] Closed {legs_closed} individual leg(s) via fallback")
+                    try:
+                        ib.sleep(0.5)  # Fix AB4: let IB confirm orders before disconnect
+                    except Exception:
+                        pass
 
             except Exception as e_legs:
                 logger.error(f"[{symbol}] Failed to close individual legs: {e_legs}")
@@ -2336,7 +2432,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         reason = "both_worthless_fixed_price"
                         price_str = "$0.01"
                         leg_order.tif = "DAY"
+                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
                         trade = ib.placeOrder(c, leg_order)
+                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
                         legs_closed += 1
                         submitted += 1
                         CLOSE_SEEN_KEYS.add(ckey)
@@ -2353,7 +2452,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         reason = "both_worthless_fixed_price"
                         price_str = "$0.05"
                         leg_order.tif = "DAY"
+                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
                         trade = ib.placeOrder(c, leg_order)
+                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        logger.info(f"[{symbol}] Worthless short leg order status: ok={ok}, reason={why}")
                         legs_closed += 1
                         submitted += 1
                         logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
@@ -2364,6 +2466,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                 if legs_closed > 0:
                     logger.info(f"[{symbol}] Closed {legs_closed} worthless leg(s) with fixed pricing")
+                    try:
+                        ib.sleep(0.5)  # Fix AB4: let IB confirm orders before disconnect
+                    except Exception:
+                        pass
 
             except Exception as e_worthless:
                 logger.error(f"[{symbol}] Failed to close worthless legs: {e_worthless}")
