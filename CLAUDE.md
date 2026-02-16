@@ -1166,6 +1166,24 @@ Additionally, the MKT order path in `place_debit_spread()` never set `outsideRth
 
 ---
 
+### Fix AB7: Position-Filter Sunday Close Sweep (Feb 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (`_delegate_close_from_csvs_within`, line ~879)
+
+**Issue:** `_delegate_close_from_csvs_within(days=21)` is CSV-driven: it picks every symbol with a CLOSE signal in the 21-day window (~60 symbols) and processes all of them through 3 stages (Stage 1 from-signal, Stage 1.5 live-mid, Stage 2 CSV fallback). Only ~4 symbols had actual held positions. The other ~56 generated ~180 useless "skipped" entries in the attempts CSV (`from_signal_exp_mismatch_defer_to_force_close` and `no_spread_in_positions`).
+
+Note: The reconcile function (`_reconcile_positions_with_signals_lookback`) was already position-based. Only `_delegate_close_from_csvs_within` had this issue.
+
+**Fix:** After building the `pick` list from CSV CLOSE signals, connect to IB (clientId=885), scan positions for held option symbols, and filter `pick` to only include symbols with actual positions. Falls back to unfiltered behavior if the position scan fails.
+
+**Impact:**
+- Sunday close sweep processes only held symbols (~4) instead of all CLOSE signals (~60)
+- Attempts CSV reduced from ~260 entries to ~12
+- No functional change — all held positions still get their close orders
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)

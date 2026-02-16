@@ -877,6 +877,38 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
+            # Fix AB7: Filter pick list to only symbols with held option positions.
+            # Without this, all ~60 CLOSE signals from 21 days get processed through
+            # 3 stages even when only ~4 have actual positions.
+            held_option_syms: set[str] = set()
+            try:
+                from ib_insync import IB as _IB_pos
+                _ib_pos = _IB_pos()
+                _ib_pos.connect("127.0.0.1", 7497, clientId=885, timeout=6)
+                try:
+                    for p in _ib_pos.positions():
+                        c = getattr(p, "contract", None)
+                        if c and getattr(c, "secType", "") == "OPT":
+                            sym = (getattr(c, "symbol", "") or "").upper()
+                            if sym:
+                                held_option_syms.add(sym)
+                finally:
+                    try:
+                        _ib_pos.disconnect()
+                    except Exception:
+                        pass
+            except Exception as e:
+                LOG.warning("Close-delegate: position scan failed (%s); proceeding unfiltered.", e)
+
+            if held_option_syms:
+                before = len(pick)
+                pick = [s for s in pick if s in held_option_syms]
+                LOG.info("Close-delegate: filtered %d → %d CLOSE symbol(s) by held positions (%s).",
+                         before, len(pick), ", ".join(sorted(pick)) or "none")
+                if not pick:
+                    LOG.info("Close-delegate: no held positions match CLOSE signals; nothing to do.")
+                    return
+
             # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
             # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
             by_day: dict[str, list[str]] = {}
