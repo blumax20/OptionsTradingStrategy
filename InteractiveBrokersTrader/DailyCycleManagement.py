@@ -1218,7 +1218,7 @@ class DailyCycleManagementMixin:
         # Use a mostly-unique clientId per invocation to avoid "client id already in use"
         try:
             import random
-            client_id = 880 + random.randint(0, 99)
+            client_id = 900 + random.randint(0, 99)  # Fix AB9b: avoid 882-891 (reconcile), 883-887 (DCM/guard)
         except Exception:
             client_id = 884  # fallback
 
@@ -2321,15 +2321,18 @@ class DailyCycleManagementMixin:
                     if has_call_vert and not has_put_vert:
                         sign = call_sign
                     elif has_put_vert and not has_call_vert:
-                        sign = put_sign
+                        # Fix AB9a: Negate put_sign to match signal convention.
+                        # _detect_vertical uses notional: long put debit → put_sign=+1.
+                        # But PUT_OPEN signal = -1, so negate.
+                        sign = -put_sign if put_sign is not None else None
                     elif has_call_vert and has_put_vert:
                         # If both sides exist, compare total notional to see which dominates
                         call_notional = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in calls)
                         put_notional  = sum(abs(q) * (avg if avg > 0 else 1.0) * 100.0 for _, q, avg in puts)
                         if call_notional > put_notional:
-                            sign = +1
+                            sign = call_sign  # Fix AB9a: use actual call_sign
                         elif put_notional > call_notional:
-                            sign = -1
+                            sign = -put_sign if put_sign is not None else None  # Fix AB9a: negate put
                         else:
                             sign = None
 
@@ -2544,6 +2547,7 @@ class DailyCycleManagementMixin:
                                 "--live-timeout", "5",
                                 "--fallback-individual-legs",
                                 "--allow-market-fallback",  # Fix AB2: MKT last resort when all limit pricing fails
+                                "--client-id", "102",  # Fix AB9c: avoid clientId 101 collision
                                 "--quiet",
                             ] + fc_side_arg)
                             # Check if PlaceAnOrder managed to submit something
@@ -2877,7 +2881,9 @@ class DailyCycleManagementMixin:
                         if s1 <= s2:
                             continue
                         if l1["qty"] > 0 and l2["qty"] < 0:
-                            _process_vertical(s2, l2, s1, l1, "PUT")
+                            # Fix AC0: PUT debit — long=l1 (higher strike s1), short=l2 (lower strike s2)
+                            # strike_low=s2, long_leg=l1, strike_high=s1, short_leg=l2
+                            _process_vertical(s2, l1, s1, l2, "PUT")
 
         LOG.info("Risk exits: evaluated %d candidate vertical(s); submitted %d CLOSE order(s).", checked, submitted)
         try:
@@ -3511,6 +3517,12 @@ if __name__ == "__main__":
             hh = now_ny.hour
             if 9 <= hh < 16:
                 LOG.info("Risk exits retry: running at %s ET", now_ny.strftime("%H:%M"))
+                # Fix AD: also enrich CSV with live prices — market data reliable by 10:30 AM
+                # (at 9:35/9:45 AM, Error 10091 often prevents live price enrichment)
+                try:
+                    host._enrich_today_and_prev_trading_day(only_rth=True)
+                except Exception as _enrich_err:
+                    LOG.warning("Risk exits retry: CSV enrichment failed (%s); proceeding with risk exits", _enrich_err)
                 host._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
             else:
                 LOG.warning("--risk-exits-only blocked: market not open at %s ET", now_ny.strftime("%H:%M"))

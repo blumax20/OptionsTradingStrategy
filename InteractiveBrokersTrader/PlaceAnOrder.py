@@ -490,6 +490,8 @@ def parse_args():
                    help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
     p.add_argument("--close-reason", type=str, default=None,
                    help="Fix Z5: reason for close (e.g. 'STOP(>=50%% loss)' or 'TP(>=50%% max profit)') — passed from DCM risk exits.")
+    p.add_argument("--client-id", type=int, default=101,
+                   help="Fix AB9c: IB Gateway clientId for this connection (default 101; reconcile uses 102).")
     return p.parse_args()
 
 def today_folder_yy_mm_dd(override: str | None = None) -> str:
@@ -2140,22 +2142,16 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     )
                 elif long_worthless and short_worthless:
                     both_worthless = True
-                    if order_type.upper() == "MKT":
-                        # Fix AB5: BAG combo MKT handles worthless spreads better than individual legs
-                        skip_combo = False
-                        logger.info(
-                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
-                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}); "
-                            f"MKT available — will attempt BAG combo MKT close"
-                        )
-                    else:
-                        # Fix S: Both legs worthless with LMT - close with fixed pricing
-                        skip_combo = True
-                        logger.info(
-                            f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
-                            f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                            f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
-                        )
+                    # Fix AE: Always use fixed-price individual legs for truly worthless spreads.
+                    # $0.01 SELL (long) / $0.05 BUY (short) fills reliably in any session —
+                    # these prices are above the market for worthless options so they fill immediately.
+                    # MKT is not needed as primary; it stays as an outer fallback only if legs fail.
+                    skip_combo = True
+                    logger.info(
+                        f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
+                        f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
+                        f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
+                    )
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
                 skip_combo = False
@@ -2512,7 +2508,7 @@ def run_from_csv():
         logger.info(f"Force-close mode (CSV-independent): symbols={sorted(list(only))}")
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=101)
+            ib.connect('127.0.0.1', 7497, clientId=args.client_id)
             ib.reqMarketDataType(4)
             ib.reqPositions()
             ib.sleep(0.5)
@@ -2612,7 +2608,7 @@ def run_from_csv():
     # Connect once
     ib = IB()
     try:
-        ib.connect('127.0.0.1', 7497, clientId=101)  # Paper trading by default
+        ib.connect('127.0.0.1', 7497, clientId=args.client_id)  # Paper trading by default
         # Market data type not required for order placement; keep delayed-frozen
         ib.reqMarketDataType(4)
         ib.reqPositions()

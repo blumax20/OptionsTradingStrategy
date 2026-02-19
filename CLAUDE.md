@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 15, 2026
+**Last Updated:** February 18, 2026
 
 ---
 
@@ -1184,6 +1184,69 @@ Note: The reconcile function (`_reconcile_positions_with_signals_lookback`) was 
 
 ---
 
+### Fix AB8: IB Watchdog — Auto-Restart During Trading Hours (Feb 17)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1`, Windows Task Scheduler (`IB_Watchdog_Every15Min`)
+
+**Issue:** On Feb 17, no orders were placed all day because IB Gateway dropped its connection (`WinError 64`) and no automated recovery existed. The system had health checks (Health.ps1 at 7:15, 8:30, 12:00) but these were **read-only diagnostics** — they detected problems but never restarted anything. The only restart scripts were:
+- `StartListener.cmd` (6 AM) — fast-path bail-out if service already RUNNING (even with broken IB connection)
+- `RestartListener.cmd` (2:30 PM) — only restarts listener, NOT IBGateway
+
+Result: 14-hour gap (6 AM to 8 PM) with zero auto-recovery.
+
+**Fix:** Created `IB_Watchdog.ps1` PowerShell script that:
+1. Checks port 7497 is LISTENING (IB Gateway alive)
+2. Checks `/health` returns HTTP 200 (Listener alive)
+3. If either fails, calls `BounceServices.cmd` to restart all services (CloudflareTunnel + IBGateway + OptionsListener)
+4. 10-minute cooldown file (`watchdog_last_restart.txt`) prevents restart loops
+5. Post-restart verification: re-checks `/health` and logs result
+
+**Scheduled Task:** `IB_Watchdog_Every15Min` — runs every 15 minutes, Mon-Fri, 6:00 AM to 8:00 PM.
+
+**Also fixed:** Re-created missing `IB_RiskExits_Retry_1030` scheduled task (Fix Y6 — was never in the task list).
+
+**Impact:** If IB Gateway or listener goes down during trading hours, auto-recovery within 15 minutes instead of requiring manual intervention.
+
+---
+
+### Fix AB9: Put Vertical Sign Detection + ClientId Hardening (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** DailyCycleManagement.py (lines ~2323, ~2330, ~1221, ~2549), PlaceAnOrder.py (argparse, lines ~2515, ~2615)
+
+**Issue:** The 21-day reconcile (`_reconcile_positions_with_signals_lookback`) falsely detected MNST and TCOM as "reconcile_mismatch" on Feb 17 and Feb 18. Both were correctly-oriented PUT debit spreads matching their PUT_OPEN signals, but got unnecessary MKT close orders at 5 PM.
+
+**Root Cause (AB9a):** `_detect_vertical()` uses notional comparison: for a PUT debit spread (long higher put, short lower put), the long leg has higher avgCost → `long_notional > short_notional` → `put_sign=+1`. But PUT_OPEN signal convention is `-1`. The code set `sign = put_sign` directly without negating.
+
+**Fix AB9a — Negate put sign (PRIMARY):**
+```python
+# Line ~2323 (put-only vertical):
+# BEFORE: sign = put_sign
+# AFTER:
+sign = -put_sign if put_sign is not None else None
+
+# Line ~2330 (mixed case, put dominates):
+# BEFORE: sign = -1
+# AFTER:
+sign = -put_sign if put_sign is not None else None
+```
+
+Logic: PUT debit spread (long higher put) → `put_sign=+1` → negated to `-1` (matches PUT_OPEN). Short put credit spread → `put_sign=-1` → negated to `+1` (bullish).
+
+**Fix AB9b — Widen clientId range:**
+Changed `_try_close_from_positions()` clientId from `880 + random.randint(0, 99)` to `900 + random.randint(0, 99)`. Avoids overlap with DCM functions at 882-891 and close guard at 884.
+
+**Fix AB9c — Add `--client-id` to PlaceAnOrder.py:**
+Added `--client-id` CLI argument (default 101). Both `ib.connect()` sites (force-close at line ~2515 and from-signal at line ~2615) now use `args.client_id`. DCM reconcile force-close passes `--client-id 102` to avoid collision with other PlaceAnOrder instances.
+
+**Impact:**
+- PUT debit spreads matching PUT_OPEN signals are correctly recognized as "matches current orientation; holding"
+- No more false MKT close orders for correctly-oriented PUT positions
+- ClientId collisions between DCM in-process connections and PlaceAnOrder subprocesses eliminated
+
+---
+
 ## Operational Issues
 
 ### Preclose Scheduler (Feb 4-5, 2026)
@@ -1404,4 +1467,131 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 15, 2026 by Claude (Opus 4.6) - Added Fix AB6: one-leg-worthless combo, close guard SELL-only, exchange fix, limit rounding
+**Last Updated:** February 18, 2026 by Claude (Sonnet 4.6) - Added Fix AD/AD2/AE: enrichment at 10:30 AM, 9:45 AM rescheduling, worthless leg fix
+
+---
+
+### Fix AD: Add CSV Enrichment to 10:30 AM Risk Exits Retry (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`--risk-exits-only` path, line ~3518)
+
+**Issue:** At 9:45 AM, `enrich_live_spread_prices: updated=0` because IB option market data feeds haven't initialized (Error 10091 at market open). The previous day's CSV has no live prices for 3 PM preclose to use as fallback. The 10:30 AM retry only called `_rth_risk_exits()` — it didn't re-run enrichment.
+
+**Fix:** Added `_enrich_today_and_prev_trading_day(only_rth=True)` before `_rth_risk_exits()` in the `--risk-exits-only` path. By 10:30 AM, option market data is reliably available, so live prices populate correctly.
+
+**Impact:** Previous day's CSV gets live prices at 10:30 AM. 3 PM preclose has reliable CSV fallback pricing. Risk exits also run with better market data.
+
+---
+
+### Fix AD2: Move IB_Open_PlaceMissing_0935 to 9:45 AM (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** Windows Task Scheduler (`IB_Open_PlaceMissing_0935`)
+
+**Issue:** At 9:35 AM (5 min after open), IB option market data feeds haven't initialized. Risk exits get Error 10091, CSV live enrichment gets `updated=0`. Moving to 9:45 AM gives 15 minutes for market data to stabilize.
+
+**Fix:** Changed task trigger from `09:35:00` to `09:45:00`. The 10:30 AM retry (`IB_RiskExits_Retry_1030`) remains as the safety net.
+
+---
+
+### Fix AE: Always Use Fixed-Price Individual Legs for Worthless Spreads (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions`, lines ~2143-2160)
+
+**Issue:** When both legs are worthless (both < worthless_threshold) AND `order_type=="MKT"` (because `--allow-market-fallback` is set and all limit pricing failed), Fix AB5 set `skip_combo=False` → routed to BAG combo MKT. The individual fixed-price leg path ($0.01/$0.05) was never reached. Reason in attempts CSV was always `market_fallback_preclose`, never `both_worthless_fixed_price`.
+
+**Root Cause of User Confusion:** The individual leg approach should be PRIMARY (deterministic, known price, fills at market open), with MKT only as last resort. The code had it backwards: MKT first, individual legs only if combo failed.
+
+**Fix:** Removed the `if order_type.upper() == "MKT"` branch. `both_worthless` now always sets `skip_combo=True`, routing directly to fixed-price individual legs regardless of `order_type`:
+
+```python
+# BEFORE: MKT bypassed individual legs
+if order_type.upper() == "MKT":
+    skip_combo = False  # → BAG combo MKT → market_fallback_preclose
+else:
+    skip_combo = True   # → $0.01/$0.05 individual legs
+
+# AFTER: Always individual legs for worthless spreads
+skip_combo = True  # → $0.01/$0.05 individual legs always
+```
+
+**Impact:**
+- `both_worthless_fixed_price` now appears in attempts CSV for truly worthless spreads
+- Fixed-price orders ($0.01 SELL long, $0.05 BUY short) fill immediately during market hours and at next open if placed after-hours
+- BAG combo MKT path for worthless spreads eliminated (it was unreliable for near-$0 spread values)
+
+---
+
+### Fix AC0: PUT Spread Leg Assignment in Risk Exits (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` line ~2884 (`_rth_risk_exits`)
+
+**Issue:** MNST PUT debit spread (long 77.5P, short 75P) got `entry=0.0000` and was skipped by risk exits every morning. avgCost showed: long=73.95, short=156.05 — reversed.
+
+**Root Cause:** In `_rth_risk_exits()`, the PUT debit loop finds pairs where `s1 > s2`, `l1.qty > 0` (long at s1=higher), `l2.qty < 0` (short at s2=lower). Then calls:
+```python
+# BEFORE (WRONG):
+_process_vertical(s2, l2, s1, l1, "PUT")  # l2=short passed as long_leg!
+# long_entry = 73.95/100 = 0.74, short_entry = 156.05/100 = 1.56
+# entry = max(0, 0.74 - 1.56) = 0.0 → skipped every time
+```
+
+**Fix:**
+```python
+# AFTER (CORRECT):
+# Fix AC0: PUT debit — long=l1 (higher strike s1), short=l2 (lower strike s2)
+_process_vertical(s2, l1, s1, l2, "PUT")
+# long_entry = 156.05/100 = 1.56, short_entry = 73.95/100 = 0.74
+# entry = max(0, 1.56 - 0.74) = 0.821 ✓
+```
+
+**Impact:** PUT debit spreads (MNST, TCOM, any PUT position) now correctly compute entry price from avgCost. Stop-loss and take-profit thresholds can be properly evaluated.
+
+---
+
+### Fix AC1: Health.ps1 — Add Missing Tasks to Monitoring (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\Health.ps1` (lines 76-92)
+
+**Issue:** `IB_RiskExits_Retry_1030` and `IB_Watchdog_Every15Min` were not in the `$wanted` array, so Health reports never showed their LastRun/LastResult.
+
+**Fix:** Added both to `$wanted`. Also added `IB_RiskExits_Retry_1030` to `$expectDaily` since it invokes DCM.
+
+**Impact:** Health reports now show status of 10 tasks instead of 8. Missing or failing risk-exit retry and watchdog tasks will be visible.
+
+---
+
+### Fix AC2: Create RiskExitsRetry.cmd (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\RiskExitsRetry.cmd` (NEW FILE)
+
+**Issue:** `IB_RiskExits_Retry_1030` task called Python directly, so there was no `==== [RiskExitsRetry ...] ====` header in `ib_cycle.log` — impossible to confirm via log that the 10:30 AM retry ran.
+
+**Fix:** Created `RiskExitsRetry.cmd` matching the pattern of `PlaceOpen.cmd`:
+```cmd
+>>"%LOG%" echo ==== [RiskExitsRetry %DATE% %TIME%] ====
+"%PY%" ".\DailyCycleManagement.py" --risk-exits-only >>"%LOG%" 2>&1
+```
+
+**Impact:** 10:30 AM risk exit retry output now appears in ib_cycle.log with a recognizable header, consistent with all other scheduled tasks.
+
+---
+
+### Fix AC3: Update IB_RiskExits_Retry_1030 Task to Use .cmd (Feb 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** Windows Task Scheduler (`IB_RiskExits_Retry_1030`)
+
+**Issue:** Task ran `python.exe DailyCycleManagement.py --risk-exits-only --verbose` directly — bypassing the .cmd wrapper and not logging to ib_cycle.log.
+
+**Fix:** Updated task action to:
+- Execute: `cmd.exe`
+- Arguments: `/c "C:\OptionsHistory\bin\RiskExitsRetry.cmd"`
+- WorkingDirectory: `C:\OptionsHistory\bin`
+
+**Impact:** Task output now goes to ib_cycle.log. Health.ps1 can detect it via log parsing. Consistent with PlaceOpen.cmd / ForceMktClose.cmd pattern.
