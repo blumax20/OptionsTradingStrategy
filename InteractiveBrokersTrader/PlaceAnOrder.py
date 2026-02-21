@@ -1933,6 +1933,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
         # FALLBACK: If live quotes failed, try CSV limits (today first, then previous trading day)
         # Fix O: Check multiple CSVs - previous day has position-based strikes (Fix I) + live prices (Fix N)
+        _csv_row_for_symbol = None  # Fix AF1/AF2: cache CSV row for strike validation and worthless check
         if limit is None:
             width = abs(float(longK) - float(shortK))
             for csv_path in _get_csv_paths_for_close(args.date):
@@ -1946,6 +1947,21 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     if rows.empty:
                         continue
                     row = rows.iloc[-1]  # Use LATEST row (aligns with DailyCycleManagement)
+                    # Fix AF1: Validate that CSV atm_strike matches actual position longK.
+                    # When the listener generates a row for a non-CLOSE signal (e.g., PUT_OPEN),
+                    # it uses current ATM strikes — not the held position's actual (often OTM) strikes.
+                    # If the CSV was generated for wrong strikes, the pricing is unreliable.
+                    _csv_row_for_symbol = row  # cache for AF2 theo check regardless of validation result
+                    _row_atm = pd.to_numeric(row.get("atm_strike"), errors="coerce")
+                    if pd.notna(_row_atm) and longK is not None:
+                        _atm_diff = abs(float(_row_atm) - float(longK))
+                        if _atm_diff > 1.5 * width:
+                            logger.warning(
+                                f"[{symbol}] CSV atm_strike={_row_atm} vs position longK={longK} "
+                                f"(diff={_atm_diff:.1f} > 1.5×width={1.5*width:.1f}): "
+                                f"discarding CSV pricing (wrong strikes — CSV generated for different spread)"
+                            )
+                            continue  # skip this CSV source; _csv_row_for_symbol cached for AF2
                     csv_limit = width_aligned_close_limit(row, right, width)
                     if csv_limit is not None:
                         # Apply additional 5% buffer (width_aligned_close_limit already applies 5% + width cap)
@@ -1986,31 +2002,52 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     )
 
         # Handle case when all pricing fallbacks fail
+        _af2_theo_worthless = False  # Fix AF2: flag for CSV-theo-based worthless detection
         if limit is None:
-            if getattr(args, "allow_market_fallback", False):
-                # Preclose mode: market is open, MARKET order is acceptable as last resort
-                logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
-                order_type = "MKT"
-                record_attempt(
-                    symbol,
-                    "force_close",
-                    "placed",
-                    "market_fallback_preclose",
-                    exp=str(exp),
-                    right=right.upper(),
-                )
-            else:
-                # After-hours: skip to avoid bad MARKET fill
-                logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
-                record_attempt(
-                    symbol,
-                    "force_close",
-                    "skipped",
-                    "no_viable_limit_all_fallbacks_failed",
-                    exp=str(exp),
-                    right=right.upper(),
-                )
-                continue  # Skip this spread, don't place market order
+            # Fix AF2: Check CSV theo as worthless proxy before giving up.
+            # If Black-Scholes theo ≈ $0, the spread is deeply OTM and essentially worthless.
+            # Route to fixed-price individual leg close ($0.05 SELL/$0.05 BUY) instead of skipping.
+            if _csv_row_for_symbol is not None:
+                try:
+                    _wb = _width_bucket(width)
+                    if _wb:
+                        _theo_col = f"{'call' if right.upper() == 'C' else 'put'}_debit_theo_{_wb}"
+                        _theo_val = pd.to_numeric(_csv_row_for_symbol.get(_theo_col), errors="coerce")
+                        if pd.notna(_theo_val) and float(_theo_val) <= 0.05:
+                            _af2_theo_worthless = True
+                            logger.info(
+                                f"[{symbol}] CSV theo ({_theo_col})={float(_theo_val):.3f} ≤ 0.05: "
+                                f"spread is essentially worthless — routing to fixed-price individual leg close"
+                            )
+                except Exception:
+                    pass
+
+            if not _af2_theo_worthless:
+                if getattr(args, "allow_market_fallback", False):
+                    # Preclose mode: market is open, MARKET order is acceptable as last resort
+                    logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
+                    order_type = "MKT"
+                    record_attempt(
+                        symbol,
+                        "force_close",
+                        "placed",
+                        "market_fallback_preclose",
+                        exp=str(exp),
+                        right=right.upper(),
+                    )
+                else:
+                    # After-hours: skip to avoid bad MARKET fill
+                    logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
+                    record_attempt(
+                        symbol,
+                        "force_close",
+                        "skipped",
+                        "no_viable_limit_all_fallbacks_failed",
+                        exp=str(exp),
+                        right=right.upper(),
+                    )
+                    continue  # Skip this spread, don't place market order
+            # If _af2_theo_worthless: fall through; override applied after use_fallback block below
         else:
             order_type = "LMT"
             limit = round(limit, 2)  # Fix AB6d: clean 2-decimal-place prices
@@ -2143,18 +2180,24 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 elif long_worthless and short_worthless:
                     both_worthless = True
                     # Fix AE: Always use fixed-price individual legs for truly worthless spreads.
-                    # $0.01 SELL (long) / $0.05 BUY (short) fills reliably in any session —
-                    # these prices are above the market for worthless options so they fill immediately.
+                    # $0.05 SELL (long) / $0.05 BUY (short) — both at exchange minimum tick.
                     # MKT is not needed as primary; it stays as an outer fallback only if legs fail.
                     skip_combo = True
                     logger.info(
                         f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
                         f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                        f"will close with fixed pricing (sell long @$0.01, buy short @$0.05)"
+                        f"will close with fixed pricing (sell long @$0.05, buy short @$0.05)"
                     )
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
                 skip_combo = False
+
+        # Fix AF2: Override skip_combo/both_worthless/use_fallback AFTER the use_fallback block,
+        # so it's not reset by lines 2039-2041. If CSV theo ≈ $0, route to individual leg close.
+        if _af2_theo_worthless:
+            both_worthless = True
+            skip_combo = True
+            use_fallback = True  # enable individual-leg path regardless of CLI flag
 
         tr = None
         if not skip_combo:
@@ -2415,12 +2458,15 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     strike = float(getattr(c, "strike", 0.0))
                     pos = float(getattr(p, "position", 0.0))
 
-                    # Long position: sell at fixed price $0.01
+                    # Long position: sell at fixed price $0.05
+                    # Fix AF3: Use $0.05 (exchange minimum tick) instead of $0.01.
+                    # $0.01 is silently rejected by IB for non-penny-pilot options (min tick = $0.05),
+                    # leaving the long position open with no working close order.
                     if abs(strike - float(longK)) < 0.01 and pos > 0:
                         qty = int(abs(pos))
-                        leg_order = LimitOrder("SELL", qty, 0.01)
+                        leg_order = LimitOrder("SELL", qty, 0.05)
                         reason = "both_worthless_fixed_price"
-                        price_str = "$0.01"
+                        price_str = "$0.05"
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
                         if not getattr(c, 'exchange', ''):  # Fix AB6c
@@ -2432,9 +2478,9 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         submitted += 1
                         CLOSE_SEEN_KEYS.add(ckey)
                         logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
-                        record_attempt(symbol, "close_individual_leg", "placed", reason,
+                        record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
                                      exp=str(exp), right=right, longK=float(longK),
-                                     limit=0.01,
+                                     limit=0.05,
                                      qty=qty, order_action="SELL", leg_type="long")
 
                     # Short position: buy at fixed price $0.05
