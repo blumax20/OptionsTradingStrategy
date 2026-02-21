@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 20, 2026
+**Last Updated:** February 21, 2026
 
 ---
 
@@ -1742,3 +1742,27 @@ if ms is None:
 - Portfolio prices come from TWS's account update stream — always available when connected, no separate subscription required
 - Both stop-loss and take-profit use the same `curr = max(0.0, ml - ms)`, so both are fixed by this change
 - CP CALL 80/82.5: portfolio long=$5.84, short=$3.90, curr=$1.94 > TP threshold $1.76 → TP triggers
+
+---
+
+### Fix AH1+AH2: BAG Cancel + Individual Leg Dedup Before Worthless Close (Feb 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`force_close_symbol_via_positions`, `both_worthless` block ~line 2481 and `one_leg_worthless` block ~line 2338)
+
+**Issue:** NWG CALL 20/22.5 (both worthless) accumulated 3× BUY 22.5C at $0.05 with no SELL 20C. Two compounding problems:
+
+1. **Dedup gap (AH2):** The `both_worthless` individual leg block has no cross-run dedup guard. `ib_close_guard.has_working_auto_close()` only detects SELL BAG orders, not individual OPT orders. Each 9:45 AM and 10:30 AM re-run placed a fresh BUY without checking if one already existed.
+
+2. **BAG conflict (AH1):** The 5 PM reconcile placed a BAG SELL combo order (`outsideRth=True, tif=DAY`) that remained Inactive over the weekend and activated Monday. IB rejects an individual SELL 20C when a BAG already contains that leg as a SELL. Individual BUY 22.5C succeeded (not conflict-blocked), but SELL 20C was silently rejected.
+
+**Fix AH1:** Before placing individual legs (in both `both_worthless` and `one_leg_worthless` blocks), cancel any Presubmitted/Submitted/Inactive BAG combo orders for the symbol. Uses `ib.reqAllOpenOrders()` + `ib.sleep(0.4)` pattern (same as `_has_working_close_order()`). Allows 0.4s for cancellation to propagate.
+
+**Fix AH2:** After AH1, build a set of already-working individual OPT orders: `_working_sells_ah` (strikes with working SELL) and `_working_buys_ah` (strikes with working BUY). Before placing each leg, check if a working order already exists for that strike+action — skip with `AH2: skipping` log if so.
+
+Applied in **both** `both_worthless` and `one_leg_worthless` blocks.
+
+**Impact:**
+- AH1: BAG cleared before individual placement → IB accepts individual SELL for legs previously blocked by BAG conflict
+- AH2: On 2nd/3rd run (9:45 AM retry, 10:30 AM retry), already-working individual legs are skipped → no more 3× BUY duplicates
+- Attempts CSV: `"AH2: SELL 20.0 individual leg already working; skipping"` visible in log on subsequent runs

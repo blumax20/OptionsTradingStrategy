@@ -2336,98 +2336,143 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                 # Close valuable legs individually
                 legs_closed = 0
+                # Fix AH1: Cancel any existing BAG combo order for this symbol before individual leg placement.
+                try:
+                    ib.reqAllOpenOrders()
+                    ib.sleep(0.4)
+                    for _t_ah in list(ib.openTrades()):
+                        _tc_ah = _t_ah.contract
+                        if (getattr(_tc_ah, "secType", "") == "BAG"
+                                and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
+                            _st_ah = _t_ah.orderStatus.status.lower()
+                            if _st_ah in ("presubmitted", "submitted", "inactive"):
+                                ib.cancelOrder(_t_ah.order)
+                                logger.info("[%s] AH1: cancelled BAG order %s (%s) to allow individual leg placement",
+                                            symbol, _t_ah.order.orderId, _st_ah)
+                    ib.sleep(0.4)
+                except Exception as _ah1_err:
+                    logger.warning("[%s] AH1: BAG cancel error (proceeding): %s", symbol, _ah1_err)
+                # Fix AH2: Build dedup set of already-working individual OPT orders.
+                _working_sells_ah: set = set()
+                _working_buys_ah: set = set()
+                try:
+                    for _t_ah in ib.openTrades():
+                        _tc_ah = _t_ah.contract
+                        if (getattr(_tc_ah, "secType", "") == "OPT"
+                                and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
+                            _st_ah = _t_ah.orderStatus.status.lower()
+                            if _st_ah in ("presubmitted", "submitted", "inactive"):
+                                _act_ah = (getattr(_t_ah.order, "action", "") or "").upper()
+                                _strk_ah = float(getattr(_tc_ah, "strike", 0))
+                                if _act_ah == "SELL":
+                                    _working_sells_ah.add(_strk_ah)
+                                elif _act_ah == "BUY":
+                                    _working_buys_ah.add(_strk_ah)
+                except Exception as _ah2_err:
+                    logger.warning("[%s] AH2: open trade scan error (proceeding): %s", symbol, _ah2_err)
 
                 if not long_worthless and abs(long_qty) > 0 and long_value is not None:
                     # Close long leg - use contract from positions if available
                     leg_action = "SELL" if long_qty > 0 else "BUY"
-                    leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
-                    leg_order.tif = "DAY"
-                    leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
-
-                    if long_contract is not None:
-                        long_opt_to_close = long_contract
-                    elif long_contract_from_pos is not None:
-                        long_opt_to_close = long_contract_from_pos
+                    _ah2_key_l = float(longK)
+                    if (leg_action == "SELL" and _ah2_key_l in _working_sells_ah) or \
+                       (leg_action == "BUY" and _ah2_key_l in _working_buys_ah):
+                        logger.info("[%s] AH2: %s %.0f individual leg already working; skipping", symbol, leg_action, _ah2_key_l)
                     else:
-                        long_opt_to_close = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
-                        qualified = ib.qualifyContracts(long_opt_to_close)
-                        if not qualified:
-                            raise ValueError(f"Could not qualify long leg contract for {symbol} {longK}")
-                        long_opt_to_close = qualified[0]
+                        leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
+                        leg_order.tif = "DAY"
+                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
 
-                    if not getattr(long_opt_to_close, 'exchange', ''):  # Fix AB6c
-                        long_opt_to_close.exchange = "SMART"
-                    trade = ib.placeOrder(long_opt_to_close, leg_order)
-                    ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
-                    logger.info(f"[{symbol}] Individual long leg order status: ok={ok}, reason={why}")
-                    legs_closed += 1
-                    submitted += 1
+                        if long_contract is not None:
+                            long_opt_to_close = long_contract
+                        elif long_contract_from_pos is not None:
+                            long_opt_to_close = long_contract_from_pos
+                        else:
+                            long_opt_to_close = Option(symbol, exp, float(longK), right.upper(), "SMART", "USD")
+                            qualified = ib.qualifyContracts(long_opt_to_close)
+                            if not qualified:
+                                raise ValueError(f"Could not qualify long leg contract for {symbol} {longK}")
+                            long_opt_to_close = qualified[0]
 
-                    logger.info(
-                        f"[{symbol}] Closed individual LONG {right} {longK} exp {exp} "
-                        f"({leg_action} {abs(long_qty):.0f} @ ${long_value:.2f})"
-                    )
+                        if not getattr(long_opt_to_close, 'exchange', ''):  # Fix AB6c
+                            long_opt_to_close.exchange = "SMART"
+                        trade = ib.placeOrder(long_opt_to_close, leg_order)
+                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        logger.info(f"[{symbol}] Individual long leg order status: ok={ok}, reason={why}")
+                        legs_closed += 1
+                        submitted += 1
 
-                    record_attempt(
-                        symbol,
-                        "close_individual_leg",
-                        "placed",
-                        "worthless_leg_fallback",
-                        exp=str(exp),
-                        right=right,
-                        longK=float(longK),
-                        limit=float(long_value),
-                        qty=int(abs(long_qty)),
-                        order_action=leg_action,
-                        leg_type="long",
-                        leg_value=float(long_value),
-                    )
+                        logger.info(
+                            f"[{symbol}] Closed individual LONG {right} {longK} exp {exp} "
+                            f"({leg_action} {abs(long_qty):.0f} @ ${long_value:.2f})"
+                        )
+
+                        record_attempt(
+                            symbol,
+                            "close_individual_leg",
+                            "placed",
+                            "worthless_leg_fallback",
+                            exp=str(exp),
+                            right=right,
+                            longK=float(longK),
+                            limit=float(long_value),
+                            qty=int(abs(long_qty)),
+                            order_action=leg_action,
+                            leg_type="long",
+                            leg_value=float(long_value),
+                        )
 
                 if not short_worthless and abs(short_qty) > 0 and short_value is not None:
                     # Close short leg - use contract from positions if available
                     leg_action = "SELL" if short_qty > 0 else "BUY"
-                    leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
-                    leg_order.tif = "DAY"
-                    leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
-
-                    if short_contract is not None:
-                        short_opt_to_close = short_contract
-                    elif short_contract_from_pos is not None:
-                        short_opt_to_close = short_contract_from_pos
+                    _ah2_key_s = float(shortK)
+                    if (leg_action == "SELL" and _ah2_key_s in _working_sells_ah) or \
+                       (leg_action == "BUY" and _ah2_key_s in _working_buys_ah):
+                        logger.info("[%s] AH2: %s %.0f individual leg already working; skipping",
+                                    symbol, leg_action, _ah2_key_s)
                     else:
-                        short_opt_to_close = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
-                        qualified = ib.qualifyContracts(short_opt_to_close)
-                        if not qualified:
-                            raise ValueError(f"Could not qualify short leg contract for {symbol} {shortK}")
-                        short_opt_to_close = qualified[0]
+                        leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
+                        leg_order.tif = "DAY"
+                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
 
-                    if not getattr(short_opt_to_close, 'exchange', ''):  # Fix AB6c
-                        short_opt_to_close.exchange = "SMART"
-                    trade = ib.placeOrder(short_opt_to_close, leg_order)
-                    ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
-                    logger.info(f"[{symbol}] Individual short leg order status: ok={ok}, reason={why}")
-                    legs_closed += 1
-                    submitted += 1
+                        if short_contract is not None:
+                            short_opt_to_close = short_contract
+                        elif short_contract_from_pos is not None:
+                            short_opt_to_close = short_contract_from_pos
+                        else:
+                            short_opt_to_close = Option(symbol, exp, float(shortK), right.upper(), "SMART", "USD")
+                            qualified = ib.qualifyContracts(short_opt_to_close)
+                            if not qualified:
+                                raise ValueError(f"Could not qualify short leg contract for {symbol} {shortK}")
+                            short_opt_to_close = qualified[0]
 
-                    logger.info(
-                        f"[{symbol}] Closed individual SHORT {right} {shortK} exp {exp} "
-                        f"({leg_action} {abs(short_qty):.0f} @ ${short_value:.2f})"
-                    )
+                        if not getattr(short_opt_to_close, 'exchange', ''):  # Fix AB6c
+                            short_opt_to_close.exchange = "SMART"
+                        trade = ib.placeOrder(short_opt_to_close, leg_order)
+                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        logger.info(f"[{symbol}] Individual short leg order status: ok={ok}, reason={why}")
+                        legs_closed += 1
+                        submitted += 1
 
-                    record_attempt(
-                        symbol,
-                        "close_individual_leg",
-                        "placed",
-                        "worthless_leg_fallback",
-                        exp=str(exp),
-                        right=right,
-                        shortK=float(shortK),
-                        limit=float(short_value),
-                        qty=int(abs(short_qty)),
-                        order_action=leg_action,
-                        leg_type="short",
-                        leg_value=float(short_value),
-                    )
+                        logger.info(
+                            f"[{symbol}] Closed individual SHORT {right} {shortK} exp {exp} "
+                            f"({leg_action} {abs(short_qty):.0f} @ ${short_value:.2f})"
+                        )
+
+                        record_attempt(
+                            symbol,
+                            "close_individual_leg",
+                            "placed",
+                            "worthless_leg_fallback",
+                            exp=str(exp),
+                            right=right,
+                            shortK=float(shortK),
+                            limit=float(short_value),
+                            qty=int(abs(short_qty)),
+                            order_action=leg_action,
+                            leg_type="short",
+                            leg_value=float(short_value),
+                        )
 
                 if legs_closed > 0:
                     logger.info(f"[{symbol}] Closed {legs_closed} individual leg(s) via fallback")
@@ -2441,9 +2486,44 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
         # Fix S: Handle both-worthless-legs case with fixed pricing
         if skip_combo and use_fallback and both_worthless:
-            # Close positions with guaranteed-fill pricing: long @ $0.01, short @ $0.05
+            # Close positions with guaranteed-fill pricing: long @ $0.05, short @ $0.05
             legs_closed = 0
             try:
+                # Fix AH1: Cancel any existing BAG combo order for this symbol before individual leg placement.
+                # A pending BAG SELL (e.g. from reconcile) causes IB to reject the individual SELL for the same leg.
+                try:
+                    ib.reqAllOpenOrders()
+                    ib.sleep(0.4)
+                    for _t_ah in list(ib.openTrades()):
+                        _tc_ah = _t_ah.contract
+                        if (getattr(_tc_ah, "secType", "") == "BAG"
+                                and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
+                            _st_ah = _t_ah.orderStatus.status.lower()
+                            if _st_ah in ("presubmitted", "submitted", "inactive"):
+                                ib.cancelOrder(_t_ah.order)
+                                logger.info("[%s] AH1: cancelled BAG order %s (%s) to allow individual leg placement",
+                                            symbol, _t_ah.order.orderId, _st_ah)
+                    ib.sleep(0.4)
+                except Exception as _ah1_err:
+                    logger.warning("[%s] AH1: BAG cancel error (proceeding): %s", symbol, _ah1_err)
+                # Fix AH2: Build dedup set of already-working individual OPT orders (prevents cross-run duplicates).
+                _working_sells_ah: set = set()
+                _working_buys_ah: set = set()
+                try:
+                    for _t_ah in ib.openTrades():
+                        _tc_ah = _t_ah.contract
+                        if (getattr(_tc_ah, "secType", "") == "OPT"
+                                and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
+                            _st_ah = _t_ah.orderStatus.status.lower()
+                            if _st_ah in ("presubmitted", "submitted", "inactive"):
+                                _act_ah = (getattr(_t_ah.order, "action", "") or "").upper()
+                                _strk_ah = float(getattr(_tc_ah, "strike", 0))
+                                if _act_ah == "SELL":
+                                    _working_sells_ah.add(_strk_ah)
+                                elif _act_ah == "BUY":
+                                    _working_buys_ah.add(_strk_ah)
+                except Exception as _ah2_err:
+                    logger.warning("[%s] AH2: open trade scan error (proceeding): %s", symbol, _ah2_err)
                 for p in ib.positions():
                     c = getattr(p, "contract", None)
                     if not c or getattr(c, "secType", "") != "OPT":
@@ -2463,46 +2543,52 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     # $0.01 is silently rejected by IB for non-penny-pilot options (min tick = $0.05),
                     # leaving the long position open with no working close order.
                     if abs(strike - float(longK)) < 0.01 and pos > 0:
-                        qty = int(abs(pos))
-                        leg_order = LimitOrder("SELL", qty, 0.05)
-                        reason = "both_worthless_fixed_price"
-                        price_str = "$0.05"
-                        leg_order.tif = "DAY"
-                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
-                        if not getattr(c, 'exchange', ''):  # Fix AB6c
-                            c.exchange = "SMART"
-                        trade = ib.placeOrder(c, leg_order)
-                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
-                        logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
-                        legs_closed += 1
-                        submitted += 1
-                        CLOSE_SEEN_KEYS.add(ckey)
-                        logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
-                        record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
-                                     exp=str(exp), right=right, longK=float(longK),
-                                     limit=0.05,
-                                     qty=qty, order_action="SELL", leg_type="long")
+                        if float(longK) in _working_sells_ah:  # Fix AH2: dedup
+                            logger.info("[%s] AH2: SELL %.0f individual leg already working; skipping", symbol, float(longK))
+                        else:
+                            qty = int(abs(pos))
+                            leg_order = LimitOrder("SELL", qty, 0.05)
+                            reason = "both_worthless_fixed_price"
+                            price_str = "$0.05"
+                            leg_order.tif = "DAY"
+                            leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                            if not getattr(c, 'exchange', ''):  # Fix AB6c
+                                c.exchange = "SMART"
+                            trade = ib.placeOrder(c, leg_order)
+                            ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                            logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
+                            legs_closed += 1
+                            submitted += 1
+                            CLOSE_SEEN_KEYS.add(ckey)
+                            logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
+                            record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
+                                         exp=str(exp), right=right, longK=float(longK),
+                                         limit=0.05,
+                                         qty=qty, order_action="SELL", leg_type="long")
 
                     # Short position: buy at fixed price $0.05
                     if abs(strike - float(shortK)) < 0.01 and pos < 0:
-                        qty = int(abs(pos))
-                        leg_order = LimitOrder("BUY", qty, 0.05)
-                        reason = "both_worthless_fixed_price"
-                        price_str = "$0.05"
-                        leg_order.tif = "DAY"
-                        leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
-                        if not getattr(c, 'exchange', ''):  # Fix AB6c
-                            c.exchange = "SMART"
-                        trade = ib.placeOrder(c, leg_order)
-                        ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
-                        logger.info(f"[{symbol}] Worthless short leg order status: ok={ok}, reason={why}")
-                        legs_closed += 1
-                        submitted += 1
-                        logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
-                        record_attempt(symbol, "close_individual_leg", "placed", reason,
-                                     exp=str(exp), right=right, shortK=float(shortK),
-                                     limit=0.05,
-                                     qty=qty, order_action="BUY", leg_type="short")
+                        if float(shortK) in _working_buys_ah:  # Fix AH2: dedup
+                            logger.info("[%s] AH2: BUY %.0f individual leg already working; skipping", symbol, float(shortK))
+                        else:
+                            qty = int(abs(pos))
+                            leg_order = LimitOrder("BUY", qty, 0.05)
+                            reason = "both_worthless_fixed_price"
+                            price_str = "$0.05"
+                            leg_order.tif = "DAY"
+                            leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                            if not getattr(c, 'exchange', ''):  # Fix AB6c
+                                c.exchange = "SMART"
+                            trade = ib.placeOrder(c, leg_order)
+                            ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                            logger.info(f"[{symbol}] Worthless short leg order status: ok={ok}, reason={why}")
+                            legs_closed += 1
+                            submitted += 1
+                            logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
+                            record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
+                                         exp=str(exp), right=right, shortK=float(shortK),
+                                         limit=0.05,
+                                         qty=qty, order_action="BUY", leg_type="short")
 
                 if legs_closed > 0:
                     logger.info(f"[{symbol}] Closed {legs_closed} worthless leg(s) with fixed pricing")
