@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 18, 2026
+**Last Updated:** February 20, 2026
 
 ---
 
@@ -1467,7 +1467,7 @@ Create test cases for pricing fallback scenarios
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\listener.py` - Signal processing (Fix I, M)
 - `C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_close_guard.py`
 
-**Last Updated:** February 18, 2026 by Claude (Sonnet 4.6) - Added Fix AD/AD2/AE: enrichment at 10:30 AM, 9:45 AM rescheduling, worthless leg fix
+**Last Updated:** February 20, 2026 by Claude (Sonnet 4.6) - Added Fix AD/AD2/AE: enrichment at 10:30 AM, 9:45 AM rescheduling, worthless leg fix
 
 ---
 
@@ -1699,3 +1699,46 @@ Also improved `record_attempt` status: `"placed" if ok else "error"` (was always
 - Net cost to close both worthless legs: SELL long @$0.05 + BUY short @$0.05 = $0 net (break even)
 - If no buyer at $0.05, order remains pending; long position costs nothing to hold (worth ~$0, expires at expiration)
 - `_await_working()` result now reflected in attempts CSV status (`error` if IB rejects)
+
+---
+
+### Fix AG1: Portfolio Price Fallback for Risk Exit TP/SL Detection (Feb 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_rth_risk_exits()`, lines ~2668 and ~2796)
+
+**Issue:** `_rth_risk_exits()` uses `reqMktData()` exclusively to get current leg prices for TP/SL evaluation. When IB returns Error 354 ("Requested market data is not subscribed") or Error 10091, `_mid()` returns `None` for both legs and every position is skipped with "no valid market data". CP CALL 80/82.5 (March 20 exp) had a spread value of $1.94 exceeding the TP threshold of $1.76 but was skipped every morning.
+
+**Root Cause (investigation Feb 20):** Paper trading account was not configured to share live market data from the live account — required explicit enablement in TWS (Account → Paper Trading → Use live market data). Additionally, `reqMktData()` with no `genericTickList` requests OPRA real-time bid/ask/last which may differ from OI/IV subscription tier used by the listener (`'101,106'`).
+
+**Fix — two changes in `_rth_risk_exits()`:**
+
+1. Build portfolio price lookup after position scan:
+```python
+# Fix AG1: Build portfolio price lookup as fallback when reqMktData fails (Error 354).
+# ib.portfolio() prices come from TWS's account update stream — no market data subscription required.
+port_prices: dict[int, float] = {}
+try:
+    for _pi in ib.portfolio():
+        _mp = _pi.marketPrice
+        if _mp and not _math_ag1.isnan(_mp) and _mp > 0:
+            port_prices[_pi.contract.conId] = _mp
+    LOG.info("Risk exits: portfolio price lookup: %d entries", len(port_prices))
+except Exception as _ag1_err:
+    LOG.warning("Risk exits: portfolio price lookup failed: %s", _ag1_err)
+```
+
+2. In `_process_vertical()`, fallback to portfolio prices after reqMktData polling:
+```python
+# Fix AG1: fallback to portfolio market prices if reqMktData returns None
+if ml is None:
+    ml = port_prices.get(long_leg["conId"])
+if ms is None:
+    ms = port_prices.get(short_leg["conId"])
+```
+
+**Impact:**
+- TP/SL detection now works even when `reqMktData()` fails (Error 354, Error 10091, timeout)
+- Portfolio prices come from TWS's account update stream — always available when connected, no separate subscription required
+- Both stop-loss and take-profit use the same `curr = max(0.0, ml - ms)`, so both are fixed by this change
+- CP CALL 80/82.5: portfolio long=$5.84, short=$3.90, curr=$1.94 > TP threshold $1.76 → TP triggers

@@ -2665,6 +2665,20 @@ class DailyCycleManagementMixin:
         LOG.info("Risk exits: scanning %d symbols with option positions: %s",
                  len(legs_by_sym), ", ".join(sorted(legs_by_sym.keys())))
 
+        # Fix AG1: Build portfolio price lookup as fallback when reqMktData fails (Error 354).
+        # ib.portfolio() prices come from TWS's account update stream — no market data
+        # subscription required. Resolves CP and similar symbols that fail reqMktData.
+        import math as _math_ag1
+        port_prices: dict[int, float] = {}
+        try:
+            for _pi in ib.portfolio():
+                _mp = _pi.marketPrice
+                if _mp and not _math_ag1.isnan(_mp) and _mp > 0:
+                    port_prices[_pi.contract.conId] = _mp
+            LOG.info("Risk exits: portfolio price lookup: %d entries", len(port_prices))
+        except Exception as _ag1_err:
+            LOG.warning("Risk exits: portfolio price lookup failed: %s", _ag1_err)
+
         # Pull executions for last 30 days to infer OPEN entry prices and age
         since = (now.astimezone(ZoneInfo("UTC")) - timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
         try:
@@ -2779,6 +2793,17 @@ class DailyCycleManagementMixin:
                     curr = None
                     ml = _mid(tl)
                     ms = _mid(ts)
+                    # Fix AG1: fallback to portfolio market prices if reqMktData returns None
+                    if ml is None:
+                        ml = port_prices.get(long_leg["conId"])
+                        if ml is not None:
+                            LOG.info("Risk exits: %s %s using portfolio price for long leg (%.0f): %.4f",
+                                     sym, right, strike_low, ml)
+                    if ms is None:
+                        ms = port_prices.get(short_leg["conId"])
+                        if ms is not None:
+                            LOG.info("Risk exits: %s %s using portfolio price for short leg (%.0f): %.4f",
+                                     sym, right, strike_high, ms)
                     if ml is not None and ms is not None:
                         curr = max(0.0, ml - ms)
                     if curr is None:
