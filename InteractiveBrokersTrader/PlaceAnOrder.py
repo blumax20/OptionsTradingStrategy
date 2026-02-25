@@ -2188,6 +2188,25 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
                         f"will close with fixed pricing (sell long @$0.05, buy short @$0.05)"
                     )
+
+                # Fix AI1: If limit is still None and portfolio prices are available for both legs,
+                # use them as a limit price for the combo close.
+                # Handles live_spread_price() returning None when bid=0 for OTM options (structurally
+                # common for deeply OTM options even with full market data subscription at 10:30 AM).
+                if limit is None and long_value is not None and short_value is not None and not both_worthless:
+                    _ai1_spread = max(0.0, long_value - short_value)
+                    if _ai1_spread >= args.min_limit:
+                        limit = round(_ai1_spread * 0.95, 2)  # 5% buffer on portfolio mid
+                        order_type = "LMT"
+                        logger.info(
+                            "[%s] AI1: portfolio-based limit for %s %s/%s: long=%.4f short=%.4f limit=%.2f",
+                            symbol, right, longK, shortK, long_value, short_value, limit
+                        )
+                    else:
+                        logger.info(
+                            "[%s] AI1: portfolio spread too small for %s %s/%s: long=%.4f short=%.4f spread=%.4f < min_limit=%.2f",
+                            symbol, right, longK, shortK, long_value, short_value, _ai1_spread, args.min_limit
+                        )
             except Exception as e:
                 logger.warning(f"[{symbol}] Failed to check leg values: {e}; will attempt combo close")
                 skip_combo = False
@@ -2220,7 +2239,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             submitted += 1
             # Fix Z3: record_attempt already logged by place_debit_spread() with reason="success".
             # Don't log a second "positions_fallback" entry for the same order.
-        else:
+        elif not skip_combo:  # Fix AI3: only log error when combo was actually attempted
             # Fix AB5: distinguish combo failure for worthless spreads
             fail_reason = "place_failed_positions"
             if both_worthless:
@@ -3014,9 +3033,24 @@ def run_from_csv():
                                 record_attempt(symbol, "close_put", "placed", "opposite_unwind_before_open_lmt", exp=None, right="P", qty=n_unw)
                                 allow_call = True  # Fix AA1: only allow open if unwind succeeded
                             else:
-                                logger.warning(f"[{symbol}] Opposite-side unwind (PUT) returned 0 spreads closed; blocking CALL_OPEN")
-                                record_attempt(symbol, "open_call", "skipped", "opposite_unwind_failed", exp=expiration, right="C")
-                                continue  # Fix AA1: skip CALL_OPEN for this symbol
+                                # Fix AJ2: n_unw=0 may mean close guard blocked a new order because one already exists.
+                                # A pre-existing SELL BAG close is functionally equivalent to a successful unwind.
+                                ib.reqAllOpenOrders()
+                                ib.sleep(0.3)
+                                _pre_close_aj2 = any(
+                                    getattr(_t2.contract, "secType", "") == "BAG"
+                                    and getattr(_t2.contract, "symbol", "").upper() == symbol.upper()
+                                    and (getattr(_t2.order, "action", "") or "").upper() == "SELL"
+                                    and _t2.orderStatus.status.lower() in ("presubmitted", "submitted", "inactive")
+                                    for _t2 in ib.openTrades()
+                                )
+                                if _pre_close_aj2:
+                                    logger.info(f"[{symbol}] AJ2: PUT unwind returned 0 but pre-existing SELL close found; allowing CALL_OPEN")
+                                    allow_call = True
+                                else:
+                                    logger.warning(f"[{symbol}] Opposite-side unwind (PUT) returned 0 spreads closed; blocking CALL_OPEN")
+                                    record_attempt(symbol, "open_call", "skipped", "opposite_unwind_failed", exp=expiration, right="C")
+                                    continue  # Fix AA1: skip CALL_OPEN for this symbol
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (PUT) failed prior to CALL_OPEN: {_e}")
                             record_attempt(symbol, "open_call", "skipped", "opposite_unwind_exception", exp=expiration, right="C")
@@ -3061,9 +3095,24 @@ def run_from_csv():
                                 record_attempt(symbol, "close_call", "placed", "opposite_unwind_before_open_lmt", exp=None, right="C", qty=n_unw)
                                 allow_put = True  # Fix AA1: only allow open if unwind succeeded
                             else:
-                                logger.warning(f"[{symbol}] Opposite-side unwind (CALL) returned 0 spreads closed; blocking PUT_OPEN")
-                                record_attempt(symbol, "open_put", "skipped", "opposite_unwind_failed", exp=expiration, right="P")
-                                continue  # Fix AA1: skip PUT_OPEN for this symbol
+                                # Fix AJ2: n_unw=0 may mean close guard blocked a new order because one already exists.
+                                # A pre-existing SELL BAG close is functionally equivalent to a successful unwind.
+                                ib.reqAllOpenOrders()
+                                ib.sleep(0.3)
+                                _pre_close_aj2 = any(
+                                    getattr(_t2.contract, "secType", "") == "BAG"
+                                    and getattr(_t2.contract, "symbol", "").upper() == symbol.upper()
+                                    and (getattr(_t2.order, "action", "") or "").upper() == "SELL"
+                                    and _t2.orderStatus.status.lower() in ("presubmitted", "submitted", "inactive")
+                                    for _t2 in ib.openTrades()
+                                )
+                                if _pre_close_aj2:
+                                    logger.info(f"[{symbol}] AJ2: CALL unwind returned 0 but pre-existing SELL close found; allowing PUT_OPEN")
+                                    allow_put = True
+                                else:
+                                    logger.warning(f"[{symbol}] Opposite-side unwind (CALL) returned 0 spreads closed; blocking PUT_OPEN")
+                                    record_attempt(symbol, "open_put", "skipped", "opposite_unwind_failed", exp=expiration, right="P")
+                                    continue  # Fix AA1: skip PUT_OPEN for this symbol
                         except Exception as _e:
                             logger.warning(f"[{symbol}] Opposite-side unwind (CALL) failed prior to PUT_OPEN: {_e}")
                             record_attempt(symbol, "open_put", "skipped", "opposite_unwind_exception", exp=expiration, right="P")

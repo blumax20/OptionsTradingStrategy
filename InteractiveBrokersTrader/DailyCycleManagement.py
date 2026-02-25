@@ -909,6 +909,12 @@ class DailyCycleManagementMixin:
                     LOG.info("Close-delegate: no held positions match CLOSE signals; nothing to do.")
                     return
 
+            # Fix AI2: Capture reconcile-submitted symbols before stage checks.
+            # _submitted_close_syms is populated synchronously by the reconcile before this function runs.
+            # _has_working_close_order() creates a fresh IB connection and may miss orders placed just
+            # seconds ago (IB cross-clientId propagation delay). Using this set avoids the race condition.
+            _submitted_syms = getattr(self, "_submitted_close_syms", set())
+
             # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
             # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
             by_day: dict[str, list[str]] = {}
@@ -921,7 +927,7 @@ class DailyCycleManagementMixin:
                     continue
                 filtered_syms: list[str] = []
                 for s in sorted(set(syms)):
-                    if self._has_working_close_order(s):
+                    if s in _submitted_syms or self._has_working_close_order(s):  # Fix AI2
                         try:
                             self._attempt(
                                 symbol=s,
@@ -960,7 +966,7 @@ class DailyCycleManagementMixin:
             # --- Stage 1.5: live-mid fallback via PlaceAnOrder for any symbols still lacking a working close ---
             still_open: list[str] = []
             for s in sorted(set(pick)):
-                if not self._has_working_close_order(s):
+                if not (s in _submitted_syms or self._has_working_close_order(s)):  # Fix AI2
                     still_open.append(s)
 
             if still_open:
@@ -988,7 +994,7 @@ class DailyCycleManagementMixin:
             # --- Stage 2: final market fallback for anything still without a working close (positions-based in PlaceAnOrder) ---
             still_open2: list[str] = []
             for s in sorted(set(pick)):
-                if not self._has_working_close_order(s):
+                if not (s in _submitted_syms or self._has_working_close_order(s)):  # Fix AI2
                     still_open2.append(s)
             if still_open2:
                 syms_joined2 = ",".join(still_open2)
@@ -2877,6 +2883,7 @@ class DailyCycleManagementMixin:
                         "--use-live-close", "join",  # Use join pricing for limit orders instead of market
                         "--live-timeout", "8",        # Fix Y1: longer timeout at market open
                         "--close-reason", reason,     # Fix Z5: pass TP/SL reason to PlaceAnOrder attempts
+                        "--fallback-individual-legs",  # Fix AI1: enable portfolio price fallback for limit computation
                         "--quiet"
                     ])
                     submitted += 1
@@ -3334,7 +3341,11 @@ class DailyCycleManagementMixin:
             # Optional: After-hours batch placement + recent closes enforcement
             if self.is_after_hours_placement(now):
                 LOG.info("After-hours placement window (%s): enforcing recent closes + placing from-signal.", now)
-                self._enforce_recent_closes(days=7)
+                # Fix AJ1: Skip 7-day enforce on Sundays — _after_hours_batch_placement will do 21-day sweep (superset).
+                # Running both on Sunday causes each symbol to be processed twice through all 3 close stages.
+                _ahp_wday = self._now_ny().weekday()
+                if _ahp_wday != 6:  # 6 = Sunday
+                    self._enforce_recent_closes(days=7)
                 self._after_hours_batch_placement()
                 try:
                     self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)

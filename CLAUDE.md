@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 21, 2026
+**Last Updated:** February 24, 2026
 
 ---
 
@@ -1766,3 +1766,52 @@ Applied in **both** `both_worthless` and `one_leg_worthless` blocks.
 - AH1: BAG cleared before individual placement → IB accepts individual SELL for legs previously blocked by BAG conflict
 - AH2: On 2nd/3rd run (9:45 AM retry, 10:30 AM retry), already-working individual legs are skipped → no more 3× BUY duplicates
 - Attempts CSV: `"AH2: SELL 20.0 individual leg already working; skipping"` visible in log on subsequent runs
+
+---
+
+### Fix AI1: Portfolio-Based Limit Price for Risk Exit Force-Closes (Feb 24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_risk_exits()`, PlaceAnOrder args ~line 2886); `InteractiveBrokersTrader/PlaceAnOrder.py` (`force_close_symbol_via_positions()`, inside `use_fallback` block ~line 2192)
+
+**Issue:** Risk exits correctly detect TP/SL for CP, YUM, PFE, D, T, UNM via portfolio prices (Fix AG1) but then fail with `no_viable_limit_all_fallbacks_failed` when delegating to PlaceAnOrder. Root cause: `live_spread_price()` join scheme requires `L_bid > 0` for the long option being sold — but deeply OTM options have bid=0 structurally even with full market data subscriptions at 10:30 AM. This is NOT a timing issue. CSV fallback also fails (no valid listener row for these symbols). `use_fallback` block (portfolio price fallback) was never activated because `--fallback-individual-legs` wasn't passed.
+
+**Fix — two changes:**
+1. Add `"--fallback-individual-legs"` to `_run_place_an_order()` args in `_rth_risk_exits()` — enables the `use_fallback` block in PlaceAnOrder which fetches portfolio prices via `ib.portfolio()`
+2. Inside `use_fallback` block in `force_close_symbol_via_positions()`, after worthless determination, add AI1 limit computation: when `limit is None`, both legs have portfolio prices, and spread is NOT worthless: `limit = round(max(0, long_value - short_value) * 0.95, 2)`
+
+**Impact:**
+- CP: long≈5.84, short≈3.90 → limit=$1.84
+- YUM: long≈8.37, short≈4.84 → limit=$3.35
+- PFE: similar — closes before Friday expiry
+- OTM options with bid=0 no longer block risk exit pricing
+- Log shows `"AI1: portfolio-based limit for C 80.0/82.5: limit=1.84"` when triggered
+
+---
+
+### Fix AI2: Respect `_submitted_close_syms` in Delegate Close Stages (Feb 24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_delegate_close_from_csvs_within()`, Stage 1/1.5/2 pre-checks ~lines 916, 930, 969, 997)
+
+**Issue:** YUM received two close orders at 5 PM on Feb 23: one from Stage 1 ($3.11) and one from reconcile ($2.80). Reconcile places orders synchronously BEFORE `_delegate_close_from_csvs_within()` and adds YUM to `_submitted_close_syms`. But Stage 1 only checks `_has_working_close_order()` (fresh IB connection, 0.5s sleep) — IB cross-clientId order propagation takes 1-5s, so the reconcile's just-placed order isn't visible yet. Stage 1 sees no working order and places a duplicate.
+
+**Fix:** Compute `_submitted_syms = getattr(self, "_submitted_close_syms", set())` once at the top of `_delegate_close_from_csvs_within()`. Use it in all three stage pre-checks alongside `_has_working_close_order()`:
+- Stage 1: `if s in _submitted_syms or self._has_working_close_order(s):`
+- Stage 1.5: `if not (s in _submitted_syms or self._has_working_close_order(s)):`
+- Stage 2: `if not (s in _submitted_syms or self._has_working_close_order(s)):`
+
+**Impact:** `_submitted_close_syms` is populated synchronously — no IB connection or timing dependency. YUM-style race condition eliminated.
+
+---
+
+### Fix AI3: Fix False `place_failed_worthless_combo` Error Log (Feb 24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`force_close_symbol_via_positions()`, ~line 2242)
+
+**Issue:** NWG attempts CSV showed `force_close,error,place_failed_worthless_combo` as a false positive. When `skip_combo=True` (both legs worthless, individual-leg path used), the combo is intentionally not attempted → `tr = None`. The `else:` block at line 2223 fired unconditionally when `tr is None`, logging an error even though the combo was never tried.
+
+**Fix:** Changed `else:` to `elif not skip_combo:` so the error log only fires when the combo was actually attempted (and failed).
+
+**Impact:** NWG attempts CSV path: `market_fallback_preclose` → directly `both_worthless_fixed_price` (no false `place_failed_worthless_combo` error in between).
