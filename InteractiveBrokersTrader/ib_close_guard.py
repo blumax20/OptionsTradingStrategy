@@ -36,7 +36,7 @@ def has_working_auto_close(symbol: str,
     try:
         # Must request all open orders first to see orders from other client IDs
         ib.reqAllOpenOrders()
-        ib.sleep(0.5)
+        ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
         trades = ib.openTrades() or []
         working_states: Set[str] = {
             "presubmitted", "submitted", "pendingsubmit", "apipending"

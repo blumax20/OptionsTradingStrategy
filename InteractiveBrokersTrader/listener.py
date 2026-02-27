@@ -813,14 +813,38 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             for k in ("last","close","bid","ask"):
                 if vals2.get(k) is not None:
                     vals[k] = vals2[k]
-        # prefer last > close > mid(bid/ask)
+        # Fix AL: After market hours, prefer official close over AH last price.
+        # AH 'last' is from thin/illiquid after-hours trading and is unreliable for
+        # Black-Scholes options pricing. Official close (4 PM settlement) is correct.
+        # Server clock is ET; datetime.now() returns local ET time.
         try:
-            if vals.get("last") is not None:
-                current_price = float(vals["last"])
-            elif vals.get("close") is not None:
-                current_price = float(vals["close"])
-            elif vals.get("bid") is not None and vals.get("ask") is not None:
-                current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
+            _now_al = datetime.now()
+            # Fix AN: IB's 'close' tick shows previous session's settlement until ~16:30 ET.
+            # Batch signals arrive 16:01-16:16 ET — 'last' is today's close trade at that point.
+            # Only prefer close>last after 16:30, when today's settlement has propagated.
+            _after_hours_al = (
+                _now_al.weekday() >= 5          # weekend
+                or _now_al.hour < 9
+                or (_now_al.hour == 9 and _now_al.minute < 30)
+                or (_now_al.hour == 16 and _now_al.minute >= 30)
+                or _now_al.hour > 16
+            )
+            if _after_hours_al:
+                # After hours: close (official settlement) > last (AH trade) > mid
+                if vals.get("close") is not None:
+                    current_price = float(vals["close"])
+                elif vals.get("last") is not None:
+                    current_price = float(vals["last"])
+                elif vals.get("bid") is not None and vals.get("ask") is not None:
+                    current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
+            else:
+                # Market hours: last (real-time trade) > close > mid
+                if vals.get("last") is not None:
+                    current_price = float(vals["last"])
+                elif vals.get("close") is not None:
+                    current_price = float(vals["close"])
+                elif vals.get("bid") is not None and vals.get("ask") is not None:
+                    current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
         except Exception:
             current_price = None
     # Always cancel stock market data after polling

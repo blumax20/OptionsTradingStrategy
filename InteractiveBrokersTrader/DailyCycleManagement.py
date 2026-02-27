@@ -1652,7 +1652,7 @@ class DailyCycleManagementMixin:
 
         try:
             ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
-            ib.sleep(0.5)
+            ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
             trades = ib.openTrades() or []
             up = (sym or "").upper()
             # states that indicate an order is still alive/working

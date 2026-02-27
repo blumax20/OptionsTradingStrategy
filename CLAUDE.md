@@ -1815,3 +1815,183 @@ Applied in **both** `both_worthless` and `one_leg_worthless` blocks.
 **Fix:** Changed `else:` to `elif not skip_combo:` so the error log only fires when the combo was actually attempted (and failed).
 
 **Impact:** NWG attempts CSV path: `market_fallback_preclose` → directly `both_worthless_fixed_price` (no false `place_failed_worthless_combo` error in between).
+
+---
+
+### Fix AJ1: Skip 7-Day Enforce-Recent-Closes on Sundays (Feb ~24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`daily_trading_cycle`, ~line 3344)
+
+**Issue:** On Sundays, `daily_trading_cycle()` called `_enforce_recent_closes(days=7)` followed by `_after_hours_batch_placement()`. The 7-day enforce is a subset of the 21-day sweep inside `_after_hours_batch_placement`, so every held symbol was processed twice through all 3 close stages on Sundays — duplicate close order attempts.
+
+**Fix:** Skip `_enforce_recent_closes(days=7)` on Sundays (`weekday() == 6`):
+```python
+_ahp_wday = self._now_ny().weekday()
+if _ahp_wday != 6:  # Fix AJ1: 21-day sweep already covers Sunday
+    self._enforce_recent_closes(days=7)
+self._after_hours_batch_placement()
+```
+
+**Impact:** Sundays only run the 21-day sweep (via `_after_hours_batch_placement`), eliminating duplicate processing.
+
+---
+
+### Fix AJ2: Pre-Existing SELL BAG Counts as Successful Unwind (Feb ~24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (CALL_OPEN and PUT_OPEN opposite-side unwind paths, ~lines 3071–3088 and ~3133–3149)
+
+**Issue:** Fix AA1 blocked OPEN orders when opposite-side unwind returned 0 spreads closed (`n_unw=0`). But `n_unw=0` can also mean the close guard blocked a new close order because one **already existed** in IB. In that case blocking the OPEN was wrong — the pre-existing SELL BAG close is functionally equivalent to a successful unwind.
+
+**Fix:** When `n_unw=0`, check for a pre-existing working SELL BAG close order via `ib.openTrades()`. If found, allow the OPEN:
+```python
+ib.reqAllOpenOrders(); ib.sleep(0.3)
+_pre_close_aj2 = any(
+    getattr(_t2.contract, "secType", "") == "BAG"
+    and getattr(_t2.contract, "symbol", "").upper() == symbol.upper()
+    and (getattr(_t2.order, "action", "") or "").upper() == "SELL"
+    and _t2.orderStatus.status.lower() in ("presubmitted", "submitted", "inactive")
+    for _t2 in ib.openTrades()
+)
+if _pre_close_aj2:
+    allow_call = True  # pre-existing close ≡ successful unwind
+else:
+    record_attempt(..., "opposite_unwind_failed"); continue
+```
+
+Applied to both CALL_OPEN and PUT_OPEN paths.
+
+**Impact:** OPEN orders are no longer blocked when a same-symbol close order already exists from a prior cycle.
+
+---
+
+### Fix AK: Watchdog — Add CloudflareTunnel Service Check (Feb ~24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (Check 3 block)
+
+**Issue:** The watchdog (Fix AB8) only checked IB Gateway port 7497 and listener `/health`. A CloudflareTunnel crash left TradingView signals unable to reach the listener while the watchdog reported everything healthy.
+
+**Fix:** Added Check 3 — if CloudflareTunnel is not Running and IB + listener are healthy, do a **targeted tunnel-only restart** (`Start-Service CloudflareTunnel`) instead of full `BounceServices.cmd` (which disrupts IB connections unnecessarily). Full restart only fires when IB Gateway or listener is down.
+
+**Impact:** Tunnel crashes auto-recover within 15 minutes without disrupting IB Gateway or open orders.
+
+---
+
+### Fix AL: After-Hours Stock Price Priority — close > last > mid (Feb ~24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` (`get_option_data`, ~line 816)
+
+**Issue:** During after-hours, IB's `last` tick reflects thin/illiquid AH trading. Black-Scholes pricing requires the official 4 PM closing price. The listener always preferred `last` over `close`, feeding unreliable AH prices into theo calculations for the 5 PM batch.
+
+**Fix:** After-hours (outside 9:30 AM–4:30 PM ET, weekdays): prefer `close > last > mid`. During market hours: prefer `last > close > mid`. The 4:30 PM threshold was later refined to 4:30 PM by Fix AN (IB's `close` tick shows previous session's settlement until ~4:15–4:30).
+
+**Impact:** 5 PM batch signals use the official closing price for theo calculations instead of unreliable AH trade prices.
+
+---
+
+### Fix AM: Corrected AI1 — Portfolio Price Before Skip Gate (Feb 24)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`force_close_symbol_via_positions()`, `use_fallback` block ~line 2192)
+
+**Issue:** Fix AI1 added portfolio-based limit pricing inside the `use_fallback` block. But the `use_fallback` block is only entered when individual-leg fallback is active. For most risk exits, the code reaches a skip gate (`if limit is None: continue`) BEFORE the `use_fallback` block, so AI1's portfolio pricing was never reached. PFE, D, T risk exits with bid=0 options still hit `no_viable_limit_all_fallbacks_failed`.
+
+**Fix:** Moved portfolio price lookup to BEFORE the `if limit is None:` gate. When `limit is None` and portfolio prices are available for both legs, compute `limit = round(max(0, long_value - short_value) * 0.95, 2)` immediately. Added log: `"[SYM] AM: portfolio-based limit for C/P atm/oth: long=X.XX short=X.XX limit=X.XX"`.
+
+**Impact:** Risk exit close orders with bid=0 options (OTM, illiquid) now get a valid limit price from portfolio data instead of hitting the skip gate. PFE/D/T/UNM correctly close at 9:45 AM.
+
+---
+
+### Fix AN: Fix AL Regression — After-Hours Threshold 16:00 → 16:30 (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` (after-hours stock price priority block, ~line 822)
+
+**Issue:** Fix AL changed stock price priority after hours to `close > last > mid`. But IB's `close` tick (Tick ID 9) shows the **previous session's settlement** until ~4:15–4:30 PM ET. At 4:01 PM when the close batch signals arrive, `close` = yesterday's price, `last` = today's final trade. Fix AL's `_now_al.hour >= 16` fires at exactly 4:00 PM, so all batch signals get yesterday's close price.
+
+Evidence from Feb 26: PLD `current_price=140.03` (Feb 25 close vs Feb 26 actual 142.66), LXP `current_price=49.02` vs actual ~50. This corrupted all Black-Scholes theo values for the evening batch.
+
+**Fix:**
+```python
+# BEFORE:
+_after_hours_al = (
+    _now_al.weekday() >= 5
+    or _now_al.hour < 9
+    or (_now_al.hour == 9 and _now_al.minute < 30)
+    or _now_al.hour >= 16
+)
+
+# AFTER (Fix AN):
+# IB's 'close' tick shows previous session's settlement until ~16:30 ET.
+# Batch signals arrive 16:01-16:16 ET — 'last' is today's close trade at that point.
+# Only prefer close>last after 16:30, when today's settlement has propagated.
+_after_hours_al = (
+    _now_al.weekday() >= 5
+    or _now_al.hour < 9
+    or (_now_al.hour == 9 and _now_al.minute < 30)
+    or (_now_al.hour == 16 and _now_al.minute >= 30)
+    or _now_al.hour > 16
+)
+```
+
+**Impact:** 4:01–4:29 PM batch signals use `last` (today's final trade) instead of `close` (yesterday's settlement). After 4:30 PM, `close` is used (today's settlement has propagated). Theo values for evening batch are now correctly priced.
+
+---
+
+### Fix AO: Enrichment OI — Timeout Fix + Column Backfill for `_oi_ok()` (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/LiquidityFilter.py`
+
+**Issue:** Two gaps caused PUT_OPEN signals received after market close to always fail OI validation:
+
+1. **OI tick timeout too short (0.6s):** `_ib_fetcher_factory` waited only 0.6s after `reqMktData`. OI (tick type 101) takes 1-3s to arrive. IV populated immediately; `oi_atm`/`oi_oth` stayed `None` on every run. Evidence: LXP row ends with `,,0.4939` (oi_atm=empty, oi_oth=empty, iv_oth=0.494).
+
+2. **Wrong column names:** `_oi_ok()` in PlaceAnOrder reads `open_interest_atm_put`/`open_interest_otm_put`. The enrichment only wrote to `oi_atm`/`oi_oth` (summary columns). PlaceAnOrder never read those.
+
+Affected: LXP PUT_OPEN (4:01 PM), HLN PUT_OPEN (4:02 PM), BCE PUT_OPEN (4:16 PM) — all `no_viable_limit_or_conditions`.
+
+**Fix — two parts:**
+
+Part 1: `_ib_fetcher_factory(ib, poll_seconds=0.6)` → `poll_seconds=1.5`
+
+Part 2: After writing `oi_atm`/`oi_oth`, also backfill `open_interest_atm_put`/`open_interest_otm_put` when right == "P" and the columns are empty:
+```python
+if oi1 is not None and right == "P":
+    if "open_interest_atm_put" in cols and _need(row.get("open_interest_atm_put")):
+        row["open_interest_atm_put"] = int(oi1); updates += 1
+if oi2 is not None and right == "P":
+    if "open_interest_otm_put" in cols and _need(row.get("open_interest_otm_put")):
+        row["open_interest_otm_put"] = int(oi2); updates += 1
+```
+
+**Impact:** PUT_OPEN signals received after market close now get OI data written to both the enrichment columns and the `_oi_ok()` validation columns. Evening batch PUT_OPEN orders (LXP, HLN, BCE type) no longer fail OI validation.
+
+---
+
+### Fix AP: Increase Close Guard Sleep — Prevent Duplicate After-Hours Close Orders (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/ib_close_guard.py` line 39; `InteractiveBrokersTrader/DailyCycleManagement.py` line 1655
+
+**Issue:** T (AT&T) accumulated 2 pending Inactive+DAY close orders on Feb 26:
+- `17:06:40` — T `close_call,placed,success` (5 PM reconcile)
+- `22:21:52` — T `close_call,placed,success` (10 PM cycle — `DAILY_ANALYSIS_COOLDOWN_HOURS=2` expired at 7 PM; new webhook at 10:21 PM triggered a fresh DCM cycle)
+
+Both guard functions (`has_working_auto_close()` in `ib_close_guard.py` and `_has_working_close_order()` in DCM) called `ib.reqAllOpenOrders()` then slept only 0.5s before reading `ib.openTrades()`. The 0.5s was not enough for IB to propagate the existing Inactive+DAY T order across clientIds — the guard returned False and a second order was placed.
+
+Note: 3 PM preclose handles duplicates by cancelling ALL pending SELL BAG orders for a symbol before re-placing one with live pricing.
+
+**Fix:** Increased sleep from 0.5s → 1.5s in both guard locations:
+```python
+# ib_close_guard.py line 39:
+ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
+
+# DailyCycleManagement.py line 1655 (_has_working_close_order):
+ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
+```
+
+**Impact:** Reduced likelihood of duplicate after-hours close orders when a second DCM cycle fires within the same evening (e.g., late webhook after cooldown expires).

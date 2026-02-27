@@ -2023,30 +2023,65 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     pass
 
             if not _af2_theo_worthless:
-                if getattr(args, "allow_market_fallback", False):
-                    # Preclose mode: market is open, MARKET order is acceptable as last resort
-                    logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
-                    order_type = "MKT"
-                    record_attempt(
-                        symbol,
-                        "force_close",
-                        "placed",
-                        "market_fallback_preclose",
-                        exp=str(exp),
-                        right=right.upper(),
-                    )
-                else:
-                    # After-hours: skip to avoid bad MARKET fill
-                    logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
-                    record_attempt(
-                        symbol,
-                        "force_close",
-                        "skipped",
-                        "no_viable_limit_all_fallbacks_failed",
-                        exp=str(exp),
-                        right=right.upper(),
-                    )
-                    continue  # Skip this spread, don't place market order
+                # Fix AM: Try portfolio prices before MKT/skip. AI1 placed this in the use_fallback
+                # block (~line 2196), but that block is unreachable when limit is None and there's
+                # no CSV row (risk exits for positions not in today's CSV). Corrected placement.
+                # Note: use_fallback not yet defined here (line 2076); use getattr directly.
+                if getattr(args, "fallback_individual_legs", False) and limit is None:
+                    _am_long_val, _am_short_val = None, None
+                    try:
+                        for _pi in ib.portfolio():
+                            _tc = _pi.contract
+                            if (getattr(_tc, "secType", "") == "OPT"
+                                    and getattr(_tc, "symbol", "").upper() == symbol.upper()):
+                                _mp = _pi.marketPrice
+                                if _mp and not math.isnan(_mp) and _mp > 0:
+                                    _strk = float(getattr(_tc, "strike", 0))
+                                    if longK is not None and abs(_strk - float(longK)) < 0.01:
+                                        _am_long_val = _mp
+                                    elif shortK is not None and abs(_strk - float(shortK)) < 0.01:
+                                        _am_short_val = _mp
+                    except Exception as _ame:
+                        logger.warning("[%s] AM: portfolio scan error: %s", symbol, _ame)
+                    if _am_long_val is not None and _am_short_val is not None:
+                        _am_spread = max(0.0, _am_long_val - _am_short_val)
+                        if _am_spread >= args.min_limit:
+                            limit = round(_am_spread * 0.95, 2)
+                            order_type = "LMT"
+                            logger.info(
+                                "[%s] AM: portfolio-based limit for %s %s/%s: long=%.4f short=%.4f limit=%.2f",
+                                symbol, right, longK, shortK, _am_long_val, _am_short_val, limit
+                            )
+                        else:
+                            logger.info(
+                                "[%s] AM: portfolio spread too small for %s %s/%s: spread=%.4f < min_limit=%.2f",
+                                symbol, right, longK, shortK, _am_spread, args.min_limit
+                            )
+                if limit is None:
+                    if getattr(args, "allow_market_fallback", False):
+                        # Preclose mode: market is open, MARKET order is acceptable as last resort
+                        logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
+                        order_type = "MKT"
+                        record_attempt(
+                            symbol,
+                            "force_close",
+                            "placed",
+                            "market_fallback_preclose",
+                            exp=str(exp),
+                            right=right.upper(),
+                        )
+                    else:
+                        # After-hours: skip to avoid bad MARKET fill
+                        logger.warning(f"[{symbol}] All limit pricing fallbacks failed - SKIPPING order to avoid market fill")
+                        record_attempt(
+                            symbol,
+                            "force_close",
+                            "skipped",
+                            "no_viable_limit_all_fallbacks_failed",
+                            exp=str(exp),
+                            right=right.upper(),
+                        )
+                        continue  # Skip this spread, don't place market order
             # If _af2_theo_worthless: fall through; override applied after use_fallback block below
         else:
             order_type = "LMT"

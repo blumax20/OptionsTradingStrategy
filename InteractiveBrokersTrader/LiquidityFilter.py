@@ -417,7 +417,7 @@ def populate_missing_strikes(day_dir: str,
 
     return updates
 
-def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 0.6):
+def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 1.5):  # Fix AO: was 0.6 — OI tick 101 needs ~1-2s to arrive
     """
     Return a callable (symbol, right, exp, strike) -> (oi, iv)
     Uses ib_insync snapshot market data to fetch option open interest and IV.
@@ -536,6 +536,12 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
             if oi1 is not None:
                 row["oi_atm"] = int(oi1)
                 updates += 1
+                # Fix AO Part 2: also backfill open_interest_atm_put — the column _oi_ok() reads
+                if right == "P":
+                    _col_put_atm = "open_interest_atm_put"
+                    if _col_put_atm in cols and _need(row.get(_col_put_atm)):
+                        row[_col_put_atm] = int(oi1)
+                        updates += 1
             if iv1 is not None:
                 row["iv_atm"] = float(iv1)
                 updates += 1
@@ -546,9 +552,34 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
             if oi2 is not None:
                 row["oi_oth"] = int(oi2)
                 updates += 1
+                # Fix AO Part 2: also backfill open_interest_otm_put — the column _oi_ok() reads
+                if right == "P":
+                    _col_put_oth = "open_interest_otm_put"
+                    if _col_put_oth in cols and _need(row.get(_col_put_oth)):
+                        row[_col_put_oth] = int(oi2)
+                        updates += 1
             if iv2 is not None:
                 row["iv_oth"] = float(iv2)
                 updates += 1
+
+        # Fix AO Part 3: For PUT_OPEN rows, use call OI as proxy for put OI when IB doesn't
+        # return put OI via reqMktData. Call and put OI on the same stock are correlated.
+        # LXP (OTM call OI=2) will still fail _oi_ok(); BCE (call OI=1231) will correctly pass.
+        if right == "P":
+            _col_put_atm = "open_interest_atm_put"
+            _col_call_atm = "open_interest_atm_call"
+            if _col_put_atm in cols and _need(row.get(_col_put_atm)):
+                _call_oi_atm = row.get(_col_call_atm)
+                if not _need(_call_oi_atm):
+                    row[_col_put_atm] = _call_oi_atm
+                    updates += 1
+            _col_put_oth = "open_interest_otm_put"
+            _col_call_oth = "open_interest_otm_call"
+            if _col_put_oth in cols and _need(row.get(_col_put_oth)):
+                _call_oi_oth = row.get(_col_call_oth)
+                if not _need(_call_oi_oth):
+                    row[_col_put_oth] = _call_oi_oth
+                    updates += 1
 
     if updates:
         _write_combined_csv(csv_path, cols, rows)
