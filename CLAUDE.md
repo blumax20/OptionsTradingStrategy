@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 24, 2026
+**Last Updated:** February 27, 2026
 
 ---
 
@@ -1995,3 +1995,52 @@ ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-c
 ```
 
 **Impact:** Reduced likelihood of duplicate after-hours close orders when a second DCM cycle fires within the same evening (e.g., late webhook after cooldown expires).
+
+---
+
+### Fix AQ: Watchdog Cascade — Task Schedule Collision + BounceServices Timeout (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd`; Windows Task Scheduler (`IB_PreClose_RestartListener_1530`, `IB_Watchdog_Every15Min`)
+
+**Issue:** Every trading day starting at ~2:30 PM, the watchdog fired a cascade of IBGateway restarts that continued for 1-3 hours. Three compounding problems:
+
+1. **Wrong task trigger time:** `IB_PreClose_RestartListener_1530` was scheduled at **14:30 (2:30 PM)** instead of 15:30 (3:30 PM). The task restarts the OptionsListener for ~45 seconds, and the watchdog runs at exactly :30 — so it always caught the listener mid-restart and triggered a full `BounceServices` (killing IBGateway unnecessarily).
+
+2. **BounceServices poll timeout too short:** After `nssm restart IBGateway`, BounceServices only polled health for ~10 seconds. IBGateway (Java) needs 60-90 seconds to stop and restart. So BounceServices almost always returned `rc=1 WARN`, the watchdog treated this as failure, and fired again 15 minutes later (after the 10-minute cooldown expired).
+
+3. **NSSM restart cascade:** When the next BounceServices fired while IBGateway was still stopping from the previous restart, NSSM returned `Unexpected status SERVICE_STOP_PENDING`. OptionsListener got `StartService FAILED 1056: already running`. The cascade self-perpetuated.
+
+**Secondary impact:** The cascade caused `_working_close_limit_symbols()` to return an empty set at 3 PM because IBGateway had just restarted and hadn't re-synchronized its order state with IB's servers. Risk exit LMT orders placed at 9:45 AM (OHI, PG) were not detected and not converted to MKT at preclose.
+
+**Fix — three changes:**
+1. **Task trigger time fixed:** `IB_PreClose_RestartListener_1530` trigger changed from `14:30` → `15:30` via Task Scheduler.
+2. **Watchdog schedule offset:** `IB_Watchdog_Every15Min` start time changed from `06:00` → `06:07` so it runs at `:07, :22, :37, :52`. The listener restart at 15:30 completes by ~15:31; the next watchdog check at 15:37 sees health 200 → no cascade.
+3. **BounceServices.cmd:** Added `timeout /t 30 >nul` after `nssm restart IBGateway` (gives IBG time to start before polling); increased poll iterations from 10 → 30 (~90 seconds total polling window).
+
+```cmd
+"C:\Program Files\nssm-2.24\win64\nssm.exe" restart "IBGateway" >>"%LOG%" 2>&1
+timeout /t 30 >nul         ← NEW: 30s for IBG to start before listener connects
+sc stop  OptionsListener   >>"%LOG%" 2>&1
+sc start OptionsListener   >>"%LOG%" 2>&1
+for /l %%i in (1,1,30) do (  ← was 10; now covers 90s of polling
+```
+
+**Impact:** Daily cascade eliminated. BounceServices returns `rc=0` reliably after genuine failures. Watchdog no longer fires during the scheduled 3:30 PM listener restart.
+
+---
+
+### Fix AR: `_working_close_limit_symbols()` Sleep 0.5s → 1.5s (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` line ~128 (`_working_close_limit_symbols`)
+
+**Issue:** Fix AP updated `_has_working_close_order()` (line 1655) and `ib_close_guard.py` (line 39) from `ib.sleep(0.5)` → `ib.sleep(1.5)` to allow more time for IB to propagate cross-clientId orders. But `_working_close_limit_symbols()` — which is called by `_pre_close_market_conversion()` to find open close orders for the 3 PM preclose — was not updated. The 0.5s sleep can cause the preclose to miss recently-placed orders when IB's cross-clientId propagation is delayed (especially common after IBGateway restarts).
+
+**Fix:**
+```python
+ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+ib.sleep(1.5)  # Fix AP: match _has_working_close_order sleep; 0.5s was too short for cross-clientId propagation
+```
+
+**Impact:** Preclose reliably detects risk exit LMT orders placed by other processes (clientId=101 at 9:45 AM) even when IB's order synchronization is delayed.

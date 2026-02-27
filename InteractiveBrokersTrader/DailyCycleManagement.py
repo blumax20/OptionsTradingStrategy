@@ -125,7 +125,7 @@ class DailyCycleManagementMixin:
         try:
             ib.connect('127.0.0.1', 7497, clientId=887, timeout=6)
             ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
-            ib.sleep(0.5)
+            ib.sleep(1.5)  # Fix AP: match _has_working_close_order sleep; 0.5s was too short for cross-clientId propagation
             for tr in ib.openTrades() or []:
                 c = getattr(tr, 'contract', None)
                 o = getattr(tr, 'order', None)
