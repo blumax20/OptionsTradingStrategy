@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 27, 2026 (Fix AS: central IB connection config for paper→live switchover)
+**Last Updated:** February 27, 2026 (Fix AT: switch_trading_mode.py script for one-command paper↔live switch)
 
 ---
 
@@ -2071,11 +2071,38 @@ PowerShell scripts use their own variable (can't import Python modules):
 - `IB_Watchdog.ps1`: `$IB_GW_PORT = 7497` at top; port check uses `$IB_GW_PORT`
 - `Health.ps1`: `$IB_PORT = 7497` at top; embedded Python heredocs use `$IB_PORT` (converted from single-quoted to double-quoted to allow PS variable expansion)
 
-**To switch to live trading:**
-1. Edit `InteractiveBrokersTrader/ib_config.py`: `IB_PORT = 7497` → `IB_PORT = 7496`
-2. Edit `C:\OptionsHistory\bin\IB_Watchdog.ps1`: `$IB_GW_PORT = 7497` → `$IB_GW_PORT = 7496`
-3. Edit `C:\OptionsHistory\bin\Health.ps1`: `$IB_PORT = 7497` → `$IB_PORT = 7496`
-4. In IB Gateway live: Configure → API → Settings → Socket port = 7496; Read-Only API = OFF
-5. Restart OptionsListener service
+**To switch to live trading:** Use `switch_trading_mode.py` (Fix AT) — one command does everything.
 
 **Impact:** Switching between paper and live trading is now a 3-line change across 3 files (vs hunting 18+ locations).
+
+---
+
+### Fix AT: switch_trading_mode.py — One-Command Paper↔Live Switch (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `switch_trading_mode.py` (NEW FILE, repo root)
+
+**Issue:** Fix AS centralised the config but still required manually editing 3 files and restarting IBGateway. Additionally, `C:\IBC\config.ini` (IBC auto-login config) also needs updating — it controls `TradingMode`, `ApiPort`, and `OverrideTwsApiPort` — but was not covered by Fix AS.
+
+**Fix:** Created `switch_trading_mode.py` that atomically updates all 4 config locations and restarts IBGateway via NSSM:
+```
+python switch_trading_mode.py live    # Switch to live trading (port 7496)
+python switch_trading_mode.py paper   # Switch to paper trading (port 7497)
+python switch_trading_mode.py status  # Show current mode
+```
+
+**Files updated by the script:**
+1. `InteractiveBrokersTrader/ib_config.py` — `IB_PORT = 7497/7496`
+2. `C:\OptionsHistory\bin\IB_Watchdog.ps1` — `$IB_GW_PORT = 7497/7496`
+3. `C:\OptionsHistory\bin\Health.ps1` — `$IB_PORT = 7497/7496`
+4. `C:\IBC\config.ini` — `TradingMode=paper/live`, `ApiPort=7497/7496`, `OverrideTwsApiPort=7497/7496`
+
+Then restarts IBGateway via `nssm restart IBGateway`. IBC handles auto-login with saved credentials — no interactive login required.
+
+**Live trading checklist** (printed after switching to live):
+1. IB Gateway shows 'Live Trading' in title bar
+2. 'Read-Only API' is OFF in IB Gateway API settings
+3. Market data subscriptions are active (Error 354 = subscription missing)
+4. Run `Health.ps1` to confirm all services healthy on port 7496
+
+**Impact:** Paper↔live switch is now a single command. IBC config updated automatically — no manual file edits.
