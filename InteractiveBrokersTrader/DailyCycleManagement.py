@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import logging
 import csv, os, uuid
 from ib_close_guard import has_working_auto_close
+from ib_config import IB_HOST, IB_PORT
 
 LOG = logging.getLogger(__name__)
 NY = ZoneInfo("America/New_York")
@@ -123,7 +124,7 @@ class DailyCycleManagementMixin:
         ib = IB()
         out: set[str] = set()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=887, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=887, timeout=6)
             ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
             ib.sleep(1.5)  # Fix AP: match _has_working_close_order sleep; 0.5s was too short for cross-clientId propagation
             for tr in ib.openTrades() or []:
@@ -161,7 +162,7 @@ class DailyCycleManagementMixin:
             return {}
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=890, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=890, timeout=6)
         except Exception:
             return {}
         signs: dict[str, int | None] = {}
@@ -215,7 +216,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=892, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=892, timeout=6)
         except Exception as e:
             LOG.warning("credit-scan: connect failed: %s", e)
             return set()
@@ -363,7 +364,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=886, timeout=6)
         except Exception:
             return 0
 
@@ -884,7 +885,7 @@ class DailyCycleManagementMixin:
             try:
                 from ib_insync import IB as _IB_pos
                 _ib_pos = _IB_pos()
-                _ib_pos.connect("127.0.0.1", 7497, clientId=885, timeout=6)
+                _ib_pos.connect(IB_HOST, IB_PORT, clientId=885, timeout=6)
                 try:
                     for p in _ib_pos.positions():
                         c = getattr(p, "contract", None)
@@ -1056,7 +1057,7 @@ class DailyCycleManagementMixin:
             # Connect to IB
             ib = IB()
             try:
-                ib.connect('127.0.0.1', 7497, clientId=885, timeout=6)
+                ib.connect(IB_HOST, IB_PORT, clientId=885, timeout=6)
             except Exception as e:
                 LOG.debug("Position age check: connect failed: %s", e)
                 return None
@@ -1146,7 +1147,7 @@ class DailyCycleManagementMixin:
             # Connect to IB to check position age
             ib = IB()
             try:
-                ib.connect('127.0.0.1', 7497, clientId=886, timeout=6)
+                ib.connect(IB_HOST, IB_PORT, clientId=886, timeout=6)
             except Exception as e:
                 LOG.debug("Live-close scheme: connect failed, defaulting to 'mid': %s", e)
                 return 'mid'  # Conservative default
@@ -1229,7 +1230,7 @@ class DailyCycleManagementMixin:
             client_id = 884  # fallback
 
         try:
-            ib.connect('127.0.0.1', 7497, clientId=client_id, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=client_id, timeout=6)
         except Exception as e:
             LOG.warning("direct-close: connect failed (clientId=%s): %s", client_id, e)
             return False
@@ -1646,7 +1647,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=883, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=883, timeout=6)
         except Exception:
             return False
 
@@ -1718,7 +1719,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=881, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=881, timeout=6)
         except Exception as e:
             LOG.warning("flatten-stock: connect failed: %s", e)
             return False
@@ -2242,7 +2243,7 @@ class DailyCycleManagementMixin:
             # Fix AA9: Randomize clientId to avoid collision with scheduled 5PM task
             import random as _rnd
             _cid = 882 + _rnd.randint(0, 9)
-            ib.connect('127.0.0.1', 7497, clientId=_cid, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=_cid, timeout=6)
         except Exception as e:
             LOG.warning("Reconcile: could not connect to IB (clientId=%s): %s", _cid, e)
             return
@@ -2614,7 +2615,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=878, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=878, timeout=6)
             ib.reqMarketDataType(1)  # 1=Live — required to get real-time option quotes via API
         except Exception as e:
             LOG.warning("Risk exits: could not connect to IB: %s", e)
@@ -2943,7 +2944,7 @@ class DailyCycleManagementMixin:
         # Connect to IB and inspect open trades
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=879, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=879, timeout=6)
         except Exception as e:
             LOG.warning("RTH cleanup: could not connect to IB: %s", e)
             return
@@ -3142,7 +3143,7 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=887, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=887, timeout=6)
         except Exception as e:
             LOG.warning("CSV OI cancel: could not connect to IB: %s", e)
             return

@@ -53,10 +53,12 @@ if platform.system() == "Windows":
 # --- single-instance guard (Windows-safe) ---
 import socket, atexit
 from pathlib import Path as _Path
+from ib_config import IB_HOST, IB_PORT
 def _ib_ports_status():
     import socket
     res = {}
-    for p in (7497, 7496):
+    _other = 7496 if IB_PORT == 7497 else 7497
+    for p in (IB_PORT, _other):
         s=socket.socket(); s.settimeout(0.5)
         try: s.connect(('127.0.0.1', p)); res[p]=True
         except: res[p]=False
@@ -312,7 +314,7 @@ def _ensure_ib_connected(ib: IB, mkt_type: int = 4) -> None:
     for i in range(_IB_MAX_RETRIES):
         cid = _IB_CLIENT_BASE_ID + i
         try:
-            ib.connect('127.0.0.1', 7497, clientId=cid)
+            ib.connect(IB_HOST, IB_PORT, clientId=cid)
             try:
                 ib.reqMarketDataType(int(mkt_type))
             except Exception:
@@ -1636,7 +1638,7 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", "5001"))
     try:
         if not IB_SHARED.isConnected():
-            IB_SHARED.connect('127.0.0.1', 7497, clientId=42)
+            IB_SHARED.connect(IB_HOST, IB_PORT, clientId=42)
         try:
             IB_SHARED.reqMarketDataType(_preferred_md_type())
         except Exception:

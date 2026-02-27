@@ -2,6 +2,7 @@ import os
 import csv
 from typing import Optional, Tuple
 from math import isnan
+from ib_config import IB_HOST, IB_PORT
 try:
     from ib_insync import Contract
 except Exception:
@@ -298,8 +299,8 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
 
 
 def populate_missing_strikes(day_dir: str,
-                             ib_host: str = "127.0.0.1",
-                             ib_port: int = 7497,
+                             ib_host: str = IB_HOST,
+                             ib_port: int = IB_PORT,
                              client_id: int = 916,
                              logger=None) -> int:
     """
@@ -717,8 +718,8 @@ def enrich_live_spread_prices(day_dir: str, ib=None, logger=None) -> int:
 
 
 def enrich_if_rth(day_dir: str,
-                  ib_host: str = "127.0.0.1",
-                  ib_port: int = 7497,
+                  ib_host: str = IB_HOST,
+                  ib_port: int = IB_PORT,
                   client_id: int = 915,
                   logger=None,
                   update_prices: bool = True) -> bool:
@@ -834,8 +835,8 @@ if __name__ == "__main__":
     ap.add_argument("--only-rth", action="store_true", help="Only enrich when current time is RTH (09:30–16:00 NY).")
     ap.add_argument("--populate-strikes", action="store_true", help="Populate missing ATM/OTM strikes by fetching current prices from IB.")
     ap.add_argument("--update-prices", action="store_true", help="Update limit columns with live spread prices from IB.")
-    ap.add_argument("--ib-host", default="127.0.0.1")
-    ap.add_argument("--ib-port", type=int, default=7497)
+    ap.add_argument("--ib-host", default=IB_HOST)
+    ap.add_argument("--ib-port", type=int, default=IB_PORT)
     ap.add_argument("--client-id", type=int, default=915)
     args = ap.parse_args()
 

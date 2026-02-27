@@ -1,13 +1,14 @@
 # ib_close_guard.py
 import logging
 from typing import Set
+from ib_config import IB_HOST, IB_PORT
 
 LOG = logging.getLogger(__name__)
 
 def has_working_auto_close(symbol: str,
                            client_id: int = 884,  # Fix U3: was 883, avoid collision with DCM
-                           host: str = "127.0.0.1",
-                           port: int = 7497) -> bool:
+                           host: str = IB_HOST,
+                           port: int = IB_PORT) -> bool:
     """
     Return True if there is already a working combo order (BAG) for this symbol.
 

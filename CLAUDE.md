@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 27, 2026
+**Last Updated:** February 27, 2026 (Fix AS: central IB connection config for paper→live switchover)
 
 ---
 
@@ -2044,3 +2044,38 @@ ib.sleep(1.5)  # Fix AP: match _has_working_close_order sleep; 0.5s was too shor
 ```
 
 **Impact:** Preclose reliably detects risk exit LMT orders placed by other processes (clientId=101 at 9:45 AM) even when IB's order synchronization is delayed.
+
+---
+
+### Fix AS: Central IB Connection Config for Paper→Live Switchover (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/ib_config.py` (NEW FILE); all IB connect calls across 5 Python files and 2 PowerShell scripts
+
+**Issue:** IB Gateway port (7497=paper, 7496=live) was hardcoded in 18+ locations across 5 Python files and 2 PowerShell scripts. Switching from paper to live trading required hunting down every occurrence.
+
+**Fix:** Created `InteractiveBrokersTrader/ib_config.py` as the single source of truth:
+```python
+IB_HOST: str = "127.0.0.1"
+IB_PORT: int = 7497  # Paper trading (change to 7496 for live)
+```
+
+All Python files now import and use these constants:
+- `ib_close_guard.py`: function defaults use `IB_HOST, IB_PORT`
+- `PlaceAnOrder.py`: both `ib.connect()` calls use `IB_HOST, IB_PORT`
+- `DailyCycleManagement.py`: all 14 `ib.connect()` calls use `IB_HOST, IB_PORT`
+- `listener.py`: both connect calls + `_ib_ports_status()` use `IB_PORT`
+- `LiquidityFilter.py`: function defaults and argparse defaults use `IB_HOST, IB_PORT`
+
+PowerShell scripts use their own variable (can't import Python modules):
+- `IB_Watchdog.ps1`: `$IB_GW_PORT = 7497` at top; port check uses `$IB_GW_PORT`
+- `Health.ps1`: `$IB_PORT = 7497` at top; embedded Python heredocs use `$IB_PORT` (converted from single-quoted to double-quoted to allow PS variable expansion)
+
+**To switch to live trading:**
+1. Edit `InteractiveBrokersTrader/ib_config.py`: `IB_PORT = 7497` → `IB_PORT = 7496`
+2. Edit `C:\OptionsHistory\bin\IB_Watchdog.ps1`: `$IB_GW_PORT = 7497` → `$IB_GW_PORT = 7496`
+3. Edit `C:\OptionsHistory\bin\Health.ps1`: `$IB_PORT = 7497` → `$IB_PORT = 7496`
+4. In IB Gateway live: Configure → API → Settings → Socket port = 7496; Read-Only API = OFF
+5. Restart OptionsListener service
+
+**Impact:** Switching between paper and live trading is now a 3-line change across 3 files (vs hunting 18+ locations).

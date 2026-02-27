@@ -1,6 +1,7 @@
 from ib_insync import IB, Option, LimitOrder, MarketOrder
 from ib_insync.contract import ComboLeg, Contract
 from ib_close_guard import has_working_auto_close
+from ib_config import IB_HOST, IB_PORT
 import logging
 from ib_insync import util as _ibutil
 import pandas as pd
@@ -2694,7 +2695,7 @@ def run_from_csv():
         logger.info(f"Force-close mode (CSV-independent): symbols={sorted(list(only))}")
         ib = IB()
         try:
-            ib.connect('127.0.0.1', 7497, clientId=args.client_id)
+            ib.connect(IB_HOST, IB_PORT, clientId=args.client_id)
             ib.reqMarketDataType(4)
             ib.reqPositions()
             ib.sleep(0.5)
@@ -2794,7 +2795,7 @@ def run_from_csv():
     # Connect once
     ib = IB()
     try:
-        ib.connect('127.0.0.1', 7497, clientId=args.client_id)  # Paper trading by default
+        ib.connect(IB_HOST, IB_PORT, clientId=args.client_id)
         # Market data type not required for order placement; keep delayed-frozen
         ib.reqMarketDataType(4)
         ib.reqPositions()
