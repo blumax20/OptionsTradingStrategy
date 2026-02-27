@@ -3,9 +3,10 @@
 switch_trading_mode.py — Switch between paper and live IB trading.
 
 Usage:
-    python switch_trading_mode.py paper   # Switch to paper trading (port 7497)
-    python switch_trading_mode.py live    # Switch to live trading   (port 7496)
-    python switch_trading_mode.py status  # Show current mode
+    python switch_trading_mode.py paper          # Switch to paper trading (port 7497)
+    python switch_trading_mode.py live           # Switch to live trading   (port 7496)
+    python switch_trading_mode.py status         # Show current mode
+    python switch_trading_mode.py live --dry-run # Preview changes, write nothing
 
 Updates 4 files atomically:
     1. InteractiveBrokersTrader/ib_config.py         -- IB_PORT
@@ -21,6 +22,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+# Set to True when --dry-run is passed; suppresses all writes and restarts.
+DRY_RUN: bool = False
 
 # ---------------------------------------------------------------------------
 # File paths
@@ -56,9 +60,27 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _write(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
-    print(f"  [OK] {path}")
+def _write(path: Path, original: str, updated: str) -> None:
+    """Write updated content; in dry-run mode print a diff instead."""
+    if DRY_RUN:
+        # Show only changed lines as before/after pairs
+        orig_lines = original.splitlines()
+        new_lines  = updated.splitlines()
+        changes = [
+            (i + 1, old, new)
+            for i, (old, new) in enumerate(zip(orig_lines, new_lines))
+            if old != new
+        ]
+        if changes:
+            print(f"  [DRY RUN] Would update {path}:")
+            for lineno, old, new in changes:
+                print(f"    line {lineno}:  {old.strip()}")
+                print(f"            -> {new.strip()}")
+        else:
+            print(f"  [DRY RUN] No changes needed in {path}")
+    else:
+        path.write_text(updated, encoding="utf-8")
+        print(f"  [OK] {path}")
 
 
 def _sub(pattern: str, replacement: str, text: str, flags=0) -> str:
@@ -89,59 +111,64 @@ def _current_port_from_ib_config() -> int | None:
 # ---------------------------------------------------------------------------
 
 def update_ib_config_py(port: int) -> None:
-    text = _read(IB_CONFIG_PY)
-    text = _sub(
+    original = _read(IB_CONFIG_PY)
+    updated = _sub(
         r"(^IB_PORT\s*:\s*int\s*=\s*)\d+",
         rf"\g<1>{port}",
-        text,
+        original,
         flags=re.MULTILINE,
     )
-    _write(IB_CONFIG_PY, text)
+    _write(IB_CONFIG_PY, original, updated)
 
 
 def update_watchdog_ps1(port: int) -> None:
-    text = _read(WATCHDOG_PS1)
-    text = _sub(
-        r"(\$IB_GW_PORT\s*=\s*)\d+",
+    original = _read(WATCHDOG_PS1)
+    # Anchor to start-of-line (MULTILINE) so comment lines are not matched
+    updated = _sub(
+        r"^(\$IB_GW_PORT\s*=\s*)\d+",
         rf"\g<1>{port}",
-        text,
+        original,
+        flags=re.MULTILINE,
     )
-    _write(WATCHDOG_PS1, text)
+    _write(WATCHDOG_PS1, original, updated)
 
 
 def update_health_ps1(port: int) -> None:
-    text = _read(HEALTH_PS1)
-    text = _sub(
-        r"(\$IB_PORT\s*=\s*)\d+",
+    original = _read(HEALTH_PS1)
+    # Anchor to start-of-line (MULTILINE) so comment lines are not matched
+    updated = _sub(
+        r"^(\$IB_PORT\s*=\s*)\d+",
         rf"\g<1>{port}",
-        text,
+        original,
+        flags=re.MULTILINE,
     )
-    _write(HEALTH_PS1, text)
+    _write(HEALTH_PS1, original, updated)
 
 
 def update_ibc_config(port: int, trading_mode: str) -> None:
     """Update TradingMode, ApiPort, and OverrideTwsApiPort in C:\\IBC\\config.ini."""
-    text = _read(IBC_CONFIG)
+    original = _read(IBC_CONFIG)
+    updated = original
 
-    text = _sub(
+    updated = _sub(
         r"(?i)(^TradingMode\s*=\s*)\S+",
         rf"\g<1>{trading_mode}",
-        text,
+        updated,
         flags=re.MULTILINE,
     )
-    text = _sub(
+    updated = _sub(
         r"(?i)(^ApiPort\s*=\s*)\d+",
         rf"\g<1>{port}",
-        text,
+        updated,
         flags=re.MULTILINE,
     )
-    text = _sub(
+    updated = _sub(
         r"(?i)(^OverrideTwsApiPort\s*=\s*)\d+",
         rf"\g<1>{port}",
-        text,
+        updated,
         flags=re.MULTILINE,
     )
-    _write(IBC_CONFIG, text)
+    _write(IBC_CONFIG, original, updated)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +177,11 @@ def update_ibc_config(port: int, trading_mode: str) -> None:
 
 def restart_ibgateway() -> None:
     """Restart the IBGateway Windows service via NSSM."""
+    if DRY_RUN:
+        print("\n  [DRY RUN] Would run: nssm restart IBGateway")
+        print("  [DRY RUN] IBGateway NOT restarted.")
+        return
+
     print("\nRestarting IBGateway service (IBC will auto-login)...")
     try:
         result = subprocess.run(
@@ -192,11 +224,17 @@ def show_status() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1].lower() not in ("paper", "live", "status"):
+    global DRY_RUN
+
+    args = sys.argv[1:]
+    DRY_RUN = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+
+    if not args or args[0].lower() not in ("paper", "live", "status"):
         print(__doc__)
         sys.exit(1)
 
-    action = sys.argv[1].lower()
+    action = args[0].lower()
 
     if action == "status":
         show_status()
@@ -210,21 +248,27 @@ def main() -> None:
     # Check if already in the requested mode
     current = _current_port_from_ib_config()
     if current == port:
-        print(f"Already in {label} mode (port {port}). No changes made.")
+        if DRY_RUN:
+            print(f"[DRY RUN] Already in {label} mode (port {port}). Nothing would change.")
+        else:
+            print(f"Already in {label} mode (port {port}). No changes made.")
         return
 
-    print(f"\nSwitching to {label} trading (port {port})...\n")
+    if DRY_RUN:
+        print(f"\n[DRY RUN] Preview: switching from port {current} -> {port} ({label})\n")
+    else:
+        print(f"\nSwitching to {label} trading (port {port})...\n")
 
     errors = []
 
-    for name, fn, args in [
-        ("ib_config.py",    update_ib_config_py, (port,)),
-        ("IB_Watchdog.ps1", update_watchdog_ps1, (port,)),
-        ("Health.ps1",      update_health_ps1,   (port,)),
-        ("C:\\IBC\\config.ini", update_ibc_config, (port, trading_mode)),
+    for name, fn, fargs in [
+        ("ib_config.py",        update_ib_config_py, (port,)),
+        ("IB_Watchdog.ps1",     update_watchdog_ps1, (port,)),
+        ("Health.ps1",          update_health_ps1,   (port,)),
+        ("C:\\IBC\\config.ini", update_ibc_config,   (port, trading_mode)),
     ]:
         try:
-            fn(*args)
+            fn(*fargs)
         except Exception as e:
             errors.append(f"  [FAIL] {name}: {e}")
 
@@ -232,22 +276,28 @@ def main() -> None:
         print("\nErrors encountered:")
         for e in errors:
             print(e)
-        print("\nPlease fix the above before restarting IBGateway.")
-        sys.exit(1)
+        if not DRY_RUN:
+            print("\nPlease fix the above before restarting IBGateway.")
+            sys.exit(1)
+        return
 
     restart_ibgateway()
 
-    print(f"\nDone. System is now configured for {label} trading.")
-    if action == "live":
-        print("""
+    if DRY_RUN:
+        print(f"\n[DRY RUN] Complete. No files were written, IBGateway was NOT restarted.")
+        print(f"          Run without --dry-run to apply these changes.")
+    else:
+        print(f"\nDone. System is now configured for {label} trading.")
+        if action == "live":
+            print("""
 LIVE TRADING CHECKLIST (verify before placing orders):
   1. IB Gateway shows 'Live Trading' in title bar (not 'Paper Trading')
   2. 'Read-Only API' is OFF in IB Gateway API settings
   3. Market data subscriptions are active (Error 354 = subscription missing)
   4. Run Health.ps1 to confirm all services healthy on port 7496
 """)
-    else:
-        print("Paper trading active. Run Health.ps1 to confirm port 7497 healthy.")
+        else:
+            print("Paper trading active. Run Health.ps1 to confirm port 7497 healthy.")
 
 
 if __name__ == "__main__":
