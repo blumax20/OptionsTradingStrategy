@@ -1,0 +1,29 @@
+# IBC (Interactive Brokers Controller) configuration template.
+# Copy this file to C:\IBC\config.ini and fill in your credentials.
+# IBC auto-logs in to IB Gateway using these settings.
+#
+# Full IBC documentation: https://github.com/IbcAlpha/IBC
+
+# ---- Credentials ----
+IbLoginId=YOUR_IB_USERNAME
+IbPassword=YOUR_IB_PASSWORD
+
+# ---- Trading mode ----
+# Managed by switch_trading_mode.py — do not edit manually.
+#   paper = paper trading account (port 7497)
+#   live  = live trading account  (port 7496)
+TradingMode=paper
+
+# ---- API port ----
+# Must match IB_PORT in InteractiveBrokersTrader\ib_config.py.
+# Managed by switch_trading_mode.py — do not edit manually.
+ApiPort=7497
+OverrideTwsApiPort=7497
+
+# ---- Safety settings ----
+ReadOnlyApi=no
+AcceptNonBrokerageAccountWarning=yes
+
+# ---- Auto-restart ----
+# IBC restarts IB Gateway daily at this time (clears session state).
+AutoRestartTime=05:00 AM

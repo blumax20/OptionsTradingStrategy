@@ -8,14 +8,17 @@
  ======================================================================= #>
 
 # ---------- Settings ----------
+# To switch between paper and live trading, update $IB_PORT below
+# (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
+#   Paper trading : $IB_PORT = 7497
+#   Live trading  : $IB_PORT = 7496
+$IB_PORT = 7497
+
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
 
 $Py     = "C:\Users\Administrator\code\OptionsTradingStrategy\.venv\Scripts\python.exe"
 if (-not (Test-Path $Py)) { $Py = "python.exe" }  # fallback
-
-# Path to ImprovedHealthQueries.py - copy this file to Windows
-$HealthQueriesPy = "C:\Users\Administrator\code\OptionsTradingStrategy\ImprovedHealthQueries.py"
 
 $LogDir = "C:\OptionsHistory\logs"
 $Now    = Get-Date
@@ -84,14 +87,17 @@ try {
     '\IB_Midday_Health_1200',
     '\IB_Open_PlaceMissing_0935',
     '\IB_PreClose_RestartListener_1530',
-    '\IB_PreMarket_StartListener'
+    '\IB_PreMarket_StartListener',
+    '\IB_RiskExits_Retry_1030',     # Fix AC1: 10:30 AM risk-exit retry
+    '\IB_Watchdog_Every15Min'        # Fix AC1: 15-min IB Gateway watchdog
   )
 
   # For any task that SHOULD invoke DailyCycleManagement.py, list it here:
   $expectDaily = @(
     '\IB_AfterHours_PlaceFromWebhook_1700',
     '\IB_ForceClose_MarketOrders_1500',
-    '\IB_Open_PlaceMissing_0935'
+    '\IB_Open_PlaceMissing_0935',
+    '\IB_RiskExits_Retry_1030'       # Fix AC1: also calls DCM --risk-exits-only
   )
 
   $all = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
@@ -169,7 +175,7 @@ try {
 " " | Tee-Object -FilePath $Report -Append
 
 # ---------- Listening Ports ----------
-"--- Listening Ports (5001, 7497, 7496) ---" | Tee-Object -FilePath $Report -Append
+"--- Listening Ports (5001, 7497/paper, 7496/live) ---" | Tee-Object -FilePath $Report -Append
 try {
   Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 5001,7497,7496 } |
     Sort-Object LocalPort |
@@ -254,121 +260,14 @@ try {
     Tee-Object -FilePath $Report -Append
 }
 " " | Tee-Object -FilePath $Report -Append
-# ---------- P/L Summary using ImprovedHealthQueries.py ----------
+# ---------- P/L Summary (day & YTD) ----------
 "--- P/L Summary (day & YTD) ---"          | Tee-Object -FilePath $Report -Append
-
-# Check if ImprovedHealthQueries.py exists
-if (Test-Path $HealthQueriesPy) {
-  try {
-    # Capture stdout only, ignore stderr (IB warnings)
-    $plJson = & $Py $HealthQueriesPy 2>$null
-    $obj = $null
-    # Handle case where output might have multiple lines - get the JSON part
-    if ($plJson -is [array]) {
-      $plJson = $plJson -join "`n"
-    }
-    # Extract JSON from output (find the first { to last })
-    if ($plJson -match '(?s)(\{.*\})') {
-      $plJson = $matches[1]
-    }
-    try { $obj = $plJson | ConvertFrom-Json -ErrorAction Stop } catch {}
-
-    # helper for PS 5.1: null/empty coalesce
-    function _co([object]$v, [string]$fallback) {
-      if ($null -eq $v) { return $fallback }
-      if ($v -is [string] -and $v.Trim() -eq '') { return $fallback }
-      return $v
-    }
-
-    if ($obj -and $obj.ok) {
-      $pnl = $obj.pnl
-      ("Day Realized   : {0}" -f (_co $pnl.day_realized   '-')) | Tee-Object -FilePath $Report -Append
-      ("Day Unrealized : {0}" -f (_co $pnl.day_unrealized '-')) | Tee-Object -FilePath $Report -Append
-      ("Day Total      : {0}" -f (_co $pnl.day_total      '-')) | Tee-Object -FilePath $Report -Append
-      ("Net Liquidation: {0}" -f (_co $pnl.netliq         '-')) | Tee-Object -FilePath $Report -Append
-
-      # YTD baseline tracking (same logic as before)
-      $basef = "C:\OptionsHistory\ytd_baseline.json"
-      $now   = Get-Date
-      $nyNow = $now.ToUniversalTime().AddHours(-4)
-
-      if (-not (Test-Path $basef)) {
-        $base = @{ year = $nyNow.Year; netliq = $pnl.netliq; ts = $nyNow.ToString('o') }
-        $base | ConvertTo-Json | Set-Content $basef
-      } else {
-        $base = Get-Content $basef | ConvertFrom-Json
-        if ([int]$base.year -ne $nyNow.Year) {
-          $base = @{ year = $nyNow.Year; netliq = $pnl.netliq; ts = $nyNow.ToString('o') }
-          $base | ConvertTo-Json | Set-Content $basef
-        }
-      }
-
-      if ($pnl.netliq) {
-        $ytdChange = $pnl.netliq - [double]$base.netliq
-        ("YTD Delta NetLiq: {0:N2}" -f $ytdChange) | Tee-Object -FilePath $Report -Append
-      }
-
-      # Recent trades summary
-      if ($obj.recent_trades_count -gt 0) {
-        "`nRecent Trades: $($obj.recent_trades_count)" | Tee-Object -FilePath $Report -Append
-        foreach ($t in $obj.recent_trades) {
-          $strike = if ($t.strike) { "K=$($t.strike)" } else { "" }
-          $exp = if ($t.expiration) { "exp=$($t.expiration)" } else { "" }
-          $right = if ($t.right) { $t.right } else { "" }
-          $spread = if ($t.is_spread) { "[SPREAD]" } else { "" }
-          $lmt = if ($t.lmt_price) { "lmt=$($t.lmt_price)" } else { "" }
-          ("  {0} | {1} {2} {3} {4} | {5} | {6} {7} {8}" -f $t.time, $t.symbol, $exp, $strike, $right, $t.action, $t.status, $spread, $lmt) |
-            Tee-Object -FilePath $Report -Append | Out-Null
-        }
-      }
-
-      # Closed spreads summary (aggregated P/L)
-      if ($obj.closed_spreads_count -gt 0) {
-        "`nClosed Spreads (last 7 days): $($obj.closed_spreads_count)  |  Total P/L: $($obj.total_closed_spreads_pnl.ToString('N2'))" | Tee-Object -FilePath $Report -Append
-        foreach ($s in $obj.closed_spreads) {
-          $strikesStr = ($s.strikes -join '/')
-          ("  {0} | {1} {2} {3} {4} | strikes={5} w={6} | P/L: {7:N2}" -f $s.time, $s.symbol, $s.expiration, $s.right, $s.spread_type, $strikesStr, $s.width, $s.spread_pnl) |
-            Tee-Object -FilePath $Report -Append | Out-Null
-          # Show individual legs
-          foreach ($leg in $s.legs) {
-            ("    {0,-5} K={1,-7} fill={2,-6} legP/L={3:N2}" -f $leg.side, $leg.strike, $leg.price, $leg.pnl) |
-              Tee-Object -FilePath $Report -Append | Out-Null
-          }
-        }
-      }
-
-      # Recent executions summary (grouped by spread)
-      if ($obj.recent_executions_count -gt 0) {
-        "`nRecent Executions (by spread): $($obj.recent_executions_count)" | Tee-Object -FilePath $Report -Append
-        foreach ($e in $obj.recent_executions) {
-          $closeTag = if ($e.is_close) { "[CLOSE]" } else { "[OPEN]" }
-          $strikesStr = ($e.strikes -join '/')
-          ("  {0} | {1} {2} {3} {4} | strikes={5} w={6} | P/L: {7:N2} {8}" -f $e.time, $e.symbol, $e.expiration, $e.right, $e.spread_type, $strikesStr, $e.width, $e.spread_pnl, $closeTag) |
-            Tee-Object -FilePath $Report -Append | Out-Null
-          # Show individual legs
-          foreach ($leg in $e.legs) {
-            ("    {0,-5} K={1,-7} fill={2,-6} legP/L={3:N2}" -f $leg.side, $leg.strike, $leg.price, $leg.pnl) |
-              Tee-Object -FilePath $Report -Append | Out-Null
-          }
-        }
-      }
-    } else {
-      $errMsg = if ($obj -and $obj.error) { $obj.error } else { $plJson }
-      "P/L: $errMsg" | Tee-Object -FilePath $Report -Append
-    }
-  } catch {
-    "P/L ERROR: $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
-  }
-} else {
-  "WARNING: ImprovedHealthQueries.py not found at: $HealthQueriesPy" | Tee-Object -FilePath $Report -Append
-  "Please copy ImprovedHealthQueries.py to the Windows machine." | Tee-Object -FilePath $Report -Append
-
-  # Fallback to inline P/L query (minimal version)
-  "Attempting fallback inline P/L query..." | Tee-Object -FilePath $Report -Append
-  $tmpPy = Join-Path $env:TEMP ("pl_check_" + [guid]::NewGuid().ToString('N') + ".py")
-@'
+$tmpPy = Join-Path $env:TEMP ("pl_check_" + [guid]::NewGuid().ToString('N') + ".py")
+@"
 from ib_insync import IB
-import json, random
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import json, os, random
 
 def f(x):
     try: return float(x)
@@ -379,7 +278,7 @@ def main():
     ib = IB()
     cid = 830 + random.randint(0,19)
     try:
-        ib.connect('127.0.0.1', 7497, clientId=cid)
+        ib.connect('127.0.0.1', $IB_PORT, clientId=cid)
     except Exception as e:
         out["error"] = f"connect: {e}"
         print(json.dumps(out)); return
@@ -398,39 +297,58 @@ def main():
     out["day_realized"]   = day_real
     out["day_unrealized"] = day_unrl
     out["day_total"]      = (day_real or 0) + (day_unrl or 0)
-    out["netliq"]         = netliq
+
+    basef = r"C:\OptionsHistory\ytd_baseline.json"
+    now   = datetime.now(ZoneInfo("America/New_York"))
+    if not os.path.exists(basef):
+        base = {"year": now.year, "netliq": netliq or 0.0, "ts": now.isoformat()}
+        os.makedirs(os.path.dirname(basef), exist_ok=True)
+        with open(basef,"w") as fh: json.dump(base, fh)
+    else:
+        base = json.load(open(basef))
+        if int(base.get("year",0)) != now.year:
+            base = {"year": now.year, "netliq": netliq or 0.0, "ts": now.isoformat()}
+            json.dump(base, open(basef,"w"))
+
+    if netliq is not None:
+        out["ytd_change"] = netliq - float(base.get("netliq", 0.0))
     out["ok"] = True
     print(json.dumps(out))
-    ib.disconnect()
-
 if __name__ == "__main__":
     main()
-'@ | Set-Content -Encoding ASCII $tmpPy
+"@ | Set-Content -Encoding ASCII $tmpPy
 
-  try {
-    $plJson = & $Py $tmpPy
-    $obj = $null
-    try { $obj = $plJson | ConvertFrom-Json -ErrorAction Stop } catch {}
-    if ($obj -and $obj.ok) {
-      ("Day Realized   : {0}" -f $(if ($obj.day_realized) { $obj.day_realized } else { '-' })) | Tee-Object -FilePath $Report -Append
-      ("Day Unrealized : {0}" -f $(if ($obj.day_unrealized) { $obj.day_unrealized } else { '-' })) | Tee-Object -FilePath $Report -Append
-      ("Day Total      : {0}" -f $(if ($obj.day_total) { $obj.day_total } else { '-' })) | Tee-Object -FilePath $Report -Append
-      ("Net Liquidation: {0}" -f $(if ($obj.netliq) { $obj.netliq } else { '-' })) | Tee-Object -FilePath $Report -Append
-    } else {
-      "P/L fallback: $plJson" | Tee-Object -FilePath $Report -Append
-    }
-  } catch {
-    "P/L fallback ERROR: $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
-  } finally {
-    Remove-Item -Force -ErrorAction SilentlyContinue $tmpPy
+try {
+  $plJson = & $Py $tmpPy
+  $obj = $null
+  try { $obj = $plJson | ConvertFrom-Json -ErrorAction Stop } catch {}
+  # helper for PS 5.1: null/empty coalesce
+  function _co([object]$v, [string]$fallback) {
+    if ($null -eq $v) { return $fallback }
+    if ($v -is [string] -and $v.Trim() -eq '') { return $fallback }
+    return $v
   }
+  if ($obj -and $obj.ok) {
+    ("Day Realized   : {0}" -f (_co $obj.day_realized   '-')) | Tee-Object -FilePath $Report -Append
+    ("Day Unrealized : {0}" -f (_co $obj.day_unrealized '-')) | Tee-Object -FilePath $Report -Append
+    ("Day Total      : {0}" -f (_co $obj.day_total      '-')) | Tee-Object -FilePath $Report -Append
+    if ($obj.PSObject.Properties.Name -contains 'ytd_change') {
+      ("YTD Δ NetLiq  : {0}" -f (_co $obj.ytd_change '-'))    | Tee-Object -FilePath $Report -Append
+    }
+  } else {
+    "P/L: $plJson" | Tee-Object -FilePath $Report -Append
+  }
+} catch {
+  "P/L ERROR: $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmpPy
 }
 " " | Tee-Object -FilePath $Report -Append
 
 # ---------- Last 20 Orders Submitted (open) ----------
 "--- Last 20 Orders Submitted (open) ---" | Tee-Object -FilePath $Report -Append
 $tmpPlacedPy = Join-Path $env:TEMP ("placed_" + [guid]::NewGuid().ToString('N') + ".py")
-@'
+@"
 from ib_insync import IB, util, Contract
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -482,7 +400,7 @@ def legs_for_combo(ib: IB, combo, cache: dict):
 def main():
     ib = IB()
     try:
-        ib.connect('127.0.0.1', 7497, clientId=900, timeout=6)
+        ib.connect('127.0.0.1', $IB_PORT, clientId=900, timeout=6)
     except Exception as e:
         print(f"(submitted) error: connect: {e}")
         return
@@ -535,7 +453,7 @@ def main():
 
 if __name__=='__main__':
     main()
-'@ | Set-Content -Encoding ASCII $tmpPlacedPy
+"@ | Set-Content -Encoding ASCII $tmpPlacedPy
 
 try {
   $placedOut = & $Py $tmpPlacedPy 2>&1
@@ -555,7 +473,7 @@ try {
 # ---------- Current Positions (grouped by verticals; positions data only) ----------
 "--- Current Positions (verticals; positions data only) ---" | Tee-Object -FilePath $Report -Append
 $tmpOpenPosPy = Join-Path $env:TEMP ("openpos_" + [guid]::NewGuid().ToString('N') + ".py")
-@'
+@"
 from ib_insync import IB
 from collections import defaultdict
 from zoneinfo import ZoneInfo
@@ -563,7 +481,7 @@ from zoneinfo import ZoneInfo
 NY = ZoneInfo("America/New_York")
 
 def main():
-    ib=IB(); ib.connect('127.0.0.1',7497,clientId=897,timeout=6)
+    ib=IB(); ib.connect('127.0.0.1',$IB_PORT,clientId=897,timeout=6)
     poss = ib.positions()
 
     # Build verticals: (sym, exp, right) -> {strike: (qty, avgCost)}
@@ -598,7 +516,7 @@ def main():
     ib.disconnect()
 
 if __name__=='__main__': main()
-'@ | Set-Content -Encoding ASCII $tmpOpenPosPy
+"@ | Set-Content -Encoding ASCII $tmpOpenPosPy
 
 try {
   $openposOut = & $Py $tmpOpenPosPy 2>&1
@@ -618,7 +536,7 @@ try {
 # ---------- Last 20 Orders Closed (with P/L) ----------
 "--- Last 20 Orders Closed (with P/L) ---" | Tee-Object -FilePath $Report -Append
 $tmpClosedPy = Join-Path $env:TEMP ("closed_" + [guid]::NewGuid().ToString('N') + ".py")
-@'
+@"
 from ib_insync import IB, util, ExecutionFilter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -636,7 +554,7 @@ def parse_ib_time(s):
 def main():
     ib=IB()
     try:
-        ib.connect('127.0.0.1',7497,clientId=901,timeout=6)
+        ib.connect('127.0.0.1',$IB_PORT,clientId=901,timeout=6)
     except Exception as e:
         print(f"(closed) error: connect: {e}")
         return
@@ -646,11 +564,11 @@ def main():
         fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
 
         # Collect leg-level CLOSE fills (no market data)
-        # IMPROVED: Use realizedPNL != 0 as primary indicator (IB only reports realized P/L on closes)
         legs=[]
         for f in fills:
             c,e=f.contract,f.execution
             if getattr(c,"secType","")!="OPT": continue
+            if getattr(e,"openClose","")!="C": continue
             t_utc=parse_ib_time(getattr(e,"time","")); t_ny=t_utc.astimezone(NY) if t_utc else None
             pnl=0.0
             try:
@@ -661,12 +579,6 @@ def main():
             except Exception:
                 # Commission may be unavailable — treat as 0 and continue
                 pnl=0.0
-            # Determine if this is a closing trade:
-            # 1. Primary: If realizedPNL != 0, it's definitely a close (IB only reports realized P/L on closes)
-            # 2. Fallback: Check if openClose field is set to 'C'
-            open_close_field = getattr(e,"openClose","")
-            is_close = (abs(pnl) > 0.001) or (open_close_field == "C")
-            if not is_close: continue
             legs.append(dict(sym=c.symbol,
                              exp=getattr(c,"lastTradeDateOrContractMonth",""),
                              right=getattr(c,"right",""),
@@ -703,7 +615,7 @@ def main():
         except: pass
 
 if __name__=='__main__': main()
-'@ | Set-Content -Encoding ASCII $tmpClosedPy
+"@ | Set-Content -Encoding ASCII $tmpClosedPy
 
 try {
   $closedOut = & $Py $tmpClosedPy 2>&1
@@ -861,7 +773,7 @@ try {
 } catch {}
 
 try {
-  $lastPL = Select-String -Path $Report -Pattern '^Day Realized|^Day Unrealized|^Day Total|^YTD|^Net Liquidation' -SimpleMatch
+  $lastPL = Select-String -Path $Report -Pattern '^Day Realized|^Day Unrealized|^Day Total|^YTD' -SimpleMatch
   if ($lastPL) { $lastPL | ForEach-Object { $_.Line | Write-Host } }
 } catch {}
 

@@ -1,0 +1,45 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Runtime state
+runtime/
+logs/
+
+# IBC credentials — never commit C:\IBC\config.ini (contains IbPassword)
+# Copy bin/config.ini.example to C:\IBC\config.ini and fill in credentials.
+
+# Accidental output files
+nul
+qc
+query
+queryex
+start
+stop
+compile_out.txt
+OneShotHealth.report.txt
+batch_result.json
+
+# Dev/temp artifacts
+*.bak
+*.bak_*
+check_compile.py
+
+# Binaries / archives
+ngrok.zip
+*.zip
+*.exe
+
+# Editor
+.vscode/settings.json
+*.code-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
