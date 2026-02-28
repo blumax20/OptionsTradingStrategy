@@ -8,14 +8,16 @@ Usage:
     python switch_trading_mode.py status         # Show current mode
     python switch_trading_mode.py live --dry-run # Preview changes, write nothing
 
-Updates 5 files atomically:
+Updates 6 files atomically:
     1. InteractiveBrokersTrader/ib_config.py         -- IB_PORT
     2. C:\\OptionsHistory\\bin\\IB_Watchdog.ps1      -- $IB_GW_PORT
     3. C:\\OptionsHistory\\bin\\Health.ps1           -- $IB_PORT
     4. C:\\IBC\\config.ini                           -- TradingMode, ApiPort, OverrideTwsApiPort
     5. C:\\IBC\\run_gateway_service.cmd              -- /Mode:paper|live
+    6. Health.ps1 (repo)                             -- $IB_PORT (used by PushButtonMenu + IB_Health_0715)
 
 Then restarts IBGateway via NSSM so IBC auto-logs in to the new mode.
+Then restarts OptionsListener so it reloads ib_config.py with the new IB_PORT.
 IBC handles all login dialogs automatically using saved credentials in config.ini.
 """
 
@@ -34,6 +36,7 @@ SCRIPT_DIR   = Path(__file__).resolve().parent
 IB_CONFIG_PY = SCRIPT_DIR / "InteractiveBrokersTrader" / "ib_config.py"
 WATCHDOG_PS1    = Path(r"C:\OptionsHistory\bin\IB_Watchdog.ps1")
 HEALTH_PS1      = Path(r"C:\OptionsHistory\bin\Health.ps1")
+HEALTH_PS1_REPO = SCRIPT_DIR / "Health.ps1"   # Fix AW: also updated by PushButtonMenu + IB_Health_0715
 IBC_CONFIG      = Path(r"C:\IBC\config.ini")
 RUN_GATEWAY_CMD = Path(r"C:\IBC\run_gateway_service.cmd")
 
@@ -135,8 +138,8 @@ def update_watchdog_ps1(port: int) -> None:
     _write(WATCHDOG_PS1, original, updated)
 
 
-def update_health_ps1(port: int) -> None:
-    original = _read(HEALTH_PS1)
+def update_health_ps1(port: int, path: Path = HEALTH_PS1) -> None:
+    original = _read(path)
     # Anchor to start-of-line (MULTILINE) so comment lines are not matched
     updated = _sub(
         r"^(\$IB_PORT\s*=\s*)\d+",
@@ -144,7 +147,7 @@ def update_health_ps1(port: int) -> None:
         original,
         flags=re.MULTILINE,
     )
-    _write(HEALTH_PS1, original, updated)
+    _write(path, original, updated)
 
 
 def update_run_gateway_cmd(trading_mode: str) -> None:
@@ -246,6 +249,30 @@ def restart_ibgateway() -> None:
         print("  [WARN] nssm restart timed out. Restart IBGateway manually.")
 
 
+def restart_options_listener() -> None:
+    """Restart OptionsListener so it reloads ib_config.py with the new IB_PORT."""
+    if DRY_RUN:
+        print("  [DRY RUN] Would run: nssm restart OptionsListener")
+        return
+
+    print("\nRestarting OptionsListener service (to pick up new IB_PORT)...")
+    try:
+        result = subprocess.run(
+            ["nssm", "restart", "OptionsListener"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            print("  [OK] OptionsListener restarted")
+        else:
+            stderr = result.stderr.replace("\x00", "").strip()
+            print(f"  [WARN] OptionsListener restart returned rc={result.returncode}: {stderr}")
+            print("  (The listener may still restart correctly — check health after)")
+    except FileNotFoundError:
+        print("  [WARN] nssm not found in PATH. Restart OptionsListener manually.")
+    except subprocess.TimeoutExpired:
+        print("  [WARN] nssm restart timed out. Restart OptionsListener manually.")
+
+
 # ---------------------------------------------------------------------------
 # Status display
 # ---------------------------------------------------------------------------
@@ -306,11 +333,12 @@ def main() -> None:
     errors = []
 
     for name, fn, fargs in [
-        ("ib_config.py",               update_ib_config_py,    (port,)),
-        ("IB_Watchdog.ps1",            update_watchdog_ps1,    (port,)),
-        ("Health.ps1",                 update_health_ps1,      (port,)),
-        ("C:\\IBC\\config.ini",        update_ibc_config,      (port, trading_mode)),
-        ("C:\\IBC\\run_gateway_service.cmd", update_run_gateway_cmd, (trading_mode,)),
+        ("ib_config.py",                           update_ib_config_py,    (port,)),
+        ("IB_Watchdog.ps1",                        update_watchdog_ps1,    (port,)),
+        ("C:\\OptionsHistory\\bin\\Health.ps1",    update_health_ps1,      (port,)),
+        ("C:\\IBC\\config.ini",                    update_ibc_config,      (port, trading_mode)),
+        ("C:\\IBC\\run_gateway_service.cmd",       update_run_gateway_cmd, (trading_mode,)),
+        ("Health.ps1 (repo)",                      update_health_ps1,      (port, HEALTH_PS1_REPO)),
     ]:
         try:
             fn(*fargs)
@@ -327,6 +355,7 @@ def main() -> None:
         return
 
     restart_ibgateway()
+    restart_options_listener()
 
     if DRY_RUN:
         print(f"\n[DRY RUN] Complete. No files were written, IBGateway was NOT restarted.")

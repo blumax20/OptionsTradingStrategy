@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 27, 2026 (Fix AU: remove redundant _enforce_recent_closes — eliminate duplicate 5 PM close orders)
+**Last Updated:** February 28, 2026 (Fix AV: restart OptionsListener after mode switch; Fix AW: update repo Health.ps1 in switch script)
 
 ---
 
@@ -2136,3 +2136,79 @@ self._after_hours_batch_placement()
 ```
 
 **Impact:** Each symbol gets at most one close attempt per 5 PM cycle (from the 21-day sweep). No more duplicates from the redundant 7-day subset call.
+
+---
+
+### Fix AV: Restart OptionsListener After Mode Switch (Feb 28)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `switch_trading_mode.py` (repo root)
+
+**Issue:** After `python switch_trading_mode.py live`, IBGateway restarted on port 7496, but OptionsListener kept running with the old `IB_PORT=7497` loaded in memory. The listener's health endpoint returned `positions_count: 0` and `"not connected"` because it was still trying to connect to 7497 (not listening after IBGateway switched to 7496).
+
+Evidence from health_20260228_131937:
+- `listener.err.log: Connecting to 127.0.0.1:7497 with clientId 42...ConnectionRefusedError`
+- `positions_count: 0`, `positions_error: "not connected"`
+
+**Fix:** Added `restart_options_listener()` function and called it after `restart_ibgateway()`:
+```python
+def restart_options_listener() -> None:
+    """Restart OptionsListener so it reloads ib_config.py with the new IB_PORT."""
+    if DRY_RUN:
+        print("  [DRY RUN] Would run: nssm restart OptionsListener")
+        return
+    print("\nRestarting OptionsListener service (to pick up new IB_PORT)...")
+    result = subprocess.run(["nssm", "restart", "OptionsListener"], ...)
+    ...
+
+# After file updates:
+restart_ibgateway()
+restart_options_listener()   # ← added
+```
+
+**Impact:** After mode switch, OptionsListener restarts and reloads `ib_config.py` with the new `IB_PORT`. Listener connects to the correct IBGateway port immediately.
+
+---
+
+### Fix AW: Update Repo Health.ps1 in switch_trading_mode.py (Feb 28)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `switch_trading_mode.py` (repo root)
+
+**Issue:** Even after Fix AV, P/L, positions, and orders sections in the health report still failed with `ConnectionRefusedError` on port 7497. Root cause: there are **two separate Health.ps1 files**:
+
+| File | Used by | Updated before Fix AW? |
+|------|---------|------------------------|
+| `C:\OptionsHistory\bin\Health.ps1` | Scheduled `IB_DailyHealth_0830` | ✓ Yes |
+| `Health.ps1` (repo root) | `IB_Health_0715` task, `PushButtonMenu.ps1` health check | ✗ Never |
+
+The repo version always had `$IB_PORT = 7497` hardcoded (line 15). The heredocs are double-quoted (so `$IB_PORT` expands correctly), but since the variable was never updated, all generated temp Python files always got `7497`.
+
+Evidence from health_20260228_132735:
+- Positions temp file: `ib.connect('127.0.0.1', 7497, clientId=897)` — clientId 897 matches repo Health.ps1
+- P/L error: `At PushButtonMenu.ps1:44` calling `& powershell ... -File $Script` — PushButtonMenu calls the repo Health.ps1
+
+**Fix:** Added repo Health.ps1 as a 6th file in the update loop. Also added a `path` parameter to `update_health_ps1()` to support updating both paths from the same function:
+
+```python
+HEALTH_PS1_REPO = SCRIPT_DIR / "Health.ps1"   # Fix AW: also updated by PushButtonMenu + IB_Health_0715
+
+def update_health_ps1(port: int, path: Path = HEALTH_PS1) -> None:
+    original = _read(path)
+    updated = _sub(r"^(\$IB_PORT\s*=\s*)\d+", rf"\g<1>{port}", original, flags=re.MULTILINE)
+    _write(path, original, updated)
+
+# Update loop now covers 6 files:
+for name, fn, fargs in [
+    ("ib_config.py",                           update_ib_config_py,    (port,)),
+    ("IB_Watchdog.ps1",                        update_watchdog_ps1,    (port,)),
+    ("C:\\OptionsHistory\\bin\\Health.ps1",    update_health_ps1,      (port,)),
+    ("C:\\IBC\\config.ini",                    update_ibc_config,      (port, trading_mode)),
+    ("C:\\IBC\\run_gateway_service.cmd",       update_run_gateway_cmd, (trading_mode,)),
+    ("Health.ps1 (repo)",                      update_health_ps1,      (port, HEALTH_PS1_REPO)),  # ← added
+]:
+```
+
+Also updated the module docstring from "5 files" to "6 files" and "Then restarts IBGateway" to "Then restarts IBGateway via NSSM" with OptionsListener restart noted.
+
+**Impact:** All six config locations are updated atomically. Both `IB_Health_0715` (scheduled task) and `PushButtonMenu.ps1` health checks connect to the correct port after a mode switch. Confirmed in health_20260228_133631: P/L shows data, positions/orders show no ConnectionRefusedError.

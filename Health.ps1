@@ -12,7 +12,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_PORT = 7497
 #   Live trading  : $IB_PORT = 7496
-$IB_PORT = 7497
+$IB_PORT = 7496
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
