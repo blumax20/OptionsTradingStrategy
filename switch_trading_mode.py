@@ -8,11 +8,12 @@ Usage:
     python switch_trading_mode.py status         # Show current mode
     python switch_trading_mode.py live --dry-run # Preview changes, write nothing
 
-Updates 4 files atomically:
+Updates 5 files atomically:
     1. InteractiveBrokersTrader/ib_config.py         -- IB_PORT
     2. C:\\OptionsHistory\\bin\\IB_Watchdog.ps1      -- $IB_GW_PORT
     3. C:\\OptionsHistory\\bin\\Health.ps1           -- $IB_PORT
     4. C:\\IBC\\config.ini                           -- TradingMode, ApiPort, OverrideTwsApiPort
+    5. C:\\IBC\\run_gateway_service.cmd              -- /Mode:paper|live
 
 Then restarts IBGateway via NSSM so IBC auto-logs in to the new mode.
 IBC handles all login dialogs automatically using saved credentials in config.ini.
@@ -31,9 +32,10 @@ DRY_RUN: bool = False
 # ---------------------------------------------------------------------------
 SCRIPT_DIR   = Path(__file__).resolve().parent
 IB_CONFIG_PY = SCRIPT_DIR / "InteractiveBrokersTrader" / "ib_config.py"
-WATCHDOG_PS1 = Path(r"C:\OptionsHistory\bin\IB_Watchdog.ps1")
-HEALTH_PS1   = Path(r"C:\OptionsHistory\bin\Health.ps1")
-IBC_CONFIG   = Path(r"C:\IBC\config.ini")
+WATCHDOG_PS1    = Path(r"C:\OptionsHistory\bin\IB_Watchdog.ps1")
+HEALTH_PS1      = Path(r"C:\OptionsHistory\bin\Health.ps1")
+IBC_CONFIG      = Path(r"C:\IBC\config.ini")
+RUN_GATEWAY_CMD = Path(r"C:\IBC\run_gateway_service.cmd")
 
 # ---------------------------------------------------------------------------
 # Mode definitions
@@ -145,6 +147,17 @@ def update_health_ps1(port: int) -> None:
     _write(HEALTH_PS1, original, updated)
 
 
+def update_run_gateway_cmd(trading_mode: str) -> None:
+    """Update /Mode:paper|live in C:\\IBC\\run_gateway_service.cmd."""
+    original = _read(RUN_GATEWAY_CMD)
+    updated = _sub(
+        r"(?i)(/Mode:)(paper|live)",
+        rf"\g<1>{trading_mode}",
+        original,
+    )
+    _write(RUN_GATEWAY_CMD, original, updated)
+
+
 def update_ibc_config(port: int, trading_mode: str) -> None:
     """Update TradingMode, ApiPort, and OverrideTwsApiPort in C:\\IBC\\config.ini."""
     original = _read(IBC_CONFIG)
@@ -175,12 +188,28 @@ def update_ibc_config(port: int, trading_mode: str) -> None:
 # IBGateway restart
 # ---------------------------------------------------------------------------
 
+def _nssm_status() -> str:
+    """Return the current NSSM service status string, or '' on error."""
+    try:
+        r = subprocess.run(["nssm", "status", "IBGateway"],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip().replace(" ", "").upper()
+    except Exception:
+        return ""
+
+
 def restart_ibgateway() -> None:
-    """Restart the IBGateway Windows service via NSSM."""
+    """Restart the IBGateway Windows service via NSSM.
+
+    nssm restart fails with SERVICE_STOP_PENDING if the service is mid-stop.
+    Fall back to stop → wait → start when that happens.
+    """
     if DRY_RUN:
         print("\n  [DRY RUN] Would run: nssm restart IBGateway")
         print("  [DRY RUN] IBGateway NOT restarted.")
         return
+
+    import time
 
     print("\nRestarting IBGateway service (IBC will auto-login)...")
     try:
@@ -190,11 +219,26 @@ def restart_ibgateway() -> None:
         )
         if result.returncode == 0:
             print("  [OK] IBGateway service restarted")
-        else:
-            print(f"  [WARN] nssm restart returned code {result.returncode}")
-            if result.stderr.strip():
-                print(f"         {result.stderr.strip()}")
-            print("  You may need to restart IBGateway manually.")
+            return
+
+        # nssm restart fails when service is SERVICE_STOP_PENDING.
+        # Fall back to: wait for it to stop, then start.
+        stderr = result.stderr.replace("\x00", "").strip()
+        if "STOP_PENDING" in stderr.upper() or result.returncode != 0:
+            print("  [INFO] Service is stopping; waiting up to 30s then starting...")
+            for _ in range(15):
+                time.sleep(2)
+                st = _nssm_status()
+                if st in ("SERVICE_STOPPED", "STOPPED"):
+                    break
+            start = subprocess.run(["nssm", "start", "IBGateway"],
+                                   capture_output=True, text=True, timeout=30)
+            if start.returncode == 0:
+                print("  [OK] IBGateway service started")
+            else:
+                print(f"  [WARN] nssm start returned code {start.returncode}")
+                print("  Please restart the IBGateway service manually in Windows Services.")
+
     except FileNotFoundError:
         print("  [WARN] nssm not found in PATH.")
         print("  Please restart the IBGateway service manually in Windows Services.")
@@ -262,10 +306,11 @@ def main() -> None:
     errors = []
 
     for name, fn, fargs in [
-        ("ib_config.py",        update_ib_config_py, (port,)),
-        ("IB_Watchdog.ps1",     update_watchdog_ps1, (port,)),
-        ("Health.ps1",          update_health_ps1,   (port,)),
-        ("C:\\IBC\\config.ini", update_ibc_config,   (port, trading_mode)),
+        ("ib_config.py",               update_ib_config_py,    (port,)),
+        ("IB_Watchdog.ps1",            update_watchdog_ps1,    (port,)),
+        ("Health.ps1",                 update_health_ps1,      (port,)),
+        ("C:\\IBC\\config.ini",        update_ibc_config,      (port, trading_mode)),
+        ("C:\\IBC\\run_gateway_service.cmd", update_run_gateway_cmd, (trading_mode,)),
     ]:
         try:
             fn(*fargs)
