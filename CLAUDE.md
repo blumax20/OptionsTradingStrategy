@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 27, 2026 (Fix AT: switch_trading_mode.py script for one-command paper↔live switch)
+**Last Updated:** February 27, 2026 (Fix AU: remove redundant _enforce_recent_closes — eliminate duplicate 5 PM close orders)
 
 ---
 
@@ -2106,3 +2106,33 @@ Then restarts IBGateway via `nssm restart IBGateway`. IBC handles auto-login wit
 4. Run `Health.ps1` to confirm all services healthy on port 7496
 
 **Impact:** Paper↔live switch is now a single command. IBC config updated automatically — no manual file edits.
+
+---
+
+### Fix AU: Remove Redundant `_enforce_recent_closes` — Eliminate Duplicate 5 PM Close Orders (Feb 27)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`daily_trading_cycle`, ~line 3344)
+
+**Issue:** OHI received two SELL close orders on Feb 27 within 47 seconds:
+- `17:06:52` — `close_call, $0.58 LMT` (from `_enforce_recent_closes(days=7)`)
+- `17:07:39` — `close_call, $0.52 LMT` (from `_after_hours_batch_placement()`)
+
+**Root Cause:** `daily_trading_cycle()` called `_enforce_recent_closes(days=7)` THEN `_after_hours_batch_placement()`. Both call `_delegate_close_from_csvs_within()` — the 7-day call is a strict subset of the 21-day call. Orders placed by the 7-day call are NOT added to `_submitted_close_syms` (only reconcile writes to that set). When the 21-day call ran 47 seconds later, `_submitted_close_syms` didn't contain OHI, and the IB guard `_has_working_close_order()` failed to detect the 47-second-old `Inactive+DAY` order (cross-clientId propagation lag — same issue that drove Fix AP).
+
+Fix AJ1 already diagnosed and fixed this exact problem on Sundays. That fix's own comment stated: *"The 7-day enforce is a subset of the 21-day sweep"* — which is true every day.
+
+**Fix:** Removed the `_enforce_recent_closes(days=7)` call entirely. The 21-day sweep always covers everything the 7-day sweep would process.
+
+```python
+# BEFORE (Fix AJ1 — Sunday-only):
+_ahp_wday = self._now_ny().weekday()
+if _ahp_wday != 6:  # 6 = Sunday
+    self._enforce_recent_closes(days=7)
+self._after_hours_batch_placement()
+
+# AFTER (Fix AU — all days):
+self._after_hours_batch_placement()
+```
+
+**Impact:** Each symbol gets at most one close attempt per 5 PM cycle (from the 21-day sweep). No more duplicates from the redundant 7-day subset call.

@@ -3341,12 +3341,13 @@ class DailyCycleManagementMixin:
 
             # Optional: After-hours batch placement + recent closes enforcement
             if self.is_after_hours_placement(now):
-                LOG.info("After-hours placement window (%s): enforcing recent closes + placing from-signal.", now)
-                # Fix AJ1: Skip 7-day enforce on Sundays — _after_hours_batch_placement will do 21-day sweep (superset).
-                # Running both on Sunday causes each symbol to be processed twice through all 3 close stages.
-                _ahp_wday = self._now_ny().weekday()
-                if _ahp_wday != 6:  # 6 = Sunday
-                    self._enforce_recent_closes(days=7)
+                LOG.info("After-hours placement window (%s): placing from-signal.", now)
+                # Fix AU: _enforce_recent_closes(days=7) is a strict subset of _after_hours_batch_placement()'s
+                # 21-day sweep — both call _delegate_close_from_csvs_within(). Running both caused OHI (Feb 27)
+                # to get two SELL close orders 47s apart: orders placed by the 7-day call are not tracked in
+                # _submitted_close_syms, and the IB guard has cross-clientId propagation lag that lets the
+                # 21-day call place a duplicate. Fix AJ1 removed this redundancy on Sundays; this extends to
+                # all days since the 21-day sweep is always a superset of the 7-day sweep.
                 self._after_hours_batch_placement()
                 try:
                     self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
