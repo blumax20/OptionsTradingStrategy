@@ -1699,6 +1699,29 @@ class DailyCycleManagementMixin:
                     # DAY orders are also working after hours (they'll activate at market open)
                     if is_after_hours:
                         return True
+
+            # Fix AV1: also detect individual OPT SELL orders — placed by the worthless-leg path.
+            # These are not BAG orders so the loop above misses them, causing reconcile to place
+            # a duplicate BAG SELL alongside the already-working individual SELL leg.
+            for tr in trades:
+                c = getattr(tr, "contract", None)
+                o = getattr(tr, "order", None)
+                s = getattr(tr, "orderStatus", None)
+                if not c or not o or not s:
+                    continue
+                if getattr(c, "secType", "") != "OPT":
+                    continue
+                if (getattr(c, "symbol", "") or "").upper() != up:
+                    continue
+                if (getattr(o, "action", "") or "").upper() != "SELL":
+                    continue
+                st = (getattr(s, "status", "") or "").lower()
+                tif = (getattr(o, "tif", "") or "").upper()
+                if st in working_states:
+                    return True
+                if st == "inactive" and tif in ("GTC", "DAY") and is_after_hours:
+                    return True
+
             return False
         finally:
             try:

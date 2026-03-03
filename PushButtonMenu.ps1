@@ -159,7 +159,6 @@ while ($true) {
             } else {
                 Write-Host ("Health script not found: {0}" -f $HealthScript)
             }
-            Pause-Enter
         }
 
         2 {

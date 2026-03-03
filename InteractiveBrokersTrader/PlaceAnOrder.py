@@ -2391,22 +2391,48 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
                 # Close valuable legs individually
                 legs_closed = 0
-                # Fix AH1: Cancel any existing BAG combo order for this symbol before individual leg placement.
+                # Fix AH1: Cancel SELL BAG combo orders before individual leg placement.
+                # Fix AV2: Poll until BAGs confirmed gone (cancel is async; 0.4s was not enough).
+                # Fix AV3: Only cancel SELL BAGs (close orders); BUY BAGs = OPEN orders, leave alone.
+                _ah1_bag_gone = True  # assume OK if no BAGs found or cancel not needed
                 try:
                     ib.reqAllOpenOrders()
-                    ib.sleep(0.4)
+                    ib.sleep(0.5)
+                    _ah1_cancelled_any = False
                     for _t_ah in list(ib.openTrades()):
                         _tc_ah = _t_ah.contract
                         if (getattr(_tc_ah, "secType", "") == "BAG"
                                 and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
                             _st_ah = _t_ah.orderStatus.status.lower()
                             if _st_ah in ("presubmitted", "submitted", "inactive"):
-                                ib.cancelOrder(_t_ah.order)
-                                logger.info("[%s] AH1: cancelled BAG order %s (%s) to allow individual leg placement",
-                                            symbol, _t_ah.order.orderId, _st_ah)
-                    ib.sleep(0.4)
+                                # Fix AV3: only cancel SELL BAGs (close orders)
+                                _act_ah = (getattr(_t_ah.order, "action", "") or "").upper()
+                                if _act_ah == "SELL":
+                                    ib.cancelOrder(_t_ah.order)
+                                    logger.info("[%s] AH1: cancelled SELL BAG %s (%s)",
+                                                symbol, _t_ah.order.orderId, _st_ah)
+                                    _ah1_cancelled_any = True
+                    if _ah1_cancelled_any:
+                        # Fix AV2: poll until SELL BAGs are confirmed gone (up to 5s)
+                        _ah1_bag_gone = False
+                        for _poll in range(10):
+                            ib.sleep(0.5)
+                            _rem = [
+                                _t for _t in ib.openTrades()
+                                if (getattr(_t.contract, "secType", "") == "BAG"
+                                    and getattr(_t.contract, "symbol", "").upper() == symbol.upper()
+                                    and (getattr(_t.order, "action", "") or "").upper() == "SELL"
+                                    and _t.orderStatus.status.lower() in ("presubmitted", "submitted", "inactive"))
+                            ]
+                            if not _rem:
+                                _ah1_bag_gone = True
+                                break
+                        if not _ah1_bag_gone:
+                            logger.warning("[%s] AH1: SELL BAG still present after 5s; skipping individual legs to avoid doubling", symbol)
                 except Exception as _ah1_err:
                     logger.warning("[%s] AH1: BAG cancel error (proceeding): %s", symbol, _ah1_err)
+                if not _ah1_bag_gone:
+                    continue
                 # Fix AH2: Build dedup set of already-working individual OPT orders.
                 _working_sells_ah: set = set()
                 _working_buys_ah: set = set()
@@ -2544,23 +2570,48 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             # Close positions with guaranteed-fill pricing: long @ $0.05, short @ $0.05
             legs_closed = 0
             try:
-                # Fix AH1: Cancel any existing BAG combo order for this symbol before individual leg placement.
-                # A pending BAG SELL (e.g. from reconcile) causes IB to reject the individual SELL for the same leg.
+                # Fix AH1: Cancel SELL BAG combo orders before individual leg placement.
+                # Fix AV2: Poll until BAGs confirmed gone (cancel is async; 0.4s was not enough).
+                # Fix AV3: Only cancel SELL BAGs (close orders); BUY BAGs = OPEN orders, leave alone.
+                _ah1_bag_gone = True
                 try:
                     ib.reqAllOpenOrders()
-                    ib.sleep(0.4)
+                    ib.sleep(0.5)
+                    _ah1_cancelled_any = False
                     for _t_ah in list(ib.openTrades()):
                         _tc_ah = _t_ah.contract
                         if (getattr(_tc_ah, "secType", "") == "BAG"
                                 and getattr(_tc_ah, "symbol", "").upper() == symbol.upper()):
                             _st_ah = _t_ah.orderStatus.status.lower()
                             if _st_ah in ("presubmitted", "submitted", "inactive"):
-                                ib.cancelOrder(_t_ah.order)
-                                logger.info("[%s] AH1: cancelled BAG order %s (%s) to allow individual leg placement",
-                                            symbol, _t_ah.order.orderId, _st_ah)
-                    ib.sleep(0.4)
+                                # Fix AV3: only cancel SELL BAGs (close orders)
+                                _act_ah = (getattr(_t_ah.order, "action", "") or "").upper()
+                                if _act_ah == "SELL":
+                                    ib.cancelOrder(_t_ah.order)
+                                    logger.info("[%s] AH1: cancelled SELL BAG %s (%s)",
+                                                symbol, _t_ah.order.orderId, _st_ah)
+                                    _ah1_cancelled_any = True
+                    if _ah1_cancelled_any:
+                        # Fix AV2: poll until SELL BAGs are confirmed gone (up to 5s)
+                        _ah1_bag_gone = False
+                        for _poll in range(10):
+                            ib.sleep(0.5)
+                            _rem = [
+                                _t for _t in ib.openTrades()
+                                if (getattr(_t.contract, "secType", "") == "BAG"
+                                    and getattr(_t.contract, "symbol", "").upper() == symbol.upper()
+                                    and (getattr(_t.order, "action", "") or "").upper() == "SELL"
+                                    and _t.orderStatus.status.lower() in ("presubmitted", "submitted", "inactive"))
+                            ]
+                            if not _rem:
+                                _ah1_bag_gone = True
+                                break
+                        if not _ah1_bag_gone:
+                            logger.warning("[%s] AH1: SELL BAG still present after 5s; skipping individual legs to avoid doubling", symbol)
                 except Exception as _ah1_err:
                     logger.warning("[%s] AH1: BAG cancel error (proceeding): %s", symbol, _ah1_err)
+                if not _ah1_bag_gone:
+                    continue
                 # Fix AH2: Build dedup set of already-working individual OPT orders (prevents cross-run duplicates).
                 _working_sells_ah: set = set()
                 _working_buys_ah: set = set()

@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** February 28, 2026 (Fix AV: restart OptionsListener after mode switch; Fix AW: update repo Health.ps1 in switch script)
+**Last Updated:** March 2, 2026 (Fix AX: Health.ps1 improvements; Fix AY: worthless close guard + AH1 race condition)
 
 ---
 
@@ -2212,3 +2212,63 @@ for name, fn, fargs in [
 Also updated the module docstring from "5 files" to "6 files" and "Then restarts IBGateway" to "Then restarts IBGateway via NSSM" with OptionsListener restart noted.
 
 **Impact:** All six config locations are updated atomically. Both `IB_Health_0715` (scheduled task) and `PushButtonMenu.ps1` health checks connect to the correct port after a mode switch. Confirmed in health_20260228_133631: P/L shows data, positions/orders show no ConnectionRefusedError.
+
+---
+
+### Fix AX: Health.ps1 Improvements — Pause, Byte-Seek, ib_cycle.log Patterns (Mar 2)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `Health.ps1` (repo root), `PushButtonMenu.ps1` (repo root)
+
+**Changes (4 sub-fixes):**
+
+**AX1 — Press Enter pause:** Added `Read-Host "Press Enter to continue"` at the end of Health.ps1 so the report doesn't immediately return to the menu. Removed redundant `Pause-Enter` from PushButtonMenu option 1.
+
+**AX2 — Byte-seek for ib_cycle.log:** `Read-SharedFile` previously read the entire file into memory before taking the tail — causing a hang on large logs. Replaced with file-seek approach: seeks to `Length - (tail * 900)` bytes from end, reads only that chunk. Handles shared-read locking for concurrent Python writes.
+
+**AX3 — Fix ib_cycle.log search patterns:** All 5 search patterns were written for an old log format that no longer exists. Updated to match the actual Python/ib_insync format:
+- `$placed` → `orderStatus:.*status='(Submitted|PreSubmitted)'` (excludes `openOrder:` broadcasts that double-count)
+- `$closed` → `orderStatus:.*permId=\d+, action='SELL'.*status=...` (anchors to Order-level action, not comboLeg action)
+- `$weekly` → `[Ff]orce.close|[Ss]tage\s+2[^0-9]|force_close`
+- `$failed` → `\bERROR\b|Exception:|no_viable_limit|SKIPPING order`
+- `$skipped` → `skipped|defer_to_force|no_spread_in_positions`
+
+Added `$formatOrder` scriptblock that parses raw ib_insync lines into readable one-liners:
+`2026-02-16 17:05  MNST    SELL  LMT  @$0.85`
+
+Fixed `$extractSym` to handle both `[SYM]` and `symbol='SYM'` log formats.
+
+**AX4 — Filter listener.err.log noise in Recent Logs:** listener.err.log is always among the 3 most-recently-modified logs. Its tail is full of verbose `ib_insync.wrapper:(position|updatePortfolio|openOrder):` lines (~400 chars each) already shown in Positions section. Added filter to suppress these, leaving only meaningful ERROR/WARNING lines.
+
+**Impact:** Health report "Recent PlaceAnOrder activity" section now shows accurate counts (not 0/false-positives) and readable order summaries. "Recent Logs" section no longer flooded with position dump noise.
+
+---
+
+### Fix AY: Worthless Close Guard + AH1 Race Condition (Mar 2)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/ib_close_guard.py`, `InteractiveBrokersTrader/DailyCycleManagement.py` (`_has_working_close_order`), `InteractiveBrokersTrader/PlaceAnOrder.py` (both AH1 blocks)
+
+**Issue:** NWG CALL 20/22.5 accumulated 2 conflicting open orders: a SELL BAG combo (from reconcile) and an individual BUY 22.5C (from the worthless individual-leg path). If both filled, the BAG would close the spread while the standalone BUY 22.5C created an unintended LONG 22.5C position.
+
+**Three root causes:**
+
+**AY1 — Close guard blind to individual OPT SELL orders:**
+`_has_working_close_order()` (DCM) and `has_working_auto_close()` (ib_close_guard) only looked for SELL BAG orders. When the worthless path placed individual SELL 20C + BUY 22.5C orders, both guards returned `False` → the 5 PM reconcile saw no working close and placed a new SELL BAG alongside the existing individual legs.
+
+**Fix:** Added second pass in both guard functions to detect individual OPT SELL orders for the same symbol as a working close indicator.
+
+**AY2 — AH1 cancel is fire-and-forget (race condition):**
+AH1 sent `ib.cancelOrder()` then slept only 0.4s before proceeding to place individual legs. IB cancel acknowledgement can take >0.4s (especially for Inactive+DAY orders activating at market open) → individual legs placed while BAG still "pending cancellation".
+
+**Fix:** After sending cancels, polls `ib.openTrades()` up to 10× (5 seconds) to confirm all SELL BAGs are gone. If still present after 5s, skips individual leg placement (`continue` to next spread pair) and lets the existing BAG handle the close.
+
+**AY3 — AH1 cancelled ALL BAGs including BUY (OPEN) orders:**
+Previously cancelled any BAG for the symbol regardless of action. BUY BAGs are OPEN orders — should not be cancelled during close operations.
+
+**Fix:** Added `action == "SELL"` filter to AH1 cancel loop in both one-leg-worthless and both-worthless paths.
+
+**Impact:**
+- Reconcile no longer places duplicate SELL BAGs when individual worthless legs are already working
+- Individual legs are only placed after confirming the SELL BAG is fully cancelled
+- OPEN BUY BAG orders are never accidentally cancelled by the worthless close path

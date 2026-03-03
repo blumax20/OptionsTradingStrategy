@@ -12,7 +12,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_PORT = 7497
 #   Live trading  : $IB_PORT = 7496
-$IB_PORT = 7496
+$IB_PORT = 7497
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
@@ -637,8 +637,17 @@ try {
 Get-ChildItem "$LogDir\*.log" -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Desc | Select-Object -First 3 |
   ForEach-Object {
-    "`n### $($_.FullName) (last 60 lines)" | Tee-Object -FilePath $Report -Append
-    Get-Content $_.FullName -Tail 60       | Tee-Object -FilePath $Report -Append | Out-Null
+    $logFile = $_
+    "`n### $($logFile.FullName) (last 60 lines)" | Tee-Object -FilePath $Report -Append
+    $logLines = Get-Content $logFile.FullName -Tail 60
+    # For listener.err.log: suppress verbose ib_insync position/portfolio dumps already shown in Positions section
+    if ($logFile.Name -like 'listener.err*') {
+      $logLines = $logLines | Where-Object {
+        $_ -notmatch 'ib_insync\.wrapper:(position|updatePortfolio|openOrder):' -and
+        $_ -notmatch 'ib_insync\.ib:Synchronization'
+      }
+    }
+    $logLines | Tee-Object -FilePath $Report -Append | Out-Null
   }
 
 "==== END ===="                             | Tee-Object -FilePath $Report -Append
@@ -705,32 +714,57 @@ function Read-SharedFile([string]$path, [int]$tail = 2000) {
   if (!(Test-Path $path)) { return @() }
   $fs = [System.IO.File]::Open($path,'Open','Read','ReadWrite')
   try {
-    $sr = New-Object System.IO.StreamReader($fs)
-    $lines = @()
-    while(-not $sr.EndOfStream){ $lines += $sr.ReadLine() }
+    $enc = [System.Text.Encoding]::UTF8
+    # Seek from end: ~300 bytes/line avg; 3x buffer to be safe
+    $bytesToRead = [Math]::Min($fs.Length, $tail * 900)
+    $startPos    = $fs.Length - $bytesToRead
+    if ($startPos -gt 0) { [void]$fs.Seek($startPos, [System.IO.SeekOrigin]::Begin) }
+    $buf  = New-Object byte[] ($fs.Length - $fs.Position)
+    $read = $fs.Read($buf, 0, $buf.Length)
+    $text = $enc.GetString($buf, 0, $read)
+    $lines = $text -split "`r?`n"
+    # Drop the first (potentially partial) line when we started mid-file
+    if ($startPos -gt 0 -and $lines.Count -gt 0) { $lines = $lines[1..($lines.Count - 1)] }
     if ($lines.Count -gt $tail) { $lines = $lines[-$tail..-1] }
     return $lines
-  } finally { $sr.Dispose(); $fs.Dispose() }
+  } finally { $fs.Dispose() }
 }
 
 $lines = Read-SharedFile $logPath 2500
 
 # Buckets
-$placed  = $lines | Select-String -SimpleMatch ' Placed ' | Select-Object -ExpandProperty Line
-$closed  = $lines | Select-String -SimpleMatch ' Submitted CLOSE ' | Select-Object -ExpandProperty Line
-$weekly  = $lines | Select-String -Pattern 'Weekly-enforce|FORCE-CLOSE' | Select-Object -ExpandProperty Line
-$failed  = $lines | Select-String -Pattern 'Failed to place|Failed to qualify|ERROR:' | Select-Object -ExpandProperty Line
-$skipped = $lines | Select-String -Pattern 'Skipping;|No matching spread quantity|limit below min|OI ' | Select-Object -ExpandProperty Line
+# Filter to 'orderStatus:' lines only — each order also fires an 'openOrder:' broadcast
+# that would double-count every submission. 'orderStatus:' = the real status update.
+$placed  = $lines | Select-String -Pattern "orderStatus:.*status='(Submitted|PreSubmitted)'" | Select-Object -ExpandProperty Line
+# Order-level action comes after 'permId=NNN, action=' in Order(); comboLegs also have
+# action= but appear earlier in the line — anchoring on permId= avoids false matches.
+$closed  = $lines | Select-String -Pattern "orderStatus:.*permId=\d+, action='SELL'.*status='(Submitted|PreSubmitted)'" | Select-Object -ExpandProperty Line
+$weekly  = $lines | Select-String -Pattern '[Ff]orce.close|[Ss]tage\s+2[^0-9]|force_close' | Select-Object -ExpandProperty Line
+$failed  = $lines | Select-String -Pattern '\bERROR\b|Exception:|no_viable_limit|SKIPPING order' | Select-Object -ExpandProperty Line
+$skipped = $lines | Select-String -Pattern 'skipped|defer_to_force|no_spread_in_positions' | Select-Object -ExpandProperty Line
 
 # Compact summary counts
-("Placed (open/close) : {0}" -f ($placed.Count + $closed.Count))        | Tee-Object -FilePath $Report -Append
-("Weekly/Force close  : {0}" -f $weekly.Count)                           | Tee-Object -FilePath $Report -Append
+$buyCount = $placed.Count - $closed.Count
+("Submitted (open/close) : {0}  [{1} SELL / {2} BUY]" -f $placed.Count, $closed.Count, $buyCount) | Tee-Object -FilePath $Report -Append
+("Force-close activity   : {0}" -f $weekly.Count)                                                   | Tee-Object -FilePath $Report -Append
 ("Failures            : {0}" -f $failed.Count)                           | Tee-Object -FilePath $Report -Append
 ("Skips               : {0}" -f $skipped.Count)                          | Tee-Object -FilePath $Report -Append
 
-# Top recent examples
-"`nLast 10 placed/submitted:" | Tee-Object -FilePath $Report -Append
-($placed + $closed | Select-Object -Last 10) |
+# Parse a raw ib_insync orderStatus line into a compact one-line summary
+$formatOrder = {
+  param($line)
+  $ts  = if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})') { $Matches[1] } else { '?' }
+  $sym = if ($line -match "symbol='([A-Z][A-Z\.]*)'")           { $Matches[1] } else { '?' }
+  # Order-level action anchored after permId= in Order() — not a comboLeg action
+  $act = if ($line -match "permId=\d+, action='([A-Z]+)'")      { $Matches[1] } else { '?' }
+  $ot  = if ($line -match "orderType='([^']+)'")                 { $Matches[1] } else { '?' }
+  $lmt = if ($line -match "lmtPrice=([\d\.]+)")                  { $Matches[1] } else { '-' }
+  "{0}  {1,-6}  {2,-4}  {3,-3}  @`${4}" -f $ts, $sym, $act, $ot, $lmt
+}
+
+# Top recent examples — $placed already contains all submitted (opens + closes)
+"`nLast 10 submitted orders:" | Tee-Object -FilePath $Report -Append
+$placed | Select-Object -Last 10 | ForEach-Object { & $formatOrder $_ } |
   Tee-Object -FilePath $Report -Append | Out-Null
 
 "`nLast 10 failures:" | Tee-Object -FilePath $Report -Append
@@ -745,7 +779,9 @@ $skipped | Select-Object -Last 10 |
 "`nPer-symbol activity (last window):" | Tee-Object -FilePath $Report -Append
 $extractSym = {
   param($line)
-  if ($line -match '\[(?<sym>[A-Z\.]+)\]') { $matches.sym } else { $null }
+  if ($line -match '\[(?<sym>[A-Z][A-Z\.]+)\]') { $matches.sym }
+  elseif ($line -match "symbol='(?<sym>[A-Z][A-Z\.]+)'") { $matches.sym }
+  else { $null }
 }
 $allTagged = @()
 foreach ($l in ($placed + $closed)) { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='placed'} } }
@@ -792,3 +828,10 @@ try {
 }
 
 Write-Host "Wrote OneShotHealth report: $Report"
+
+try {
+    Write-Host ""
+    [void](Read-Host "Press Enter to continue")
+} catch {
+    # Non-interactive terminal (scheduled task, piped) — skip silently
+}

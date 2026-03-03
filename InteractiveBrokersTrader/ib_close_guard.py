@@ -73,6 +73,28 @@ def has_working_auto_close(symbol: str,
             if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
                 return True
 
+        # Fix AV1: individual OPT SELL orders indicate the long leg is being closed
+        # (placed by the worthless-leg path). Neither the BAG check above nor the reconcile
+        # guard detects these, so a new BAG SELL gets placed alongside the individual legs.
+        after_hours = True  # conservative: always treat individual SELL as working
+        for tr in trades:
+            c = getattr(tr, "contract", None)
+            o = getattr(tr, "order", None)
+            s = getattr(tr, "orderStatus", None)
+            if not (c and o and s):
+                continue
+            if getattr(c, "secType", "") != "OPT":
+                continue
+            if (getattr(c, "symbol", "") or "").upper() != sym_u:
+                continue
+            if (getattr(o, "action", "") or "").upper() != "SELL":
+                continue
+            st = (getattr(s, "status", "") or "").lower()
+            tif = (getattr(o, "tif", "") or "").upper()
+            if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
+                LOG.debug("has_working_auto_close: individual OPT SELL working for %s (%s)", sym_u, st)
+                return True
+
         return False
     finally:
         try:
