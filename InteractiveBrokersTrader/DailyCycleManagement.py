@@ -3113,15 +3113,28 @@ class DailyCycleManagementMixin:
             sym_u = (symbol or "").strip().upper()
             r_u = (right or "").strip().upper()
 
-            cand_keys = {
-                "symbol": ("symbol",),
-                "right": ("right", "signal_right"),
-                "exp": ("expiration", "exp", "lastTradeDateOrContractMonth"),
-                "atm_strike": ("atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike"),
-                "oth_strike": ("oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike"),
-                "oi_atm": ("oi_atm", "atm_oi", "oi_call_atm", "oi_put_atm", "open_interest_atm", "oi1"),
-                "oi_oth": ("oi_oth", "oth_oi", "oi_call_oth", "oi_put_oth", "open_interest_oth", "oi2"),
-            }
+            # Build right-aware aliases so listener CSV columns (atm_strike, otm_strike_call/put,
+            # open_interest_atm_call/put) match without requiring prior enrichment to rename them.
+            if r_u == 'C':
+                cand_keys = {
+                    "symbol":     ("symbol",),
+                    "right":      ("right", "signal_right"),
+                    "exp":        ("expiration", "exp", "lastTradeDateOrContractMonth"),
+                    "atm_strike": ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike"),
+                    "oth_strike": ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike"),
+                    "oi_atm":     ("oi_atm", "atm_oi", "oi_call_atm", "open_interest_atm_call", "open_interest_atm", "oi1"),
+                    "oi_oth":     ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                }
+            else:  # PUT
+                cand_keys = {
+                    "symbol":     ("symbol",),
+                    "right":      ("right", "signal_right"),
+                    "exp":        ("expiration", "exp", "lastTradeDateOrContractMonth"),
+                    "atm_strike": ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "high_strike", "upper_strike"),
+                    "oth_strike": ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike"),
+                    "oi_atm":     ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1"),
+                    "oi_oth":     ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                }
 
             def _get(row, keys):
                 for k in keys:

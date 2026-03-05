@@ -2272,3 +2272,91 @@ Previously cancelled any BAG for the symbol regardless of action. BUY BAGs are O
 - Reconcile no longer places duplicate SELL BAGs when individual worthless legs are already working
 - Individual legs are only placed after confirming the SELL BAG is fully cancelled
 - OPEN BUY BAG orders are never accidentally cancelled by the worthless close path
+
+---
+
+### Fix AZ: Health.ps1 P/L — Non-Blocking reqAccountUpdates (Mar 4)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `Health.ps1` (repo root), `C:\OptionsHistory\bin\Health.ps1`
+
+**Issue:** "Day Realized" and "Day Unrealized" P/L showed "-" in health reports. A prior fix added `ib.reqAccountUpdates(acct)` which caused Health.ps1 to hang indefinitely — requiring the user to kill the process.
+
+**Root cause:** `ib.reqAccountUpdates(acct)` is the high-level ib_insync blocking wrapper. It calls `self.run(self.wrapper.updateAccountTimeEvent.wait())` — waiting forever for IB to send an `updateAccountTime` event. Paper trading accounts often never send this event, causing an infinite hang.
+
+**Fix:** Replaced the blocking high-level call with the non-blocking EClient call + sleep + unsubscribe:
+
+```python
+# BEFORE (hangs indefinitely on paper accounts):
+if acct:
+    ib.reqAccountUpdates(acct)  # blocking — waits for updateAccountTime event
+avs = ib.accountValues(acct) if acct else []
+
+# AFTER (non-blocking, 4s sleep to let IB push values):
+if acct:
+    ib.client.reqAccountUpdates(True, acct)   # non-blocking EClient subscribe
+    ib.sleep(4.0)                               # wait for IB to push account values
+    avs = ib.accountValues(acct)
+    ib.client.reqAccountUpdates(False, acct)   # unsubscribe cleanly
+```
+
+Adds ~5 seconds to health report runtime (1s connect sleep + 4s account sleep) but never hangs.
+
+**Impact:** Day Realized and Day Unrealized P/L now show numeric values instead of "-". Health report completes reliably.
+
+---
+
+### Fix BA: OI Cancel Column Alias Fix — Low-OI Order Cancellation Never Worked (Mar 4)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_low_oi_working_orders_from_csv`, `_find_csv_oi` helper)
+
+**Issue:** The 9:45 AM low-OI cancellation guard (`_cancel_low_oi_working_orders_from_csv`) never cancelled any orders — despite being called correctly and enrichment running. Orders like LXP (OI 15/10) and FER (OI 9/28), both well below the 100 threshold, remained as working orders all day.
+
+**Root cause:** The `_find_csv_oi()` helper used alias lists that don't match the actual listener CSV column names:
+
+| Alias looked for | Actual listener CSV column |
+|-----------------|---------------------------|
+| `"atm"`, `"k_atm"` | **`"atm_strike"`** |
+| `"oth"`, `"k_oth"` | **`"otm_strike_call"` / `"otm_strike_put"`** |
+| `"open_interest_atm"` | **`"open_interest_atm_call"` / `"open_interest_atm_put"`** |
+
+Since `ra = _get(row, atm_strike_aliases)` returned `None` on every row (no alias matched `atm_strike`), the check `if ra is None or ro is None: continue` skipped every row → `_find_csv_oi` always returned `(None, None, None)` → no orders were ever cancelled.
+
+**Fix:** Made the alias lists right-aware (CALL vs PUT) and added the actual listener CSV column names:
+
+```python
+# BEFORE: static aliases that never matched listener CSV format
+cand_keys = {
+    "atm_strike": ("atm", "k_atm", "strike_atm", ...),          # missed atm_strike
+    "oth_strike": ("oth", "k_oth", "strike_oth", ...),           # missed otm_strike_call/put
+    "oi_atm":     ("oi_atm", ..., "open_interest_atm", ...),     # missed open_interest_atm_call
+    ...
+}
+
+# AFTER: right-aware aliases with listener CSV column names first
+if r_u == 'C':
+    cand_keys = {
+        "atm_strike": ("atm_strike", "atm", "k_atm", ...),
+        "oth_strike": ("otm_strike_call", "oth", "k_oth", ...),
+        "oi_atm":     ("oi_atm", ..., "open_interest_atm_call", ...),
+        "oi_oth":     ("oi_oth", ..., "open_interest_otm_call", ...),
+    }
+else:  # PUT
+    cand_keys = {
+        "atm_strike": ("atm_strike", "atm", "k_atm", ...),
+        "oth_strike": ("otm_strike_put", "oth", "k_oth", ...),
+        "oi_atm":     ("oi_atm", ..., "open_interest_atm_put", "open_interest_atm_call", ...),
+        "oi_oth":     ("oi_oth", ..., "open_interest_otm_put", "open_interest_otm_call", ...),
+    }
+```
+
+For PUT signals, call OI columns serve as fallback proxies for put OI (which the listener often leaves empty — matching Fix AO's proxy logic in LiquidityFilter).
+
+The fix works with the raw listener CSV even when LiquidityFilter enrichment (`oi_atm`/`oi_oth`) has not yet run. When enrichment has run, the enriched values (first in alias list) are preferred.
+
+**Impact:**
+- LXP CALL 50/55 (OI 15/10): both < 100 → **cancelled at 9:45 AM**
+- FER PUT 70/65 (OI 9/28 via call proxy): both < 100 → **cancelled at 9:45 AM**
+- BG CALL 115/120 (OI 960/435): both ≥ 100 → **kept**
+- All previously placed low-OI OPEN orders will be correctly evaluated going forward

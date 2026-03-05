@@ -279,6 +279,7 @@ def main():
     cid = 830 + random.randint(0,19)
     try:
         ib.connect('127.0.0.1', $IB_PORT, clientId=cid)
+        ib.sleep(1.0)  # Wait for managed accounts list to populate after connect
     except Exception as e:
         out["error"] = f"connect: {e}"
         print(json.dumps(out)); return
@@ -286,8 +287,14 @@ def main():
     acct = ib.managedAccounts()[0] if ib.managedAccounts() else None
     vals = {}
     try:
-        summ = ib.accountSummary(acct)
-        vals = {s.tag: s.value for s in summ}
+        if acct:
+            ib.client.reqAccountUpdates(True, acct)   # non-blocking subscribe
+            ib.sleep(4.0)                               # wait for IB to push account values
+            avs = ib.accountValues(acct)
+            ib.client.reqAccountUpdates(False, acct)   # unsubscribe
+            for av in avs:  # prefer BASE (consolidated), fall back to USD
+                if av.currency == 'BASE' or (av.currency == 'USD' and av.tag not in vals):
+                    vals[av.tag] = av.value
     except Exception: pass
 
     day_real = f(vals.get("RealizedPnL"))
@@ -311,7 +318,7 @@ def main():
             json.dump(base, open(basef,"w"))
 
     if netliq is not None:
-        out["ytd_change"] = netliq - float(base.get("netliq", 0.0))
+        out["ytd_change"] = round(netliq - float(base.get("netliq", 0.0)), 2)
     out["ok"] = True
     print(json.dumps(out))
 if __name__ == "__main__":
@@ -349,10 +356,9 @@ try {
 "--- Last 20 Orders Submitted (open) ---" | Tee-Object -FilePath $Report -Append
 $tmpPlacedPy = Join-Path $env:TEMP ("placed_" + [guid]::NewGuid().ToString('N') + ".py")
 @"
-from ib_insync import IB, util, Contract
+from ib_insync import IB, util, ExecutionFilter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import collections
 
 NY, UTC = ZoneInfo("America/New_York"), ZoneInfo("UTC")
 
@@ -363,40 +369,6 @@ def parse_ib_time(s):
         return dt.astimezone(UTC)
     except: return None
 
-def first_submitted_time(tr):
-    # Prefer first "Submitted" / "PreSubmitted" in the trade log
-    for L in (tr.log or []):
-        st = (L.status or "").lower()
-        if "submitted" in st:
-            t = parse_ib_time(L.time)
-            if t: return t
-    # Fallbacks on status timestamps (if any)
-    s = getattr(tr.orderStatus, "lastUpdateTime", "") or getattr(tr.orderStatus, "lastFillTime", "")
-    return parse_ib_time(s) if s else None
-
-def legs_for_combo(ib: IB, combo, cache: dict):
-    # Only resolve leg contracts (no market data)
-    out=[]
-    for leg in (getattr(combo,"comboLegs",None) or []):
-        conId = getattr(leg, "conId", None)
-        if not conId: 
-            continue
-        if conId not in cache:
-            try:
-                cds = ib.reqContractDetails(Contract(conId=conId)) or []
-                cache[conId] = cds[0].contract if cds else None
-            except Exception:
-                cache[conId] = None
-        c = cache.get(conId)
-        if c and getattr(c, "secType", "") == "OPT":
-            out.append(dict(
-                action=getattr(leg,"action",""),
-                exp=getattr(c,"lastTradeDateOrContractMonth",""),
-                strike=float(getattr(c,"strike",0.0)),
-                right=getattr(c,"right","")
-            ))
-    return out
-
 def main():
     ib = IB()
     try:
@@ -406,52 +378,70 @@ def main():
         return
 
     try:
-        # Make sure we see current open orders; harmless if not supported
+        rows = []  # list of (t_utc, display_line)
+
+        # Part 1: Currently open/pending orders (requires sleep for cross-clientId propagation)
         try:
-            ib.reqAllOpenOrders(); ib.reqAutoOpenOrders(True)
+            ib.reqAllOpenOrders()
+            ib.sleep(2.0)
         except Exception:
             pass
+        for tr in (ib.openTrades() or []):
+            c, o = tr.contract, tr.order
+            sym = getattr(c, "symbol", "?")
+            act = getattr(o, "action", "?")
+            ot  = (getattr(o, "orderType", "") or "").upper()
+            lmt = getattr(o, "lmtPrice", None)
+            price = f"{lmt:.2f}" if lmt else "MKT"
+            st = getattr(tr.orderStatus, "status", "")
+            t_str = getattr(tr.orderStatus, "lastUpdateTime", "") or ""
+            t_utc = parse_ib_time(t_str) if t_str else None
+            ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M") if t_utc else "?"
+            rows.append((t_utc or datetime.min.replace(tzinfo=UTC),
+                         f"{ts}  {sym:<6}  {act:<4}  {ot:<3}  @\${price}  [{st}]"))
 
-        trades = ib.trades() or []
-        rows=[]
-        for tr in trades:
-            t_utc = first_submitted_time(tr)
-            if not t_utc: 
+        # Part 2: Recent fills from last 48h (covers filled/cancelled orders no longer in openTrades)
+        since_str = (datetime.now(UTC) - timedelta(hours=48)).strftime("%Y%m%d-%H:%M:%S")
+        fills = ib.reqExecutions(ExecutionFilter(time=since_str)) or []
+        seen_ids = set()
+        for fill in fills:
+            c, e = fill.contract, fill.execution
+            if getattr(c, "secType", "") not in ("OPT", "BAG"):
                 continue
-            if t_utc < datetime.now(UTC) - timedelta(days=14):
+            t_utc = parse_ib_time(getattr(e, "time", ""))
+            if not t_utc:
                 continue
-            rows.append((t_utc,tr))
+            # Deduplicate: use first 24 chars of execId as key
+            eid = (getattr(e, "execId", "") or "")[:24]
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            sym  = getattr(c, "symbol", "?")
+            side = getattr(e, "side", "?")   # "BOT" or "SLD"
+            act  = "BUY " if side == "BOT" else "SELL"
+            px   = float(getattr(e, "price", 0.0) or 0.0)
+            exp  = getattr(c, "lastTradeDateOrContractMonth", "") or ""
+            rt   = getattr(c, "right", "") or ""
+            exp_rt = f" {exp} {rt}" if exp else ""
+            ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M")
+            rows.append((t_utc, f"{ts}  {sym:<6}{exp_rt:<12}  {act}  fill  @\${px:.2f}"))
 
-        rows.sort(key=lambda r:r[0], reverse=True)
+        rows.sort(key=lambda r: r[0], reverse=True)
         rows = rows[:20]
 
         if not rows:
-            print("(no placed orders in recent window)")
+            print("(no placed orders in recent 48h window)")
             return
+        for _, line in rows:
+            print(line)
 
-        cache={}
-        for t_utc,tr in rows:
-            c,o = tr.contract, tr.order
-            tny = t_utc.astimezone(NY)
-            tag = " [~17:00]" if (tny.hour==17 and abs(tny.minute-0)<=10) else ""
-            sym = getattr(c,"symbol","")
-            spread = "MKT" if (getattr(o,"orderType","") or "").upper()=="MKT" else (f"LMT {o.lmtPrice:.2f}" if getattr(o,"lmtPrice",None) else "-")
-
-            if getattr(c,"secType","")=="BAG":
-                print(f"{tny:%Y-%m-%d %H:%M:%S %Z}{tag}  {sym}  Vertical  spread={spread}")
-                for L in legs_for_combo(ib,c,cache):
-                    print(f"  {L['action']:<4} strike={L['strike']:<7} exp={L['exp']:<8} right={L['right']}")
-            elif getattr(c,"secType","")=="OPT":
-                exp=getattr(c,"lastTradeDateOrContractMonth",""); st=getattr(c,"strike",""); rt=getattr(c,"right","")
-                print(f"{tny:%Y-%m-%d %H:%M:%S %Z}{tag}  {sym} {exp} {rt} Vertical  spread={spread}")
-                print(f"  {o.action:<4} strike={st:<7} exp={exp:<8} right={rt}")
     except Exception as e:
         print(f"(submitted) error: {e}")
     finally:
         try: ib.disconnect()
         except: pass
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
 "@ | Set-Content -Encoding ASCII $tmpPlacedPy
 
@@ -563,21 +553,20 @@ def main():
         since = (datetime.now(UTC)-timedelta(days=7)).strftime("%Y%m%d-%H:%M:%S")
         fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
 
-        # Collect leg-level CLOSE fills (no market data)
+        # Collect leg-level fills (all OPT fills; openClose field is unreliable on paper accounts)
         legs=[]
         for f in fills:
             c,e=f.contract,f.execution
             if getattr(c,"secType","")!="OPT": continue
-            if getattr(e,"openClose","")!="C": continue
+            # Include all OPT fills — paper accounts often leave openClose="" on BAG legs
             t_utc=parse_ib_time(getattr(e,"time","")); t_ny=t_utc.astimezone(NY) if t_utc else None
             pnl=0.0
             try:
-                if getattr(e,"execId",None):
-                    cr=ib.reqCommissionReport(e.execId)
-                    if cr and cr.realizedPNL is not None:
-                        pnl=float(cr.realizedPNL)
+                # commissionReport is a direct attribute on Fill (ib_insync NamedTuple)
+                cr = f.commissionReport
+                if cr and cr.realizedPNL is not None:
+                    pnl=float(cr.realizedPNL)
             except Exception:
-                # Commission may be unavailable — treat as 0 and continue
                 pnl=0.0
             legs.append(dict(sym=c.symbol,
                              exp=getattr(c,"lastTradeDateOrContractMonth",""),
@@ -732,6 +721,11 @@ function Read-SharedFile([string]$path, [int]$tail = 2000) {
 
 $lines = Read-SharedFile $logPath 2500
 
+# Scope stats to today + yesterday to avoid multi-day accumulation from the cumulative log
+$_todayStr  = (Get-Date).ToString('yyyy-MM-dd')
+$_yesterStr = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
+$lines = $lines | Where-Object { $_ -match "^($_todayStr|$_yesterStr)" }
+
 # Buckets
 # Filter to 'orderStatus:' lines only — each order also fires an 'openOrder:' broadcast
 # that would double-count every submission. 'orderStatus:' = the real status update.
@@ -779,12 +773,17 @@ $skipped | Select-Object -Last 10 |
 "`nPer-symbol activity (last window):" | Tee-Object -FilePath $Report -Append
 $extractSym = {
   param($line)
-  if ($line -match '\[(?<sym>[A-Z][A-Z\.]+)\]') { $matches.sym }
-  elseif ($line -match "symbol='(?<sym>[A-Z][A-Z\.]+)'") { $matches.sym }
-  else { $null }
+  # Limit to 1-5 char symbols; excludes [ERROR], [WARNING], [INFO], [DEBUG] (6+ chars)
+  $excluded = @('ERROR','WARNING','INFO','DEBUG','CRITICAL')
+  if ($line -match '\[(?<sym>[A-Z][A-Z\.]{0,4})\]') {
+    if ($matches.sym -notin $excluded) { return $matches.sym }
+  }
+  if ($line -match "symbol='(?<sym>[A-Z][A-Z\.]+)'") { return $matches.sym }
+  return $null
 }
 $allTagged = @()
-foreach ($l in ($placed + $closed)) { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='placed'} } }
+# Use $placed only (not $placed + $closed) — $closed is a subset of $placed and would double-count SELL orders
+foreach ($l in $placed)  { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='placed'} } }
 foreach ($l in $failed)            { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='failed'} } }
 foreach ($l in $skipped)           { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='skipped'} } }
 
@@ -828,6 +827,13 @@ try {
 }
 
 Write-Host "Wrote OneShotHealth report: $Report"
+
+# Re-encode the saved report from UTF-16 LE (PS 5.1 Tee-Object default) to UTF-8 without BOM
+# so the .txt file is readable in Notepad, VSCode, etc.
+try {
+    $content = [System.IO.File]::ReadAllText($Report, [System.Text.Encoding]::Unicode)
+    [System.IO.File]::WriteAllText($Report, $content, [System.Text.UTF8Encoding]::new($false))
+} catch {}
 
 try {
     Write-Host ""
