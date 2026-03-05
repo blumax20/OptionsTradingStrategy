@@ -133,7 +133,9 @@ class DailyCycleManagementMixin:
                     continue
                 if getattr(c, 'secType', '') != 'BAG':
                     continue
-                if (getattr(o, 'action', '') or '').upper() not in ('SELL','BUY'):
+                # Fix BN-1: Only SELL BAG orders are close orders. BUY BAGs are open orders
+                # and should not cause a symbol to appear as a preclose candidate.
+                if (getattr(o, 'action', '') or '').upper() != 'SELL':
                     continue
                 if (getattr(o, 'orderType', '') or '').upper() != 'LMT':
                     continue
@@ -472,94 +474,105 @@ class DailyCycleManagementMixin:
                 )
                 return
 
-            # Stage 1: delegate using CSV-derived limits (from-signal mode respects CSV limits)
             dated_folder = self._now_ny().strftime("%y_%m_%d")
-            LOG.info(f"[{sym}] Stage 1: Attempting CSV-based close from {dated_folder} (context={context})")
-            try:
-                self._attempt(
-                    symbol=sym,
-                    action="close",
-                    status="queued",
-                    reason=f"{context}_delegated_csv_limit",
-                    source=f"dcm-{context}",
-                )
-            except Exception:
-                pass
-            self._run_place_an_order([
-                "--mode","from-signal",  # Changed: use from-signal to respect CSV limits
-                "--date", dated_folder,  # Ensure correct dated CSV directory
-                "--symbols", sym,
-                "--min-limit","0.01" if context == "preclose" else "0.05",
-                "--use-live-close","off",  # Don't override CSV limits with live quotes
-                "--quantity","50",
-                "--quiet"
-            ])
 
-            has_working = self._has_working_close_order(sym)
-            LOG.info(f"[{sym}] Stage 1 completed: has_working_close_order={has_working}")
-            if has_working:
-                try:
-                    self._attempt(
-                        symbol=sym,
-                        action="close",
-                        status="submitted",
-                        reason=f"{context}_delegated_csv_limit_working",
-                        source=f"dcm-{context}",
-                    )
-                except Exception:
-                    pass
-            else:
-                # Stage 2: fallback to force-close with age-based pricing (mid for same-day, join for previous-day)
-                scheme = self._determine_live_close_scheme_for_symbol(sym)
-                LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close with '{scheme}' scheme)")
+            # Stage 1: CSV-based pricing — only for non-preclose contexts (after-hours / reconcile).
+            # Fix BN-2: At preclose (3 PM, market open) stale CSV prices (from yesterday's 9:45 AM
+            # enrichment) already failed to fill all day; re-placing at the same prices won't fill
+            # in the remaining hour.  Skip Stage 1 at preclose and go directly to Stage 2 (live join
+            # pricing + MKT fallback), which uses current bid/ask.
+            if context != "preclose":
+                LOG.info(f"[{sym}] Stage 1: Attempting CSV-based close from {dated_folder} (context={context})")
                 try:
                     self._attempt(
                         symbol=sym,
                         action="close",
                         status="queued",
-                        reason=f"{context}_fallback_live_{scheme}",
+                        reason=f"{context}_delegated_csv_limit",
                         source=f"dcm-{context}",
                     )
                 except Exception:
                     pass
-                # Build args for force-close
-                force_close_args = [
-                    "--mode","force-close",  # Force-close scans positions directly
-                    "--date", dated_folder,  # Ensure correct dated CSV directory
+                self._run_place_an_order([
+                    "--mode", "from-signal",
+                    "--date", dated_folder,
                     "--symbols", sym,
-                    "--min-limit","0.01" if context == "preclose" else "0.05",
-                    "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
-                    "--quantity","50",
-                    "--quiet",
-                    "--fallback-individual-legs",  # Fix S: Enable worthless leg handling
-                ]
-                # In preclose (market open), allow MARKET fallback if all limit pricing fails
-                if context == "preclose":
-                    force_close_args.append("--allow-market-fallback")
-                self._run_place_an_order(force_close_args)
-                if self._has_working_close_order(sym):
+                    "--min-limit", "0.05",
+                    "--use-live-close", "off",  # Don't override CSV limits with live quotes
+                    "--quantity", "50",
+                    "--quiet"
+                ])
+                has_working = self._has_working_close_order(sym)
+                LOG.info(f"[{sym}] Stage 1 completed: has_working_close_order={has_working}")
+                if has_working:
                     try:
                         self._attempt(
                             symbol=sym,
                             action="close",
                             status="submitted",
-                            reason=f"{context}_delegated_live_mid_working",
+                            reason=f"{context}_delegated_csv_limit_working",
                             source=f"dcm-{context}",
                         )
                     except Exception:
                         pass
-                else:
-                    # No working close even after Stage 2; record but do not place direct orders from DCM.
-                    try:
-                        self._attempt(
-                            symbol=sym,
-                            action="close",
-                            status="submitted",
-                            reason=f"{context}_delegated_no_working_close",
-                            source=f"dcm-{context}",
-                        )
-                    except Exception:
-                        pass
+                    return  # Stage 1 succeeded; done for non-preclose contexts
+
+            # Stage 2: Force-close with live pricing.
+            # For preclose: always (first and only attempt — live join + MKT fallback fills at 3 PM).
+            # For non-preclose: fallback when Stage 1 failed.
+            scheme = self._determine_live_close_scheme_for_symbol(sym)
+            if context == "preclose":
+                LOG.info(f"[{sym}] Stage 2 (live pricing): context=preclose, scheme={scheme}")
+            else:
+                LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close with '{scheme}' scheme)")
+            try:
+                self._attempt(
+                    symbol=sym,
+                    action="close",
+                    status="queued",
+                    reason=f"{context}_fallback_live_{scheme}",
+                    source=f"dcm-{context}",
+                )
+            except Exception:
+                pass
+            # Build args for force-close
+            force_close_args = [
+                "--mode", "force-close",
+                "--date", dated_folder,
+                "--symbols", sym,
+                "--min-limit", "0.01" if context == "preclose" else "0.05",
+                "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
+                "--quantity", "50",
+                "--quiet",
+                "--fallback-individual-legs",  # Fix S: Enable worthless leg handling
+            ]
+            # In preclose (market open), allow MARKET fallback if all limit pricing fails
+            if context == "preclose":
+                force_close_args.append("--allow-market-fallback")
+            self._run_place_an_order(force_close_args)
+            if self._has_working_close_order(sym):
+                try:
+                    self._attempt(
+                        symbol=sym,
+                        action="close",
+                        status="submitted",
+                        reason=f"{context}_delegated_live_mid_working",
+                        source=f"dcm-{context}",
+                    )
+                except Exception:
+                    pass
+            else:
+                # No working close even after Stage 2; record but do not place direct orders from DCM.
+                try:
+                    self._attempt(
+                        symbol=sym,
+                        action="close",
+                        status="submitted",
+                        reason=f"{context}_delegated_no_working_close",
+                        source=f"dcm-{context}",
+                    )
+                except Exception:
+                    pass
 
             # If the latest signal is CLOSE, also flatten any stock leg to avoid lingering STK exposure
             try:

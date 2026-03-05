@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 5, 2026 (Fix BL: LiquidityFilter OI attribute name — callOpenInterest/putOpenInterest)
+**Last Updated:** March 5, 2026 (Fix BN-1/BN-2: Preclose uses live join pricing; BUY-order false candidate fixed)
 
 ---
 
@@ -2609,3 +2609,66 @@ for attr in (_primary, "optionOpenInterest", "openInterest", "optOpenInterest"):
 Also increased `poll_seconds` default from 1.5 → 3.0: with 1.5s, OTM legs (less liquid) often timed out even when ATM legs returned data fine. Verified: at 3.0s both legs populated for all three OPEN signals (BG 960/435, LXP 15/10, FER 1/1).
 
 **Impact:** `oi_atm`/`oi_oth` now populate correctly for both legs in the enriched CSV. The 9:45 AM cancel uses reliable live RTH OI instead of the listener's after-hours fallback.
+
+---
+
+### Fix BN-1: `_working_close_limit_symbols()` — SELL-Only Filter (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_working_close_limit_symbols`, ~line 136)
+
+**Issue:** `_working_close_limit_symbols()` returned symbols with **either** SELL or BUY working BAG LMT orders. BUY BAG orders are OPEN orders. On March 5, BG had a working BUY order (CALL_OPEN placed at 1:47 PM) that hadn't filled. BG landed in `work_syms`, then `_latest_signal_is_close("BG")` found an old CLOSE signal in the CSV → preclose tried to close a non-existent position.
+
+**Fix:**
+```python
+# BEFORE:
+if (getattr(o, 'action', '') or '').upper() not in ('SELL','BUY'):
+    continue
+
+# AFTER (Fix BN-1):
+# Only SELL BAG orders are close orders. BUY BAGs are open orders and should
+# not cause a symbol to appear as a preclose candidate.
+if (getattr(o, 'action', '') or '').upper() != 'SELL':
+    continue
+```
+
+**Impact:** Symbols with only working BUY (open) orders no longer appear as preclose close candidates. BG correctly excluded from preclose.
+
+---
+
+### Fix BN-2: Preclose Uses Live Join Pricing (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_submit_close_shared`, ~line 479)
+
+**Issue:** At 3 PM on March 5, the preclose cancelled the morning's risk-exit LMT orders for BK, CP, O, PBR, T (correct) but re-placed them using Stage 1 (from-signal with stale CSV prices from yesterday's 9:45 AM enrichment). Since Stage 1 placed a working order (at the stale price), Stage 2 (live join pricing + MKT fallback) was **never reached**. Result: all 5 positions expired unfilled at 4 PM.
+
+**Root cause:** Stage 1 "succeeds" whenever it places any working order — even at a price that won't fill. Prices that failed to fill from 9:45 AM → 3 PM won't fill in the remaining hour.
+
+**Fix:** For `context == "preclose"`, skip Stage 1 entirely and go directly to Stage 2 (force-close with live join pricing + `--allow-market-fallback` + `--fallback-individual-legs`):
+
+```python
+# Fix BN-2: At preclose (3 PM, market open) stale CSV prices already failed to fill
+# all day; re-placing at the same prices won't fill in the remaining hour.
+# Skip Stage 1 at preclose and go directly to Stage 2 (live join + MKT fallback).
+if context != "preclose":
+    # Stage 1: CSV-based pricing (after-hours / reconcile only)
+    self._run_place_an_order(["--mode", "from-signal", "--use-live-close", "off", ...])
+    has_working = self._has_working_close_order(sym)
+    if has_working:
+        ...log csv_limit_working...
+        return  # Done for non-preclose contexts
+
+# Stage 2: Force-close with live pricing (always for preclose; fallback for others)
+force_close_args = ["--mode", "force-close", "--use-live-close", scheme,
+                    "--fallback-individual-legs", ...]
+if context == "preclose":
+    force_close_args.append("--allow-market-fallback")
+```
+
+**Impact:**
+- 3 PM preclose now uses current bid/ask via live join pricing (fills within remaining hour)
+- Worthless spreads (BK, NWG): bid=0 → `both_worthless_fixed_price` → $0.05 individual legs
+- Stop-loss/TP exits (T, PBR, O, CP): join current bid → fill before 4 PM
+- MKT fallback available as last resort if bid=0 and not worthless
+- Non-preclose flows (after-hours reconcile) unchanged — still use Stage 1 CSV first
