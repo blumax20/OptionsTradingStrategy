@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 5, 2026 (Fix BG/BH/BI/BJ/BK: clientId=101 cancel; NameError; BUY-only filter; OI=-1 guard; cancel/write separation)
+**Last Updated:** March 5, 2026 (Fix BL: LiquidityFilter OI attribute name — callOpenInterest/putOpenInterest)
 
 ---
 
@@ -2579,3 +2579,33 @@ if not (leg1_ok or leg2_ok):
 ```
 
 **Impact:** Orders for which IB cannot return OI data are conservatively kept (not cancelled). Only orders where BOTH legs have confirmed OI data showing both below threshold are cancelled. Consistent with `_cancel_low_oi_working_orders_from_csv()`'s `if oi_atm is None or oi_oth is None: continue` guard.
+
+---
+
+### Fix BL: LiquidityFilter `_ib_fetcher_factory` — Wrong OI Attribute Name (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/LiquidityFilter.py` (`_ib_fetcher_factory`, ~line 443)
+
+**Issue:** `enrich_combined_csv()` correctly ran at 9:45 AM (confirmed by `iv_oth` being populated in the March 4 CSV for FER, BG, LXP), but `oi_atm`/`oi_oth` were always NaN. Root cause: the attribute loop tried:
+```python
+for attr in ("optionOpenInterest", "openInterest", "optOpenInterest"):
+    val = getattr(t, attr, None)  # ← always None — wrong attribute names
+```
+ib_insync's `Ticker` object exposes `callOpenInterest`/`putOpenInterest` (confirmed by `listener.py` which uses them successfully to get OI=960 for BG, OI=15 for LXP). The names `optionOpenInterest` etc. don't exist on the Ticker → `oi_atm`/`oi_oth` remained NaN despite enrichment running. The 9:45 AM low-OI cancel was silently falling back to the listener's unreliable after-hours OI instead of the fresh RTH data enrichment was supposed to provide.
+
+**Fix:**
+```python
+# Fix BL: ib_insync Ticker uses callOpenInterest/putOpenInterest (confirmed by listener.py).
+_primary = "callOpenInterest" if str(right).upper() == "C" else "putOpenInterest"
+for attr in (_primary, "optionOpenInterest", "openInterest", "optOpenInterest"):
+    val = getattr(t, attr, None)
+    if isinstance(val, (int, float)) and not (val != val):  # not NaN
+        oi = int(val)
+        break
+```
+`right` is already in scope from the `_fetch(symbol, right, exp, strike)` closure — no signature change.
+
+Also increased `poll_seconds` default from 1.5 → 3.0: with 1.5s, OTM legs (less liquid) often timed out even when ATM legs returned data fine. Verified: at 3.0s both legs populated for all three OPEN signals (BG 960/435, LXP 15/10, FER 1/1).
+
+**Impact:** `oi_atm`/`oi_oth` now populate correctly for both legs in the enriched CSV. The 9:45 AM cancel uses reliable live RTH OI instead of the listener's after-hours fallback.

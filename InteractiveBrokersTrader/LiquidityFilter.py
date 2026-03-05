@@ -418,7 +418,7 @@ def populate_missing_strikes(day_dir: str,
 
     return updates
 
-def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 1.5):  # Fix AO: was 0.6 — OI tick 101 needs ~1-2s to arrive
+def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5 (Fix AO: was 0.6) — OTM OI often needs >1.5s
     """
     Return a callable (symbol, right, exp, strike) -> (oi, iv)
     Uses ib_insync snapshot market data to fetch option open interest and IV.
@@ -439,9 +439,13 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 1.5):  # Fix AO: was 0.6
             t = ib.reqMktData(opt, "100,101,106,588", False, False)
             # Allow brief time for snapshot to populate
             ib.sleep(poll_seconds)
-            # Try several attribute names defensively
+            # Try several attribute names defensively.
+            # Fix BL: ib_insync Ticker uses callOpenInterest/putOpenInterest (confirmed by listener.py).
+            # The generic names (optionOpenInterest etc.) don't exist on the Ticker object and always
+            # returned None, leaving oi_atm/oi_oth as NaN despite enrichment running.
             oi = None
-            for attr in ("optionOpenInterest", "openInterest", "optOpenInterest"):
+            _primary = "callOpenInterest" if str(right).upper() == "C" else "putOpenInterest"
+            for attr in (_primary, "optionOpenInterest", "openInterest", "optOpenInterest"):
                 val = getattr(t, attr, None)
                 if isinstance(val, (int, float)) and not (val != val):  # not NaN
                     oi = int(val)
