@@ -2427,3 +2427,26 @@ Both produce `@${price}` and `@${px:.2f}` as literal Python text (valid f-string
 Note: `C:\OptionsHistory\bin\Health.ps1` uses an older placed-orders implementation without this pattern — no change needed there.
 
 **Impact:** Placed-orders section in health report no longer shows SyntaxError. The probe generates and runs valid Python, displaying filled order summary with prices.
+
+---
+
+### Fix BE: Log `_rth_liquidity_cleanup()` Cancellations to Attempts CSV (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup`, cancel block ~line 3057)
+
+**Issue:** Fix Q (Feb 7) added `_AttemptLogger.write()` to `_cancel_low_oi_working_orders_from_csv()` (CSV-based OI path) but missed `_rth_liquidity_cleanup()` (live-OI path). Cancellations from the live-OI path only appeared in `ib_cycle.log` (`RTH cleanup: cancelled low-OI order...`) and not in the attempts CSV, making them invisible to post-trade audit.
+
+**Fix:** Added `_AttemptLogger.write()` after `ib.cancelOrder(o)` in `_rth_liquidity_cleanup()`:
+```python
+_AttemptLogger.write(
+    symbol=sym,
+    action="cancel_open",
+    status="placed",
+    reason="low_oi_live",   # distinguishes from CSV-based "low_oi_both_legs"
+    exp=exp, right=_r, atm=_atm, oth=_oth,
+)
+```
+Uses `reason="low_oi_live"` to distinguish from `_cancel_low_oi_working_orders_from_csv()`'s `"low_oi_both_legs"`.
+
+**Impact:** All low-OI cancellations now appear in the attempts CSV regardless of which path (CSV-based or live-OI) triggered them.

@@ -3060,6 +3060,20 @@ class DailyCycleManagementMixin:
                         net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
                         LOG.info("RTH cleanup: cancelled low-OI order %s %s %s strikes=%s OI=%s (threshold>%d) spread=%s",
                                  sym, exp, right, strikes, oi_values, MIN_OI_FOR_RTH, net)
+                        # Fix BE: log to attempts CSV (same as _cancel_low_oi_working_orders_from_csv)
+                        _r = (right or "").upper()
+                        _atm = str(strikes[1] if _r == "P" else strikes[0])
+                        _oth = str(strikes[0] if _r == "P" else strikes[1])
+                        _AttemptLogger.write(
+                            symbol=sym,
+                            action="cancel_open",
+                            status="placed",
+                            reason="low_oi_live",
+                            exp=exp,
+                            right=_r,
+                            atm=_atm,
+                            oth=_oth,
+                        )
                     except Exception as e:
                         LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
             LOG.info("RTH cleanup completed. Cancelled %d low-liquidity open order(s).", cancelled)
