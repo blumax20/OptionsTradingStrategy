@@ -2360,3 +2360,70 @@ The fix works with the raw listener CSV even when LiquidityFilter enrichment (`o
 - FER PUT 70/65 (OI 9/28 via call proxy): both < 100 → **cancelled at 9:45 AM**
 - BG CALL 115/120 (OI 960/435): both ≥ 100 → **kept**
 - All previously placed low-OI OPEN orders will be correctly evaluated going forward
+
+---
+
+### Fix BB: Add `reqAllOpenOrders()` to `_cancel_low_oi_working_orders_from_csv()` (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_low_oi_working_orders_from_csv`, line ~3189)
+
+**Issue:** LXP and FER low-OI BUY orders were NOT cancelled at 9:45 AM on March 5 despite Fix BA correctly fixing the CSV column aliases. The cancel function connected with clientId=887 and immediately called `ib.openTrades()` without first calling `ib.reqAllOpenOrders()`. On a fresh connection, `openTrades()` only returns orders placed by the current clientId in the current session — returning empty. The LXP/FER/BG BUY orders (placed by clientId=101/listener at 5 PM as Inactive+DAY) were invisible. Log confirmed: `"CSV OI cancel: no open trades."` at 9:46 AM.
+
+This is the same class of bug as Fix U1 (which fixed `_has_working_close_order`, `_working_close_limit_symbols`, `_cancel_symbol_close_orders`) — `_cancel_low_oi_working_orders_from_csv()` was missed.
+
+**Fix:**
+```python
+# BEFORE (bug — no reqAllOpenOrders):
+trades = ib.openTrades() or []
+
+# AFTER (Fix BB):
+ib.reqAllOpenOrders()
+ib.sleep(1.5)  # Fix BB: allow IB to propagate cross-clientId orders (same as Fix AP)
+trades = ib.openTrades() or []
+```
+
+**Impact:** Low-OI cancellation function now sees cross-clientId orders (Inactive+DAY placed by PlaceAnOrder/reconcile). LXP/FER-type orders will be correctly evaluated and cancelled at 9:45 AM.
+
+---
+
+### Fix BC: Add `reqAllOpenOrders()` to `_rth_liquidity_cleanup()` (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup`, line ~2998, clientId=879)
+
+**Issue:** Same pattern as Fix BB — `_rth_liquidity_cleanup()` (live-OI-based cleanup) also called `ib.openTrades()` without `reqAllOpenOrders()` first, returning empty and logging `"RTH cleanup: no open trades to evaluate."`. ib_cycle.log confirmed this at 9:46:23 on March 5.
+
+**Fix:**
+```python
+# BEFORE (bug):
+try:
+    trades = ib.openTrades()
+
+# AFTER (Fix BC):
+try:
+    ib.reqAllOpenOrders()
+    ib.sleep(1.5)  # Fix BC: allow IB to propagate cross-clientId orders (same as Fix AP)
+    trades = ib.openTrades()
+```
+
+**Impact:** Live-OI cleanup function now sees all open orders from any clientId. Both CSV-based and live-OI-based cleanup paths now correctly evaluate low-OI cancellations.
+
+---
+
+### Fix BD: Health.ps1 `@\${price}` Syntax Error in Placed-Orders Probe (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `Health.ps1` (repo root), lines 401 and 427 (inside `@" "@` double-quoted PS here-string)
+
+**Issue:** Health report showed `SyntaxError: invalid escape sequence '\ '` in the placed-orders probe section. Root cause: `@\${price}` inside a PS double-quoted here-string — PowerShell expands `${price}` as a PS variable (empty, undefined), leaving `@\ ` (backslash + space) in the generated Python file. Python 3.12 raises `SyntaxWarning: invalid escape sequence '\ '`. Same for `@\${px:.2f}` at line 427.
+
+**Fix:** Changed `\$` → `` `$ `` (backtick escapes `$` in PS double-quoted strings, producing literal `$` in output):
+- Line 401: `@\${price}` → `` @`${price} ``
+- Line 427: `@\${px:.2f}` → `` @`${px:.2f} ``
+
+Both produce `@${price}` and `@${px:.2f}` as literal Python text (valid f-string syntax where `$` is a literal char and `{price}`/`{px:.2f}` are Python variables).
+
+Note: `C:\OptionsHistory\bin\Health.ps1` uses an older placed-orders implementation without this pattern — no change needed there.
+
+**Impact:** Placed-orders section in health report no longer shows SyntaxError. The probe generates and runs valid Python, displaying filled order summary with prices.

@@ -398,7 +398,7 @@ def main():
             t_utc = parse_ib_time(t_str) if t_str else None
             ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M") if t_utc else "?"
             rows.append((t_utc or datetime.min.replace(tzinfo=UTC),
-                         f"{ts}  {sym:<6}  {act:<4}  {ot:<3}  @\${price}  [{st}]"))
+                         f"{ts}  {sym:<6}  {act:<4}  {ot:<3}  @`${price}  [{st}]"))
 
         # Part 2: Recent fills from last 48h (covers filled/cancelled orders no longer in openTrades)
         since_str = (datetime.now(UTC) - timedelta(hours=48)).strftime("%Y%m%d-%H:%M:%S")
@@ -424,7 +424,7 @@ def main():
             rt   = getattr(c, "right", "") or ""
             exp_rt = f" {exp} {rt}" if exp else ""
             ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M")
-            rows.append((t_utc, f"{ts}  {sym:<6}{exp_rt:<12}  {act}  fill  @\${px:.2f}"))
+            rows.append((t_utc, f"{ts}  {sym:<6}{exp_rt:<12}  {act}  fill  @`${px:.2f}"))
 
         rows.sort(key=lambda r: r[0], reverse=True)
         rows = rows[:20]

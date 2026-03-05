@@ -2995,6 +2995,8 @@ class DailyCycleManagementMixin:
                 return None
 
         try:
+            ib.reqAllOpenOrders()
+            ib.sleep(1.5)  # Fix BC: allow IB to propagate cross-clientId orders (same as Fix AP)
             trades = ib.openTrades()
             if not trades:
                 LOG.info("RTH cleanup: no open trades to evaluate.")
@@ -3186,6 +3188,8 @@ class DailyCycleManagementMixin:
 
         cancelled = 0
         try:
+            ib.reqAllOpenOrders()
+            ib.sleep(1.5)  # Fix BB: allow IB to propagate cross-clientId orders (same as Fix AP)
             trades = ib.openTrades() or []
             if not trades:
                 LOG.info("CSV OI cancel: no open trades.")
