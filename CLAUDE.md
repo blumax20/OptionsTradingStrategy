@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 2, 2026 (Fix AX: Health.ps1 improvements; Fix AY: worthless close guard + AH1 race condition)
+**Last Updated:** March 5, 2026 (Fix BG/BH/BI/BJ/BK: clientId=101 cancel; NameError; BUY-only filter; OI=-1 guard; cancel/write separation)
 
 ---
 
@@ -2450,3 +2450,132 @@ _AttemptLogger.write(
 Uses `reason="low_oi_live"` to distinguish from `_cancel_low_oi_working_orders_from_csv()`'s `"low_oi_both_legs"`.
 
 **Impact:** All low-OI cancellations now appear in the attempts CSV regardless of which path (CSV-based or live-OI) triggered them.
+
+---
+
+### Fix BF: clientId=0 Attempted for Cross-ClientId Cancel (Mar 5)
+**Status:** ✗ DID NOT WORK — superseded by Fix BG
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py`
+
+**Attempt:** Changed both `_rth_liquidity_cleanup()` (clientId=879) and `_cancel_low_oi_working_orders_from_csv()` (clientId=887) to connect with `clientId=0`, which IB API documentation says can cancel orders from any client (TWS 9.80+ "master client"). Still received Error 10147 in paper trading.
+
+**Outcome:** clientId=0 does not grant cross-clientId cancel permissions in IB paper trading (and likely live too). See Fix BG.
+
+---
+
+### Fix BG: clientId=101 for Cross-ClientId Cancel (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup` ~line 2973; `_cancel_low_oi_working_orders_from_csv` ~line 3202)
+
+**Issue:** Low-OI order cancellations failed with Error 10147 ("OrderId that needs to be cancelled is not found"). IB only allows cancelling orders from the same clientId that placed them. All OPEN BUY orders are placed by PlaceAnOrder.py which uses `clientId=101`. Both cancel functions were using different clientIds (879, 887, then 0 via Fix BF) — none of which placed the orders.
+
+**Fix:** Changed both cancel function connections to use `clientId=101`:
+```python
+ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
+```
+
+**Safety:** The cleanup runs at 9:45 AM. PlaceAnOrder's 5 PM batch finished ~17 hours earlier. No concurrent clientId=101 session expected. (Risk exit subprocess at 9:45 AM also uses clientId=101 but runs sequentially, not concurrently with the cleanup.)
+
+**Impact:** `ib.cancelOrder(o)` now cancels the correct orders — IB recognizes clientId=101 as the placing client and accepts the cancel.
+
+---
+
+### Fix BH: `_AttemptLogger.write()` NameError — Redundant Local `datetime` Import (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_AttemptLogger.write()`, ~line 84)
+
+**Issue:** `_AttemptLogger.write()` threw `NameError: cannot access local variable 'datetime' where it is not associated with a value` when called from `_rth_liquidity_cleanup()`. The error occurred on line 60: `datetime.now(NY).isoformat()`.
+
+**Root cause:** Python's scoping rules: when a function contains ANY assignment to a variable name, Python's compiler treats ALL references to that name as local to the function. Inside `write()`, the nested `try` block at line 84 had `from datetime import datetime` — a local import/assignment. This made Python treat `datetime` as local throughout `write()`. At line 60 (before the assignment at line 84), the local `datetime` was unbound → NameError.
+
+Note: `datetime` IS imported at module level (`from datetime import datetime` at line 3). The redundant local import was unnecessary.
+
+**Fix:** Removed `from datetime import datetime` from inside `write()`'s nested try block. Added comment: `# datetime already imported at module level`.
+
+**Impact:** `_AttemptLogger.write()` no longer throws NameError when called from any DCM function. All low-OI cancellations write to the attempts CSV correctly.
+
+---
+
+### Fix BI: Separate `_AttemptLogger.write()` from `cancelOrder` try/except (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup`, cancel block ~line 3059)
+
+**Issue:** The `_AttemptLogger.write()` call (Fix BE) was inside the same `try/except` as `ib.cancelOrder(o)`. If the write failed, the except block logged `"RTH cleanup: failed to cancel order for X"` — misleading, since the cancel DID succeed and the logging was what failed.
+
+**Fix:** Moved `_AttemptLogger.write()` outside the cancel try/except. Added `continue` in the cancel's except block (so a cancel failure skips the write). Wrapped the write in its own `try/except _be_err` that logs `"attempts CSV write failed"` separately.
+
+**Structure after fix:**
+```python
+try:
+    ib.cancelOrder(o)
+    cancelled += 1
+    LOG.info("RTH cleanup: cancelled ...")
+except Exception as e:
+    LOG.warning("RTH cleanup: failed to cancel order ...")
+    continue  # skip write if cancel failed
+# Fix BE/BI: log to attempts CSV outside the cancel try/except
+try:
+    _AttemptLogger.write(...)
+except Exception as _be_err:
+    LOG.warning("RTH cleanup: attempts CSV write failed ...")
+```
+
+**Impact:** Cancel failures and write failures are independently logged. Cancel success is not masked by write errors.
+
+---
+
+### Fix BJ: `_rth_liquidity_cleanup()` — BUY-Only Filter (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup`, ~line 3018)
+
+**Issue:** `_rth_liquidity_cleanup()` evaluated ALL BAG combo orders for OI cancellation regardless of `order.action`. This caused SELL BAG orders (close orders placed by risk exits) to be cancelled when their legs had low OI. The live-OI path lacked the BUY filter that already existed in `_cancel_low_oi_working_orders_from_csv()` (lines 3240-3242).
+
+Evidence: PBR and T SELL close orders placed at 9:47 AM by risk exits were cancelled by the cleanup at 11:27 AM.
+
+**Fix:** Added `if (getattr(o, 'action', '') or '').upper() != 'BUY': continue` immediately after the BAG type check:
+```python
+# Only consider active, unfilled COMBO (BAG) BUY orders.
+# SELL BAGs are close orders — must NOT be cancelled here.
+if getattr(c, 'secType', '') != 'BAG':
+    continue
+if (getattr(o, 'action', '') or '').upper() != 'BUY':
+    continue
+```
+
+**Impact:** SELL BAG (close) orders are never cancelled by `_rth_liquidity_cleanup()`. Only BUY (open) orders with low OI are cancelled. Consistent with `_cancel_low_oi_working_orders_from_csv()`'s behavior.
+
+---
+
+### Fix BK: `_rth_liquidity_cleanup()` — OI=-1 Conservative Guard (Mar 5)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_rth_liquidity_cleanup`, ~line 3058)
+
+**Issue:** When IB's `reqMktData` couldn't return OI data (e.g., timing issue, Error 10091), `_live_oi()` returned `None` which was stored as `-1`. The old cancel condition:
+```python
+leg1_ok = oi_values[0] is not None and oi_values[0] > MIN_OI_FOR_RTH
+if not (leg1_ok or leg2_ok):  # cancel if neither leg meets threshold
+```
+`-1 is not None` is `True`, `-1 > 100` is `False` → `leg1_ok = False`. If BOTH legs returned -1 (no data), BOTH were treated as low-OI → order cancelled incorrectly. BG 115/120 CALL April 17 was cancelled this way.
+
+**Fix:** Added explicit known-data check before the threshold evaluation:
+```python
+# Cancel only if we have actual OI data for BOTH legs and BOTH are below threshold.
+# OI=-1 means IB returned no data — treat as unknown, do NOT cancel (conservative).
+leg1_known = oi_values[0] != -1
+leg2_known = oi_values[1] != -1
+if not (leg1_known and leg2_known):
+    LOG.info("RTH cleanup: skipping %s — OI data unavailable (OI=%s); not cancelling.", sym, oi_values)
+    continue
+leg1_ok = oi_values[0] > MIN_OI_FOR_RTH
+leg2_ok = oi_values[1] > MIN_OI_FOR_RTH
+if not (leg1_ok or leg2_ok):
+    # cancel
+```
+
+**Impact:** Orders for which IB cannot return OI data are conservatively kept (not cancelled). Only orders where BOTH legs have confirmed OI data showing both below threshold are cancelled. Consistent with `_cancel_low_oi_working_orders_from_csv()`'s `if oi_atm is None or oi_oth is None: continue` guard.

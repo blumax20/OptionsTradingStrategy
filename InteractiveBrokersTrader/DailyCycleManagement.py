@@ -81,9 +81,7 @@ class _AttemptLogger:
 
         # Additionally, write to today's dated folder under C:\OptionsHistory\<yy_mm_dd>\attempts_<yy_mm_dd>.csv
         try:
-            from datetime import datetime
-            import sys
-            # Get today's New York date
+            # Get today's New York date (datetime already imported at module level)
             ny_now = datetime.now(NY)
             folder = ny_now.strftime("%y_%m_%d")
             root = fr"C:\OptionsHistory\{folder}" if sys.platform.startswith("win") else f"./{folder}"
@@ -2965,9 +2963,14 @@ class DailyCycleManagementMixin:
             return
 
         # Connect to IB and inspect open trades
+        # Fix BG: use clientId=101 (same as PlaceAnOrder.py) so cancelOrder works.
+        # IB only allows cancelling orders from the same clientId that placed them.
+        # clientId=0 ("master client") was tried but does NOT work in paper trading.
+        # All OPEN BUY orders are placed by PlaceAnOrder.py which uses clientId=101.
+        # The cleanup runs at 9:45 AM; PlaceAnOrder's 5 PM batch finished hours earlier.
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=879, timeout=6)
+            ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
         except Exception as e:
             LOG.warning("RTH cleanup: could not connect to IB: %s", e)
             return
@@ -3008,8 +3011,11 @@ class DailyCycleManagementMixin:
                 s = tr.orderStatus
                 o = tr.order
 
-                # Only consider active, unfilled COMBO (BAG) orders
+                # Only consider active, unfilled COMBO (BAG) BUY orders.
+                # SELL BAGs are close orders — must NOT be cancelled here.
                 if getattr(c, 'secType', '') != 'BAG':
+                    continue
+                if (getattr(o, 'action', '') or '').upper() != 'BUY':
                     continue
                 status = (getattr(s, 'status', '') or '').lower()
                 if status in ('filled', 'cancelled', 'apicancelled'):
@@ -3049,9 +3055,16 @@ class DailyCycleManagementMixin:
                     oi = _live_oi(oc)
                     oi_values.append(oi if oi is not None else -1)
 
-                # If BOTH legs have OI <= threshold (or unknown), cancel
-                leg1_ok = oi_values[0] is not None and oi_values[0] > MIN_OI_FOR_RTH
-                leg2_ok = oi_values[1] is not None and oi_values[1] > MIN_OI_FOR_RTH
+                # Cancel only if we have actual OI data for BOTH legs and BOTH are below threshold.
+                # OI=-1 means IB returned no data — treat as unknown, do NOT cancel (conservative).
+                # If either leg has OI > threshold, keep the order.
+                leg1_known = oi_values[0] != -1
+                leg2_known = oi_values[1] != -1
+                if not (leg1_known and leg2_known):
+                    LOG.info("RTH cleanup: skipping %s — OI data unavailable (OI=%s); not cancelling.", sym, oi_values)
+                    continue
+                leg1_ok = oi_values[0] > MIN_OI_FOR_RTH
+                leg2_ok = oi_values[1] > MIN_OI_FOR_RTH
                 if not (leg1_ok or leg2_ok):
                     try:
                         ib.cancelOrder(o)
@@ -3060,10 +3073,14 @@ class DailyCycleManagementMixin:
                         net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
                         LOG.info("RTH cleanup: cancelled low-OI order %s %s %s strikes=%s OI=%s (threshold>%d) spread=%s",
                                  sym, exp, right, strikes, oi_values, MIN_OI_FOR_RTH, net)
-                        # Fix BE: log to attempts CSV (same as _cancel_low_oi_working_orders_from_csv)
-                        _r = (right or "").upper()
-                        _atm = str(strikes[1] if _r == "P" else strikes[0])
-                        _oth = str(strikes[0] if _r == "P" else strikes[1])
+                    except Exception as e:
+                        LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
+                        continue
+                    # Fix BE: log to attempts CSV outside the cancel try/except (separate concerns)
+                    _r = (right or "").upper()
+                    _atm = str(strikes[1] if _r == "P" else strikes[0])
+                    _oth = str(strikes[0] if _r == "P" else strikes[1])
+                    try:
                         _AttemptLogger.write(
                             symbol=sym,
                             action="cancel_open",
@@ -3074,8 +3091,8 @@ class DailyCycleManagementMixin:
                             atm=_atm,
                             oth=_oth,
                         )
-                    except Exception as e:
-                        LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
+                    except Exception as _be_err:
+                        LOG.warning("RTH cleanup: attempts CSV write failed for %s: %s", sym, _be_err)
             LOG.info("RTH cleanup completed. Cancelled %d low-liquidity open order(s).", cancelled)
         finally:
             try:
@@ -3195,7 +3212,8 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=887, timeout=6)
+            # Fix BG: use clientId=101 (same as PlaceAnOrder.py) so cancelOrder works.
+            ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
         except Exception as e:
             LOG.warning("CSV OI cancel: could not connect to IB: %s", e)
             return
