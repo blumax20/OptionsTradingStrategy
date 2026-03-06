@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 6, 2026 (Fix BQ reverted — original bid-ask was correct; Fix BP: preclose always join; Fix BN-3/BO/BO2)
+**Last Updated:** March 6, 2026 (Fix BS: Error 201 async rejection detection in individual leg orders)
 
 ---
 
@@ -2752,3 +2752,34 @@ if context == "preclose":
 **Fix:** Changed `clientId=886` → `clientId=101`. Safe because `_cancel_symbol_close_orders()` is only called from preclose (sequential), disconnects before PlaceAnOrder subprocess starts.
 
 **Impact:** IB accepts the cancel from the placing clientId. Combined with Fix BO polling, the next PlaceAnOrder run sees cleared orders and places the replacement at live prices.
+
+---
+
+### Fix BR: Low-OI Cancel — Allow Cancellation When One Leg OI Is Known-Low + Other Is Unknown (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_low_oi_working_orders_from_csv` ~line 3342; `_rth_liquidity_cleanup` ~line 3058)
+
+**Issue:** ROST CALL_OPEN (215/220C, April 2) was placed March 5 with `oi_atm=22` (< 100) but `oi_oth=empty` (listener's except path returned `otm_strike=None` → LiquidityFilter couldn't fetch OTM OI). Both cancellation paths required BOTH legs to have non-None OI — when `oi_oth` was unknown, the order was kept.
+
+**Fix:** Changed both guards from AND to OR logic — skip only when ALL OI is missing; cancel when no leg has confirmed-good OI (≥ 100) and at least one has confirmed-low OI:
+- CSV path: `if oi_atm is None or oi_oth is None:` → `if oi_atm is None and oi_oth is None:`
+- Live path: `if not (leg1_known and leg2_known):` → `if not leg1_known and not leg2_known:`
+- Added `leg1_ok/leg2_ok` check: skip (keep) if any leg has confirmed-good OI
+
+**Impact:** ROST-type orders (one leg known-low, other unknown) are now cancelled. Fix BK's both-unknown protection is preserved.
+
+---
+
+### Fix BS: Detect IB Error 201 Async Rejection in Individual Leg Orders (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (6 individual leg placement sites)
+
+**Issue:** BK CALL 130/135 (March 20) — `both_worthless` path placed SELL 130C + BUY 135C at 17:05 after hours. IB returned Error 201 "You are not able to submit this order because you do not have trading permissions for this options strategy" for the SELL, arriving ~0.6s after "PreSubmitted" status. `_await_working()` returned True (saw PreSubmitted at ~0.1s, returned before Error 201 arrived). Attempts CSV logged `"placed"` for the rejected SELL; `legs_closed += 1` was incremented; user saw BUY 135C pending in TWS but no SELL 130C.
+
+**Why after hours only:** During RTH, IB verifies the long 130C covers the SELL (covered write = L2 permission). After market close, IB's risk engine applies per-order checks without position context.
+
+**Fix:** After each `_await_working()` returns True at all 6 individual leg placement sites, add `ib.sleep(1.0)` + check `trade.log` for "Order rejected"/"trading permissions". If detected: `ok=False`, `why="bs_rejected"`, WARNING logged. Also gated `legs_closed`/`submitted`/`CLOSE_SEEN_KEYS` on `ok=True`.
+
+**Impact:** Rejected SELL logs `close_individual_leg,error,bs_rejected` (not `placed`). On next RTH run (9:45 AM), AH2 finds no working SELL (Cancelled ≠ working) → retries successfully during RTH where covered SELL is accepted.
