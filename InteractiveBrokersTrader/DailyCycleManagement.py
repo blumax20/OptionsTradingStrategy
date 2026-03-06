@@ -560,10 +560,15 @@ class DailyCycleManagementMixin:
             # Stage 2: Force-close with live pricing.
             # For preclose: always (first and only attempt — live join + MKT fallback fills at 3 PM).
             # For non-preclose: fallback when Stage 1 failed.
-            scheme = self._determine_live_close_scheme_for_symbol(sym)
+            # Fix BP: For preclose, always use 'join' scheme (aggressive pricing to fill before 4 PM close).
+            # _determine_live_close_scheme_for_symbol() uses reqExecutions() which fails after IBGateway
+            # restart (same root cause as Fix X3). At 3 PM all positions need aggressive pricing — 'mid'
+            # is too conservative with only ~55 minutes until market close.
             if context == "preclose":
-                LOG.info(f"[{sym}] Stage 2 (live pricing): context=preclose, scheme={scheme}")
+                scheme = "join"
+                LOG.info(f"[{sym}] Stage 2 (live pricing): context=preclose, scheme=join (Fix BP: forced)")
             else:
+                scheme = self._determine_live_close_scheme_for_symbol(sym)
                 LOG.warning(f"[{sym}] Stage 1 failed to create working order - falling back to Stage 2 (force-close with '{scheme}' scheme)")
             try:
                 self._attempt(
@@ -596,7 +601,7 @@ class DailyCycleManagementMixin:
                         symbol=sym,
                         action="close",
                         status="submitted",
-                        reason=f"{context}_delegated_live_mid_working",
+                        reason=f"{context}_delegated_live_{scheme}_working",
                         source=f"dcm-{context}",
                     )
                 except Exception:

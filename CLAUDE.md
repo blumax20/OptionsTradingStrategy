@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 6, 2026 (Fix BN-3: Attempts CSV schema unified; Fix BO/BO2: Preclose cancel race condition fixed)
+**Last Updated:** March 6, 2026 (Fix BP: Preclose always uses join pricing; Fix BN-3/BO/BO2: Attempts CSV schema + cancel race condition)
 
 ---
 
@@ -2633,6 +2633,30 @@ if (getattr(o, 'action', '') or '').upper() != 'SELL':
 ```
 
 **Impact:** Symbols with only working BUY (open) orders no longer appear as preclose close candidates. BG correctly excluded from preclose.
+
+---
+
+### Fix BP: Preclose Always Uses "join" Scheme (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_submit_close_shared`, ~line 563)
+
+**Issue:** On March 6, preclose used "mid" pricing instead of "join" pricing for CP, CTVA, O. Orders placed at 15:00 with mid pricing did not fill immediately — required 3 retry cycles before filling at 15:33 (33-minute delay).
+
+**Root cause:** `_submit_close_shared()` called `_determine_live_close_scheme_for_symbol()` for all contexts including preclose. That function uses `_get_position_open_date()` which calls `reqExecutions()`. IB clears execution history on TWS restart (same root cause as Fix X3). When `reqExecutions()` returns empty, falls into `"unknown age → use 'mid'"` branch — silently overriding the intended "join" for preclose.
+
+**Fix:** For `context == "preclose"`, hardcode `scheme = "join"` and skip `_determine_live_close_scheme_for_symbol()`:
+```python
+if context == "preclose":
+    scheme = "join"  # Fix BP: always join at 3 PM
+else:
+    scheme = self._determine_live_close_scheme_for_symbol(sym)
+```
+Also updated post-check log reason from hardcoded `delegated_live_mid_working` → `delegated_live_{scheme}_working`.
+
+**Why join is correct for preclose:** At 3 PM, ~55 minutes remain until market close. Positions reaching preclose have already failed to fill all day at conservative prices. "join" catches the current best bid. `--allow-market-fallback` escalates to MKT if join also fails. There is no scenario at 3 PM where "mid" is preferable to "join".
+
+**Impact:** Preclose now consistently uses join pricing. Orders should fill within the first placement attempt instead of requiring multiple retry cycles.
 
 ---
 
