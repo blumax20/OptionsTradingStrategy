@@ -57,18 +57,27 @@ class _AttemptLogger:
     def write(cls, **kw):
         path = cls.path()
         row = {
-            "ts":     kw.get("ts") or datetime.now(NY).isoformat(),
-            "symbol": kw.get("symbol", ""),
-            "action": kw.get("action", ""),     # e.g., close / hold / noop
-            "status": kw.get("status", ""),     # submitted / skipped / placed
-            "reason": kw.get("reason", ""),     # reconcile_mismatch / reconcile_close_signal / ...
-            "exp":    kw.get("exp", ""),
-            "right":  kw.get("right", ""),
-            "atm":    kw.get("atm", ""),
-            "oth":    kw.get("oth", ""),
-            "limit":  kw.get("limit", ""),
-            "source": kw.get("source", "dcm"),
-            "uid":    kw.get("uid", str(uuid.uuid4())[:8]),
+            "ts":           kw.get("ts") or datetime.now(NY).isoformat(),
+            "symbol":       kw.get("symbol", ""),
+            "action":       kw.get("action", ""),     # e.g., close / hold / noop
+            "status":       kw.get("status", ""),     # submitted / skipped / placed
+            "reason":       kw.get("reason", ""),     # reconcile_mismatch / reconcile_close_signal / ...
+            "exp":          kw.get("exp", ""),
+            "right":        kw.get("right", ""),
+            "atm":          kw.get("atm", ""),
+            "oth":          kw.get("oth", ""),
+            "limit":        kw.get("limit", ""),
+            # Fix BN-3: expanded schema — matches PlaceAnOrder ATTEMPT_FIELDS so that
+            # when PlaceAnOrder appends to this file it can write longK/shortK/close_reason
+            # instead of having them silently dropped by extrasaction="ignore".
+            "longK":        kw.get("longK", ""),
+            "shortK":       kw.get("shortK", ""),
+            "order_type":   kw.get("order_type", ""),
+            "order_action": kw.get("order_action", ""),
+            "qty":          kw.get("qty", ""),
+            "close_reason": kw.get("close_reason", ""),
+            "source":       kw.get("source", "dcm"),
+            "uid":          kw.get("uid", str(uuid.uuid4())[:8]),
         }
         hdr = list(row.keys())
         # Write to primary log file (logs folder or wherever _active_path points)
@@ -364,7 +373,11 @@ class DailyCycleManagementMixin:
 
         ib = IB()
         try:
-            ib.connect(IB_HOST, IB_PORT, clientId=886, timeout=6)
+            # Fix BO2: Use clientId=101 — same clientId that PlaceAnOrder uses to place orders.
+            # IB only allows the placing clientId to cancel orders.  The old clientId=886 caused
+            # cancelOrder() to silently fail (no exception, but IB rejected the cancel),
+            # leaving the order active and blocking the replacement order via the close guard.
+            ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
         except Exception:
             return 0
 
@@ -372,7 +385,7 @@ class DailyCycleManagementMixin:
             # Refresh local view of open orders/trades from ALL client IDs
             try:
                 ib.reqAllOpenOrders()  # Fix U1: was reqOpenOrders() - need ALL client IDs
-                ib.sleep(0.5)
+                ib.sleep(1.5)  # Fix BO: was 0.5 — allow cross-clientId order propagation (matches Fix AP/BB/BC/AR)
             except Exception:
                 pass
 
@@ -429,6 +442,33 @@ class DailyCycleManagementMixin:
                             )
                 except Exception:
                     continue
+
+            # Fix BO: After sending cancels, poll until IB confirms the orders are gone.
+            # Without this, PlaceAnOrder's close guard starts ~3s after the cancel request and
+            # still sees the order as active (IB propagation lag), blocking the replacement order.
+            if n_cancel > 0:
+                import time as _time_bo
+                _deadline = _time_bo.monotonic() + 10.0
+                while _time_bo.monotonic() < _deadline:
+                    ib.sleep(0.5)
+                    try:
+                        ib.reqAllOpenOrders()
+                        ib.sleep(0.3)
+                    except Exception:
+                        pass
+                    still_active = [
+                        tr for tr in (ib.openTrades() or [])
+                        if getattr(getattr(tr, "contract", None), "secType", "") == "BAG"
+                        and (getattr(getattr(tr, "contract", None), "symbol", "") or "").upper() == sym_u
+                        and (getattr(getattr(tr, "order", None), "action", "") or "").upper() == "SELL"
+                        and (getattr(getattr(tr, "orderStatus", None), "status", "") or "") in
+                            ("PreSubmitted", "Submitted", "PendingSubmit", "ApiPending", "Inactive")
+                    ]
+                    if not still_active:
+                        LOG.info("[%s] Fix BO: Cancel confirmed — SELL BAG orders gone", sym_u)
+                        break
+                else:
+                    LOG.warning("[%s] Fix BO: Timeout waiting for cancel confirmation — proceeding anyway", sym_u)
 
             return n_cancel
         finally:
@@ -2882,6 +2922,7 @@ class DailyCycleManagementMixin:
                         atm=strike_low,
                         oth=strike_high,
                         source="dcm-risk-exit",
+                        close_reason=reason,       # Fix BN-3: STOP/TP reason in its own column
                     )
                 except Exception:
                     # Best-effort; don't block risk exits if attempts logging fails

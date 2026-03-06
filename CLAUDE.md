@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 5, 2026 (Fix BN-1/BN-2: Preclose uses live join pricing; BUY-order false candidate fixed)
+**Last Updated:** March 6, 2026 (Fix BN-3: Attempts CSV schema unified; Fix BO/BO2: Preclose cancel race condition fixed)
 
 ---
 
@@ -2672,3 +2672,44 @@ if context == "preclose":
 - Stop-loss/TP exits (T, PBR, O, CP): join current bid → fill before 4 PM
 - MKT fallback available as last resort if bid=0 and not worthless
 - Non-preclose flows (after-hours reconcile) unchanged — still use Stage 1 CSV first
+
+---
+
+### Fix BN-3: Attempts CSV Schema Unified — PlaceAnOrder Fields No Longer Dropped (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_AttemptLogger.write()`, ~line 59); risk exit `_AttemptLogger.write()` call (~line 2884)
+
+**Issue:** DCM created the attempts CSV with a 12-column schema (`ts, symbol, action, status, reason, exp, right, atm, oth, limit, source, uid`). PlaceAnOrder's `_attempts_append()` reads the existing header and uses `extrasaction="ignore"`, silently dropping all PlaceAnOrder-specific fields: `longK`, `shortK`, `order_type`, `order_action`, `qty`, `close_reason`. Fix Z5's `--close-reason` (STOP/TP reason) was never actually appearing in the CSV because of this schema mismatch.
+
+**Fix:** Expanded `_AttemptLogger.write()` row dict to include all PlaceAnOrder ATTEMPT_FIELDS columns (defaulting to `""`). New 18-column canonical schema: `ts, symbol, action, status, reason, exp, right, atm, oth, limit, longK, shortK, order_type, order_action, qty, close_reason, source, uid`. Added `close_reason=reason` to the risk exit `queued` entry so the STOP/TP trigger appears in its own column.
+
+**Impact:** PlaceAnOrder `force_close,placed,success` entries now include `longK`, `shortK`, `order_type`, `order_action`, `limit`, and `close_reason` in the CSV. Risk exit `queued` entries show `close_reason` in its own column (not just embedded in `reason`).
+
+---
+
+### Fix BO: Preclose Cancel Race Condition — Poll Until Cancelled (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_symbol_close_orders()`, ~line 384)
+
+**Issue:** On March 6, the 3 PM preclose cancelled existing close orders for CP, CTVA, O but then failed to place new orders at live prices. Attempts CSV showed `close_call,skipped,existing_working_close` + `force_close,error,place_failed_positions` for all three, then `preclose_delegated_live_mid_working` (false success). Root cause: `_cancel_symbol_close_orders()` sent `ib.cancelOrder()` and returned immediately — no waiting for IB confirmation. PlaceAnOrder's close guard started ~3 seconds later, still saw the old orders (IB cancellation not yet propagated), and blocked new placement. DCM's post-check found the stale order and logged false success.
+
+**Fix 1 (polling):** After sending all cancel requests, poll `ib.openTrades()` in a loop (up to 10 seconds) until no active SELL BAG orders remain for the symbol. Same pattern as Fix AY1.
+
+**Fix 2 (initial sleep):** Increased `ib.reqAllOpenOrders()` sleep from 0.5s → 1.5s (matches Fix AP/BB/BC/AR pattern).
+
+**Impact:** `_cancel_symbol_close_orders()` only returns after IB confirms the cancellation. PlaceAnOrder's close guard finds nothing → replacement order placed at live prices.
+
+---
+
+### Fix BO2: `_cancel_symbol_close_orders()` Must Use clientId=101 (Mar 6)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_symbol_close_orders()`, ~line 376)
+
+**Issue:** Same root cause as Fix BG (low-OI cleanup). `_cancel_symbol_close_orders()` connected with `clientId=886`, but all close orders are placed by PlaceAnOrder using `clientId=101`. IB only allows the placing clientId to cancel orders. The `ib.cancelOrder()` call didn't throw an exception (ib_insync is async), so DCM logged "cancelled" — but IB silently rejected the cancel. Orders remained active. Confirmed on March 6: CP/CTVA/O orders were in `PendingCancel` status when manually inspected with clientId=101, indicating IB had queued the cancel from clientId=886 but not processed it as authoritative.
+
+**Fix:** Changed `clientId=886` → `clientId=101`. Safe because `_cancel_symbol_close_orders()` is only called from preclose (sequential), disconnects before PlaceAnOrder subprocess starts.
+
+**Impact:** IB accepts the cancel from the placing clientId. Combined with Fix BO polling, the next PlaceAnOrder run sees cleared orders and places the replacement at live prices.
