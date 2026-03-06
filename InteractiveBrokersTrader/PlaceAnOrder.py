@@ -2329,12 +2329,24 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
+                        # Fix BS: check for async Error 201 rejection
+                        if ok_leg:
+                            ib.sleep(1.0)
+                            for _bs_le in getattr(trade_leg, "log", []) or []:
+                                _bs_msg = getattr(_bs_le, "message", "") or ""
+                                if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                    ok_leg = False
+                                    why_leg = "bs_rejected"
+                                    logger.warning("[%s] Fix BS: SELL %s rejected async (Error 201): %s",
+                                                   symbol, longK, _bs_msg[:120])
+                                    break
                         logger.info(f"[{symbol}] Fallback worthless long leg status: ok={ok_leg}, reason={why_leg}")
-                        legs_closed += 1
-                        submitted += 1
-                        CLOSE_SEEN_KEYS.add(ckey)
-                        logger.info(f"[{symbol}] Fallback: closed worthless LONG {right} {longK} exp {exp} (SELL {qty_leg} @ $0.01)")
-                        record_attempt(symbol, "close_individual_leg", "placed",
+                        if ok_leg:
+                            legs_closed += 1
+                            submitted += 1
+                            CLOSE_SEEN_KEYS.add(ckey)
+                            logger.info(f"[{symbol}] Fallback: closed worthless LONG {right} {longK} exp {exp} (SELL {qty_leg} @ $0.01)")
+                        record_attempt(symbol, "close_individual_leg", "placed" if ok_leg else "error",
                                      "both_worthless_combo_failed_fallback",
                                      exp=str(exp), right=right, longK=float(longK),
                                      limit=0.01, qty=qty_leg, order_action="SELL", leg_type="long")
@@ -2348,11 +2360,23 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
+                        # Fix BS: check for async rejection (BUY rarely rejected, for symmetry)
+                        if ok_leg:
+                            ib.sleep(1.0)
+                            for _bs_le in getattr(trade_leg, "log", []) or []:
+                                _bs_msg = getattr(_bs_le, "message", "") or ""
+                                if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                    ok_leg = False
+                                    why_leg = "bs_rejected"
+                                    logger.warning("[%s] Fix BS: BUY %s rejected async (Error 201): %s",
+                                                   symbol, shortK, _bs_msg[:120])
+                                    break
                         logger.info(f"[{symbol}] Fallback worthless short leg status: ok={ok_leg}, reason={why_leg}")
-                        legs_closed += 1
-                        submitted += 1
-                        logger.info(f"[{symbol}] Fallback: closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty_leg} @ $0.05)")
-                        record_attempt(symbol, "close_individual_leg", "placed",
+                        if ok_leg:
+                            legs_closed += 1
+                            submitted += 1
+                            logger.info(f"[{symbol}] Fallback: closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty_leg} @ $0.05)")
+                        record_attempt(symbol, "close_individual_leg", "placed" if ok_leg else "error",
                                      "both_worthless_combo_failed_fallback",
                                      exp=str(exp), right=right, shortK=float(shortK),
                                      limit=0.05, qty=qty_leg, order_action="BUY", leg_type="short")
@@ -2482,19 +2506,30 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             long_opt_to_close.exchange = "SMART"
                         trade = ib.placeOrder(long_opt_to_close, leg_order)
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        # Fix BS: check for async Error 201 rejection (affects SELL of individual legs)
+                        if ok:
+                            ib.sleep(1.0)
+                            for _bs_le in getattr(trade, "log", []) or []:
+                                _bs_msg = getattr(_bs_le, "message", "") or ""
+                                if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                    ok = False
+                                    why = "bs_rejected"
+                                    logger.warning("[%s] Fix BS: %s %s rejected async (Error 201): %s",
+                                                   symbol, leg_action, longK, _bs_msg[:120])
+                                    break
                         logger.info(f"[{symbol}] Individual long leg order status: ok={ok}, reason={why}")
-                        legs_closed += 1
-                        submitted += 1
-
-                        logger.info(
-                            f"[{symbol}] Closed individual LONG {right} {longK} exp {exp} "
-                            f"({leg_action} {abs(long_qty):.0f} @ ${long_value:.2f})"
-                        )
+                        if ok:
+                            legs_closed += 1
+                            submitted += 1
+                            logger.info(
+                                f"[{symbol}] Closed individual LONG {right} {longK} exp {exp} "
+                                f"({leg_action} {abs(long_qty):.0f} @ ${long_value:.2f})"
+                            )
 
                         record_attempt(
                             symbol,
                             "close_individual_leg",
-                            "placed",
+                            "placed" if ok else "error",
                             "worthless_leg_fallback",
                             exp=str(exp),
                             right=right,
@@ -2534,19 +2569,30 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             short_opt_to_close.exchange = "SMART"
                         trade = ib.placeOrder(short_opt_to_close, leg_order)
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                        # Fix BS: check for async Error 201 rejection
+                        if ok:
+                            ib.sleep(1.0)
+                            for _bs_le in getattr(trade, "log", []) or []:
+                                _bs_msg = getattr(_bs_le, "message", "") or ""
+                                if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                    ok = False
+                                    why = "bs_rejected"
+                                    logger.warning("[%s] Fix BS: %s %s rejected async (Error 201): %s",
+                                                   symbol, leg_action, shortK, _bs_msg[:120])
+                                    break
                         logger.info(f"[{symbol}] Individual short leg order status: ok={ok}, reason={why}")
-                        legs_closed += 1
-                        submitted += 1
-
-                        logger.info(
-                            f"[{symbol}] Closed individual SHORT {right} {shortK} exp {exp} "
-                            f"({leg_action} {abs(short_qty):.0f} @ ${short_value:.2f})"
-                        )
+                        if ok:
+                            legs_closed += 1
+                            submitted += 1
+                            logger.info(
+                                f"[{symbol}] Closed individual SHORT {right} {shortK} exp {exp} "
+                                f"({leg_action} {abs(short_qty):.0f} @ ${short_value:.2f})"
+                            )
 
                         record_attempt(
                             symbol,
                             "close_individual_leg",
-                            "placed",
+                            "placed" if ok else "error",
                             "worthless_leg_fallback",
                             exp=str(exp),
                             right=right,
@@ -2665,11 +2711,26 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                                 c.exchange = "SMART"
                             trade = ib.placeOrder(c, leg_order)
                             ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                            # Fix BS: brief extra wait to catch async IB rejection (Error 201 arrives
+                            # ~0.6s after PreSubmitted — after _await_working already returned True).
+                            # After hours, IB rejects individual option SELLs without "selling
+                            # individual options" permission even when long position covers the sell.
+                            if ok:
+                                ib.sleep(1.0)
+                                for _bs_le in getattr(trade, "log", []) or []:
+                                    _bs_msg = getattr(_bs_le, "message", "") or ""
+                                    if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                        ok = False
+                                        why = "bs_rejected"
+                                        logger.warning("[%s] Fix BS: SELL %s rejected async (Error 201): %s",
+                                                       symbol, longK, _bs_msg[:120])
+                                        break
                             logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
-                            legs_closed += 1
-                            submitted += 1
-                            CLOSE_SEEN_KEYS.add(ckey)
-                            logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
+                            if ok:
+                                legs_closed += 1
+                                submitted += 1
+                                CLOSE_SEEN_KEYS.add(ckey)
+                                logger.info(f"[{symbol}] Closed worthless LONG {right} {longK} exp {exp} (SELL {qty} @ {price_str})")
                             record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
                                          exp=str(exp), right=right, longK=float(longK),
                                          limit=0.05,
@@ -2690,10 +2751,22 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                                 c.exchange = "SMART"
                             trade = ib.placeOrder(c, leg_order)
                             ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
+                            # Fix BS: check for async rejection (BUY rarely rejected but check for symmetry)
+                            if ok:
+                                ib.sleep(1.0)
+                                for _bs_le in getattr(trade, "log", []) or []:
+                                    _bs_msg = getattr(_bs_le, "message", "") or ""
+                                    if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
+                                        ok = False
+                                        why = "bs_rejected"
+                                        logger.warning("[%s] Fix BS: BUY %s rejected async (Error 201): %s",
+                                                       symbol, shortK, _bs_msg[:120])
+                                        break
                             logger.info(f"[{symbol}] Worthless short leg order status: ok={ok}, reason={why}")
-                            legs_closed += 1
-                            submitted += 1
-                            logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
+                            if ok:
+                                legs_closed += 1
+                                submitted += 1
+                                logger.info(f"[{symbol}] Closed worthless SHORT {right} {shortK} exp {exp} (BUY {qty} @ {price_str})")
                             record_attempt(symbol, "close_individual_leg", "placed" if ok else "error", reason,
                                          exp=str(exp), right=right, shortK=float(shortK),
                                          limit=0.05,
