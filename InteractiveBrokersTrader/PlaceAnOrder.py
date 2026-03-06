@@ -478,7 +478,7 @@ def parse_args():
     p.add_argument("--use-live-open", choices=["off","mid","join"], default="off",
                    help="If not 'off', price OPEN orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = ask(long)-bid(short).")
     p.add_argument("--use-live-close", choices=["off","mid","join"], default="off",
-                   help="If not 'off', price CLOSE orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = bid(long)-ask(short).")
+                   help="If not 'off', price CLOSE orders from live quotes: 'mid' = mid(long)-mid(short), 'join' = bid(long)-bid(short).")
     p.add_argument("--oi-threshold", type=int, default=100,
                    help="Minimum OI required on BOTH legs to allow OPEN orders (applies per --oi-check).")
     p.add_argument("--oi-check", choices=["off","rth","always"], default="rth",
@@ -762,7 +762,7 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
     """
     Compute a live net positive price for the combo using either:
       - scheme='join':  OPEN(BUY):  ask(long) - bid(short)
-                        CLOSE(SELL): bid(long) - ask(short)
+                        CLOSE(SELL): bid(long) - bid(short)  [Fix BQ]
       - scheme='mid' :  OPEN/CLOSE: mid(long) - mid(short)
     Returns a rounded positive float, or None if unavailable.
     """
@@ -786,8 +786,11 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
                         if val > 0:
                             return round(val, 2)
                 else:
-                    if isinstance(L_bid,(int,float)) and isinstance(S_ask,(int,float)) and L_bid is not None and S_ask is not None and not math.isnan(L_bid) and not math.isnan(S_ask) and S_ask > 0 and L_bid >= 0:
-                        val = float(L_bid) - float(S_ask)
+                    # Fix BQ: SELL join = bid(long) - bid(short). This "joins the bid" —
+                    # prices at both legs' bids, giving a higher net vs bid(long)-ask(short)
+                    # which crossed the short leg spread (paying ask instead of bid).
+                    if isinstance(L_bid,(int,float)) and isinstance(S_bid,(int,float)) and L_bid is not None and S_bid is not None and not math.isnan(L_bid) and not math.isnan(S_bid) and L_bid > 0 and S_bid >= 0:
+                        val = float(L_bid) - float(S_bid)
                         if val > 0:
                             return round(val, 2)
             else:
