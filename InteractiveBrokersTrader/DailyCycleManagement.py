@@ -3114,44 +3114,47 @@ class DailyCycleManagementMixin:
                     oi = _live_oi(oc)
                     oi_values.append(oi if oi is not None else -1)
 
-                # Cancel only if we have actual OI data for BOTH legs and BOTH are below threshold.
-                # OI=-1 means IB returned no data — treat as unknown, do NOT cancel (conservative).
-                # If either leg has OI > threshold, keep the order.
+                # Fix BR: skip only when BOTH legs are unknown. When one leg is confirmed
+                # below threshold and none are confirmed above, cancel the order.
+                # OI=-1 means IB returned no data — treat as unknown.
                 leg1_known = oi_values[0] != -1
                 leg2_known = oi_values[1] != -1
-                if not (leg1_known and leg2_known):
-                    LOG.info("RTH cleanup: skipping %s — OI data unavailable (OI=%s); not cancelling.", sym, oi_values)
+                if not leg1_known and not leg2_known:
+                    LOG.info("RTH cleanup: skipping %s — OI data unavailable for both legs (OI=%s); not cancelling.", sym, oi_values)
                     continue
-                leg1_ok = oi_values[0] > MIN_OI_FOR_RTH
-                leg2_ok = oi_values[1] > MIN_OI_FOR_RTH
-                if not (leg1_ok or leg2_ok):
-                    try:
-                        ib.cancelOrder(o)
-                        cancelled += 1
-                        lmt = getattr(o, 'lmtPrice', None)
-                        net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
-                        LOG.info("RTH cleanup: cancelled low-OI order %s %s %s strikes=%s OI=%s (threshold>%d) spread=%s",
-                                 sym, exp, right, strikes, oi_values, MIN_OI_FOR_RTH, net)
-                    except Exception as e:
-                        LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
-                        continue
-                    # Fix BE: log to attempts CSV outside the cancel try/except (separate concerns)
-                    _r = (right or "").upper()
-                    _atm = str(strikes[1] if _r == "P" else strikes[0])
-                    _oth = str(strikes[0] if _r == "P" else strikes[1])
-                    try:
-                        _AttemptLogger.write(
-                            symbol=sym,
-                            action="cancel_open",
-                            status="placed",
-                            reason="low_oi_live",
-                            exp=exp,
-                            right=_r,
-                            atm=_atm,
-                            oth=_oth,
-                        )
-                    except Exception as _be_err:
-                        LOG.warning("RTH cleanup: attempts CSV write failed for %s: %s", sym, _be_err)
+                leg1_ok = leg1_known and oi_values[0] >= MIN_OI_FOR_RTH
+                leg2_ok = leg2_known and oi_values[1] >= MIN_OI_FOR_RTH
+                if leg1_ok or leg2_ok:
+                    # at least one leg has confirmed-good OI — keep order
+                    continue
+                # No leg confirmed good; at least one known-low or unknown (both unknown excluded above).
+                try:
+                    ib.cancelOrder(o)
+                    cancelled += 1
+                    lmt = getattr(o, 'lmtPrice', None)
+                    net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
+                    LOG.info("RTH cleanup: cancelled low-OI order %s %s %s strikes=%s OI=%s (threshold>%d) spread=%s",
+                             sym, exp, right, strikes, oi_values, MIN_OI_FOR_RTH, net)
+                except Exception as e:
+                    LOG.warning("RTH cleanup: failed to cancel order for %s %s %s: %s", sym, exp, right, e)
+                    continue
+                # Fix BE: log to attempts CSV outside the cancel try/except (separate concerns)
+                _r = (right or "").upper()
+                _atm = str(strikes[1] if _r == "P" else strikes[0])
+                _oth = str(strikes[0] if _r == "P" else strikes[1])
+                try:
+                    _AttemptLogger.write(
+                        symbol=sym,
+                        action="cancel_open",
+                        status="placed",
+                        reason="low_oi_live",
+                        exp=exp,
+                        right=_r,
+                        atm=_atm,
+                        oth=_oth,
+                    )
+                except Exception as _be_err:
+                    LOG.warning("RTH cleanup: attempts CSV write failed for %s: %s", sym, _be_err)
             LOG.info("RTH cleanup completed. Cancelled %d low-liquidity open order(s).", cancelled)
         finally:
             try:
@@ -3340,29 +3343,37 @@ class DailyCycleManagementMixin:
                     atm, oth = (min(k1, k2), max(k1, k2))
 
                 oi_atm, oi_oth, src = _find_csv_oi(sym, right, exp, atm, oth)
-                if oi_atm is None or oi_oth is None:
-                    # no CSV OI — do not cancel
+                # Fix BR: skip only when ALL OI data is missing. When one leg is confirmed
+                # below threshold and none are confirmed above, cancel the order.
+                # e.g. oi_atm=22, oi_oth=None → cancel (22<100, nothing confirmed good).
+                if oi_atm is None and oi_oth is None:
+                    # no CSV OI at all — do not cancel
+                    continue
+                _leg1_ok_csv = oi_atm is not None and oi_atm >= threshold
+                _leg2_ok_csv = oi_oth is not None and oi_oth >= threshold
+                if _leg1_ok_csv or _leg2_ok_csv:
+                    # at least one leg has confirmed-good OI — keep order
                     continue
 
-                if oi_atm < threshold and oi_oth < threshold:
-                    try:
-                        ib.cancelOrder(o)
-                        cancelled += 1
-                        LOG.info("CSV OI cancel [%s]: cancelled %s %s %s atm/oth=%s/%s OI=%s/%s<thr(%d)",
-                                 (src or "unknown"), sym, exp, right, atm, oth, oi_atm, oi_oth, threshold)
-                        # Log to attempts CSV
-                        _AttemptLogger.write(
-                            symbol=sym,
-                            action="cancel_open",
-                            status="placed",
-                            reason="low_oi_both_legs",
-                            exp=exp,
-                            right=right,
-                            atm=str(atm),
-                            oth=str(oth),
-                        )
-                    except Exception as e:
-                        LOG.warning("CSV OI cancel: cancel failed for %s %s %s: %s", sym, exp, right, e)
+                # No leg confirmed good; at least one known-low (or unknown with both excluded above).
+                try:
+                    ib.cancelOrder(o)
+                    cancelled += 1
+                    LOG.info("CSV OI cancel [%s]: cancelled %s %s %s atm/oth=%s/%s OI=%s/%s<thr(%d)",
+                             (src or "unknown"), sym, exp, right, atm, oth, oi_atm, oi_oth, threshold)
+                    # Log to attempts CSV
+                    _AttemptLogger.write(
+                        symbol=sym,
+                        action="cancel_open",
+                        status="placed",
+                        reason="low_oi_both_legs",
+                        exp=exp,
+                        right=right,
+                        atm=str(atm),
+                        oth=str(oth),
+                    )
+                except Exception as e:
+                    LOG.warning("CSV OI cancel: cancel failed for %s %s %s: %s", sym, exp, right, e)
 
             LOG.info("CSV OI cancel completed. Cancelled %d low-OI working order(s).", cancelled)
         finally:
