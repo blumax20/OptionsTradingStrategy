@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 6, 2026 (Fix BQ: join SELL uses bid-bid not bid-ask; Fix BP: preclose always join; Fix BN-3/BO/BO2)
+**Last Updated:** March 6, 2026 (Fix BQ reverted — original bid-ask was correct; Fix BP: preclose always join; Fix BN-3/BO/BO2)
 
 ---
 
@@ -2660,28 +2660,18 @@ Also updated post-check log reason from hardcoded `delegated_live_mid_working` �
 
 ---
 
-### Fix BQ: "join" SELL Uses bid(long)-bid(short) Not bid(long)-ask(short) (Mar 6)
-**Status:** ✓ IMPLEMENTED
+### Fix BQ: REVERTED — Original bid(long)-ask(short) Was Correct (Mar 6)
+**Status:** ✗ REVERTED
 
-**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`live_spread_price()`, ~line 788)
+The original `bid(long) - ask(short)` formula for SELL+join is correct and was restored.
 
-**Issue:** The "join" scheme for SELL close orders used `bid(long) - ask(short)`. This uses the **ask** of the short leg, penalizing us by crossing the short leg's spread. For a SELL, "joining the bid" means pricing at the current best bid of the spread, which is approximately `bid(long) - bid(short)`.
+**Why the original is correct:** OPEN join = `ask(long) - bid(short)` (buyer crosses both legs at market). CLOSE join = `bid(long) - ask(short)` (seller crosses both legs at market). Both give maximum fill probability by accepting market prices on both legs. This is the "natural sell price" / combo BID — the lowest a seller would accept at market, so it fills against any buyer bidding above this floor.
 
-**Example (CP CALL 80/82.5):**
-- bid(80C)=$4.00, bid(82.5C)=$1.70, ask(82.5C)=$1.90
-- Old formula: $4.00 - $1.90 = **$2.10** (crosses the short leg spread)
-- New formula: $4.00 - $1.70 = **$2.30** (joins the bid on both legs)
+**Why `bid-bid` and `ask-bid` are wrong for preclose:**
+- `bid(long) - bid(short)` = combo mid ≈ $2.30 — passive on short leg, harder to fill
+- `ask(long) - bid(short)` = combo ASK ≈ $2.50 — passive on both legs, hardest to fill
 
-**Fix:** Changed SELL+join formula from `bid(long) - ask(short)` → `bid(long) - bid(short)`:
-```python
-# Fix BQ: SELL join = bid(long) - bid(short)
-val = float(L_bid) - float(S_bid)
-```
-Also updated guard condition: `S_ask > 0` → `S_bid >= 0`, docstring, and argparse help text.
-
-**Symmetry note:** OPEN BUY join = `ask(long) - bid(short)`. SELL CLOSE join = `bid(long) - bid(short)`. Both use bid on the leg we're "joining", ask only on the leg we're crossing.
-
-**Impact:** Close orders placed at preclose will be priced at the spread bid (not below it). Fills should happen immediately when a buyer is at or above the spread bid price.
+At 3 PM with ~55 minutes to close, fill probability > price optimization. `bid-ask` fills immediately; `ask-bid` may not fill at all.
 
 ---
 
