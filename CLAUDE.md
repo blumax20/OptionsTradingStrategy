@@ -3664,6 +3664,41 @@ sc start CloudflareTunnel >>"%LOG%" 2>&1
 
 ---
 
+### Fix DK: 2FA Prediction Tracking + Post-Weekend Comparison (Mar 21)
+**Status:** ⏳ ASSESSMENT PENDING (Monday March 23, 2026)
+
+**Location:** `C:\OptionsHistory\logs\2fa_predictions.txt` (predictions); `C:\OptionsHistory\bin\Compare2FA.ps1` (comparison script); `C:\OptionsHistory\logs\compare2fa.log` (output); Windows Task Scheduler (`IB_Compare2FA_Once`, runs Mon Mar 23 8 PM)
+
+**Purpose:** Before the weekend (Mar 21–24), write a fixed set of predicted 2FA events so there is a ground truth to compare against after the weekend. After the weekend, run `Compare2FA.ps1` to validate whether predictions matched reality and how long each authentication took.
+
+**Predictions written to `2fa_predictions.txt`:**
+```
+2026-03-22 05:00  IB server daily restart (5 AM) -- FULL 2FA expected (SATURDAY)
+2026-03-22 18:30  ColdRestartTime Sunday 6:30 PM -- FULL 2FA expected (SUNDAY)
+2026-03-23 05:00  IB server daily restart (5 AM) -- FULL 2FA expected (MONDAY, before autorestart kicks in)
+2026-03-23 15:00  Preclose clientId approval dialogs -- APPROVAL DIALOG expected (Mon 3 PM)
+```
+
+**What `Compare2FA.ps1` validates:**
+- Matches each prediction to nearest `FAIL (2FA)` or `RESTART` event in `watchdog.log` (±3 hour window)
+- Shows delta between predicted and actual time
+- Shows authentication duration (FAIL(2FA) → next OK/ONLINE)
+- Checks `ibc_backup\` logs for exact "Second Factor Authentication initiated" timestamps
+
+**`IB_Compare2FA_Once` task:** Runs `Compare2FA.ps1` Mon Mar 23 at 8 PM, writes to `compare2fa.log`. One-time task (not recurring).
+
+**What to look for in comparison output:**
+- Saturday 5 AM: FAIL(2FA) in watchdog.log ✓ (autorestart not yet in effect — first weekend after setting AutoRestartTime=05:45 AM)
+- Sunday 6:30 PM: FAIL(2FA) ✓ (ColdRestartTime always requires 2FA)
+- Monday 5 AM: Should show `OK` at 6:07 AM (no FAIL — 5:45 AM IBC autorestart with autorestart file → auto-login)
+  - If Monday shows FAIL(2FA): autorestart mechanism didn't work → investigate IBC config
+  - If Monday shows OK: autorestart successful → daily 2FA eliminated going forward
+- Monday 3 PM: If approval dialog occurred → add daily 6:00 AM prewarm task (`IB_PrewarmApiConnections_0600`)
+
+**Impact:** First systematic validation of the 2FA reduction changes (AutoRestartTime=05:45 AM + Fix DL/DM). Results determine whether additional fixes (daily prewarm task) are needed.
+
+---
+
 ### Fix DL: Extend 2FA Detection Window 20 min → 90 min (Mar 21)
 **Status:** ✓ IMPLEMENTED
 
