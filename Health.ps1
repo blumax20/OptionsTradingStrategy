@@ -12,7 +12,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_PORT = 7497
 #   Live trading  : $IB_PORT = 7496
-$IB_PORT = 7497
+$IB_PORT = 7496
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
@@ -88,6 +88,7 @@ try {
     '\IB_Open_PlaceMissing_0935',
     '\IB_PreClose_RestartListener_1530',
     '\IB_PreMarket_StartListener',
+    '\IB_PlaceSkippedOpens_1000',    # Fix CP: 10:00 AM retry of skipped OPEN orders
     '\IB_RiskExits_Retry_1030',     # Fix AC1: 10:30 AM risk-exit retry
     '\IB_Watchdog_Every15Min'        # Fix AC1: 15-min IB Gateway watchdog
   )
@@ -97,6 +98,7 @@ try {
     '\IB_AfterHours_PlaceFromWebhook_1700',
     '\IB_ForceClose_MarketOrders_1500',
     '\IB_Open_PlaceMissing_0935',
+    '\IB_PlaceSkippedOpens_1000',    # Fix CP: 10:00 AM retry of skipped OPEN orders
     '\IB_RiskExits_Retry_1030'       # Fix AC1: also calls DCM --risk-exits-only
   )
 
@@ -308,13 +310,14 @@ def main():
     basef = r"C:\OptionsHistory\ytd_baseline.json"
     now   = datetime.now(ZoneInfo("America/New_York"))
     if not os.path.exists(basef):
-        base = {"year": now.year, "netliq": netliq or 0.0, "ts": now.isoformat()}
+        base = {"year": now.year, "acct": acct, "netliq": netliq or 0.0, "ts": now.isoformat()}
         os.makedirs(os.path.dirname(basef), exist_ok=True)
         with open(basef,"w") as fh: json.dump(base, fh)
     else:
         base = json.load(open(basef))
-        if int(base.get("year",0)) != now.year:
-            base = {"year": now.year, "netliq": netliq or 0.0, "ts": now.isoformat()}
+        # Reset if year changed OR account changed (e.g. paper→live switch)
+        if int(base.get("year",0)) != now.year or base.get("acct") != acct:
+            base = {"year": now.year, "acct": acct, "netliq": netliq or 0.0, "ts": now.isoformat()}
             json.dump(base, open(basef,"w"))
 
     if netliq is not None:
@@ -446,10 +449,10 @@ if __name__ == '__main__':
 "@ | Set-Content -Encoding ASCII $tmpPlacedPy
 
 try {
-  $placedOut = & $Py $tmpPlacedPy 2>&1
+  $placedOut = & $Py $tmpPlacedPy 2>$null
   if ($LASTEXITCODE -ne 0) { "placed-orders: ERROR (exit $LASTEXITCODE)" | Tee-Object -FilePath $Report -Append }
   if ($placedOut) {
-    ($placedOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append | Out-Null }
+    ($placedOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append }
   } else {
     "(no output from placed-orders probe)" | Tee-Object -FilePath $Report -Append
   }
@@ -471,48 +474,54 @@ from zoneinfo import ZoneInfo
 NY = ZoneInfo("America/New_York")
 
 def main():
-    ib=IB(); ib.connect('127.0.0.1',$IB_PORT,clientId=897,timeout=6)
-    poss = ib.positions()
+    ib=IB()
+    try:
+        ib.connect('127.0.0.1',$IB_PORT,clientId=897,timeout=6)
+        ib.sleep(1.5)
+        poss = ib.positions()
 
-    # Build verticals: (sym, exp, right) -> {strike: (qty, avgCost)}
-    groups = defaultdict(dict)
-    for p in poss:
-        c = p.contract
-        if getattr(c,"secType","") != "OPT":
-            continue
-        sym   = c.symbol
-        exp   = getattr(c,"lastTradeDateOrContractMonth","")
-        right = getattr(c,"right","")
-        k     = float(getattr(c,"strike",0.0))
-        groups[(sym,exp,right)][k] = (float(p.position or 0.0), float(p.avgCost or 0.0))
-
-    # Print last 50 verticals (by symbol name, no market data)
-    items = sorted(groups.items(), key=lambda kv: kv[0][0])[:50]
-    if not items:
-        print("(no current option positions)"); ib.disconnect(); return
-
-    for (sym,exp,right), legs in items:
-        strikes = sorted(legs.keys())
-        if len([k for k,(q,_) in legs.items() if abs(q)>1e-9]) < 2:
-            # not a 2-leg vertical currently open
-            continue
-        print(f"{sym} {exp} {right} Vertical (positions)")
-        for k in strikes:
-            q, avg = legs[k]
-            if abs(q) < 1e-9: 
+        # Build verticals: (sym, exp, right) -> {strike: (qty, avgCost)}
+        groups = defaultdict(dict)
+        for p in poss:
+            c = p.contract
+            if getattr(c,"secType","") != "OPT":
                 continue
-            side = "LONG " if q>0 else "SHORT"
-            print(f"  {side:<5} strike={k:<7} exp={exp:<8} right={right}  posQty={q:<6} avgCost={avg:.2f}")
-    ib.disconnect()
+            sym   = c.symbol
+            exp   = getattr(c,"lastTradeDateOrContractMonth","")
+            right = getattr(c,"right","")
+            k     = float(getattr(c,"strike",0.0))
+            groups[(sym,exp,right)][k] = (float(p.position or 0.0), float(p.avgCost or 0.0))
+
+        # Print last 50 verticals (by symbol name, no market data)
+        items = sorted(groups.items(), key=lambda kv: kv[0][0])[:50]
+        if not items:
+            print("(no current option positions)"); return
+
+        for (sym,exp,right), legs in items:
+            strikes = sorted(legs.keys())
+            if len([k for k,(q,_) in legs.items() if abs(q)>1e-9]) < 2:
+                continue
+            print(f"{sym} {exp} {right} Vertical (positions)")
+            for k in strikes:
+                q, avg = legs[k]
+                if abs(q) < 1e-9:
+                    continue
+                side = "LONG " if q>0 else "SHORT"
+                print(f"  {side:<5} strike={k:<7} exp={exp:<8} right={right}  posQty={q:<6} avgCost={avg:.2f}")
+    except Exception as e:
+        print(f"(open-positions) error: {e}")
+    finally:
+        try: ib.disconnect()
+        except: pass
 
 if __name__=='__main__': main()
 "@ | Set-Content -Encoding ASCII $tmpOpenPosPy
 
 try {
-  $openposOut = & $Py $tmpOpenPosPy 2>&1
+  $openposOut = & $Py $tmpOpenPosPy 2>$null
   if ($LASTEXITCODE -ne 0) { "open-positions: ERROR (exit $LASTEXITCODE)" | Tee-Object -FilePath $Report -Append }
   if ($openposOut) {
-    ($openposOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append | Out-Null }
+    ($openposOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append }
   } else {
     "(no output from open-positions probe)" | Tee-Object -FilePath $Report -Append
   }
@@ -530,16 +539,29 @@ $tmpClosedPy = Join-Path $env:TEMP ("closed_" + [guid]::NewGuid().ToString('N') 
 from ib_insync import IB, util, ExecutionFilter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import collections
+import collections, math
 
 NY, UTC = ZoneInfo("America/New_York"), ZoneInfo("UTC")
 
 def parse_ib_time(s):
     try:
+        if isinstance(s, datetime):
+            return s if s.tzinfo else s.replace(tzinfo=UTC)
         dt = util.parseIBDatetime(s)
         if dt.tzinfo is None: return dt.replace(tzinfo=UTC)
         return dt.astimezone(UTC)
     except: return None
+
+def sum_commission(group):
+    total = 0.0
+    for f in group:
+        try:
+            cr = f.commissionReport
+            if cr and cr.commission is not None:
+                v = float(cr.commission)
+                if not math.isnan(v) and v > 0: total += v
+        except: pass
+    return total
 
 def main():
     ib=IB()
@@ -550,54 +572,88 @@ def main():
         return
 
     try:
-        since = (datetime.now(UTC)-timedelta(days=7)).strftime("%Y%m%d-%H:%M:%S")
+        # 30-day window captures multi-day positions (open one day, close later)
+        since = (datetime.now(UTC)-timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
         fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
+        ib.sleep(2.0)
 
-        # Collect leg-level fills (all OPT fills; openClose field is unreliable on paper accounts)
-        legs=[]
+        # Group fills by permId; each BAG order = one permId group
+        by_perm = collections.defaultdict(list)
         for f in fills:
-            c,e=f.contract,f.execution
-            if getattr(c,"secType","")!="OPT": continue
-            # Include all OPT fills — paper accounts often leave openClose="" on BAG legs
-            t_utc=parse_ib_time(getattr(e,"time","")); t_ny=t_utc.astimezone(NY) if t_utc else None
-            pnl=0.0
-            try:
-                # commissionReport is a direct attribute on Fill (ib_insync NamedTuple)
-                cr = f.commissionReport
-                if cr and cr.realizedPNL is not None:
-                    pnl=float(cr.realizedPNL)
-            except Exception:
-                pnl=0.0
-            legs.append(dict(sym=c.symbol,
-                             exp=getattr(c,"lastTradeDateOrContractMonth",""),
-                             right=getattr(c,"right",""),
-                             strike=float(getattr(c,"strike",0.0)),
-                             side=e.side, fill=float(e.price or 0.0),
-                             t_utc=t_utc, t_ny=t_ny, pnl=pnl))
+            pid = int(getattr(f.execution, "permId", 0) or 0)
+            by_perm[pid].append(f)
 
-        if not legs:
-            print("(no closed executions in last 7 days)")
+        opens  = []  # (t_utc, sym, exp, right, bag_px, commission)
+        closes = []  # (t_utc, sym, exp, right, bag_px, commission)
+
+        for pid, group in by_perm.items():
+            bag  = [f for f in group if getattr(f.contract, "secType", "") == "BAG"]
+            opts = [f for f in group if getattr(f.contract, "secType", "") == "OPT"]
+            if not bag or not opts:
+                continue
+
+            bag_fill = bag[0]
+            bag_side = (getattr(bag_fill.execution, "side", "") or "").upper()
+            bag_px   = float(getattr(bag_fill.execution, "price", 0) or 0)
+
+            sym = exp = right = "?"
+            t_max = None
+            for f in opts:
+                c = f.contract
+                if sym   == "?": sym   = getattr(c, "symbol", "?")
+                if exp   == "?": exp   = getattr(c, "lastTradeDateOrContractMonth", "")
+                if right == "?": right = (getattr(c, "right", "") or "").upper()
+                t_utc = parse_ib_time(getattr(f.execution, "time", ""))
+                if t_utc and (t_max is None or t_utc > t_max): t_max = t_utc
+            if t_max is None: t_max = datetime.now(UTC)
+
+            commission = sum_commission(group)
+            bag_qty = int(float(getattr(bag_fill.execution, "shares", 1) or 1))
+            entry = (t_max, sym, exp, right, bag_px, bag_qty, commission)
+            if bag_side == "SLD":
+                closes.append(entry)
+            else:
+                opens.append(entry)
+
+        if not closes:
+            print("(no closed spreads in last 30 days)")
             return
 
-        # Group by (sym,exp,right,time bucket ~1m)
-        def bucket(t): 
-            ny=t.astimezone(NY); 
-            return ny.replace(second=0, microsecond=0) if ny else None
+        results = []
+        for (t_cl, sym, exp, right, cl_px, qty, cl_comm) in closes:
+            # Find the most recent matching open (same sym+right+exp, before close time)
+            candidates = [o for o in opens if o[1]==sym and o[3]==right and o[2]==exp and o[0]<=t_cl]
+            if not candidates:
+                # Fallback: match by sym+right only (different expiration)
+                candidates = [o for o in opens if o[1]==sym and o[3]==right and o[0]<=t_cl]
+            if candidates:
+                t_op, _, _, _, op_px, _, op_comm = max(candidates, key=lambda x: x[0])
+                pnl = round((cl_px - op_px) * 100 * qty, 2)
+                # Commission from IB reports if attached, else estimate: $0.65/leg * 2 legs * 2 orders
+                attached_comm = cl_comm + op_comm
+                est_comm = round(qty * 4 * 0.65, 2)
+                comm = attached_comm if attached_comm > 0.01 else est_comm
+                comm_label = "" if attached_comm > 0.01 else " est."
+            else:
+                op_px = None
+                pnl = None
+                comm = 0.0
+                comm_label = ""
+            results.append((t_cl, sym, exp, right, op_px, cl_px, qty, pnl, comm, comm_label))
 
-        groups=collections.defaultdict(list)
-        for L in legs:
-            key=(L['sym'],L['exp'],L['right'], bucket(L['t_utc']) if L['t_utc'] else None)
-            groups[key].append(L)
-
-        items=sorted(groups.items(), key=lambda kv: max([(l['t_utc'] or datetime.min.replace(tzinfo=UTC)) for l in kv[1]]), reverse=True)[:20]
-        for (sym,exp,right,tb), g in items:
-            tny = (tb.astimezone(NY).strftime("%Y-%m-%d %H:%M:%S %Z") if tb else "-")
-            tag = " [~17:00]" if (tb and tb.astimezone(NY).hour==17 and abs(tb.astimezone(NY).minute-0)<=10) else ""
-            spread_pnl=sum(l['pnl'] for l in g)
-            print(f"{tny}{tag}  {sym} {exp} {right} Vertical  spreadP/L={spread_pnl:.2f}")
-            for l in sorted(g, key=lambda z:z['strike']):
-                print(f"  {l['side']:<4} strike={l['strike']:<7} exp={l['exp']:<8} right={l['right']}  fillPx={l['fill']:.2f}  legPnL={l['pnl']:.2f}")
+        results.sort(key=lambda r: r[0], reverse=True)
+        for (t_cl, sym, exp, right, op_px, cl_px, qty, pnl, comm, comm_label) in results[:20]:
+            tny = t_cl.astimezone(NY).strftime("%Y-%m-%d %H:%M %Z")
+            op_str = f"{op_px:.2f}" if op_px is not None else "?"
+            qty_str = f" x{qty}" if qty > 1 else ""
+            pnl_str = f"  P/L={pnl:+.2f}" if pnl is not None else "  P/L=?"
+            if comm > 0.01:
+                net = round(pnl - comm, 2) if pnl is not None else None
+                net_str = f"  net={net:+.2f}" if net is not None else ""
+                pnl_str += f"  comm{comm_label}: -{comm:.2f}{net_str}"
+            print(f"{tny}  {sym} {exp} {right}{qty_str}  open={op_str} -> close={cl_px:.2f}{pnl_str}")
     except Exception as e:
+        import traceback; traceback.print_exc()
         print(f"(closed) error: {e}")
     finally:
         try: ib.disconnect()
@@ -607,10 +663,10 @@ if __name__=='__main__': main()
 "@ | Set-Content -Encoding ASCII $tmpClosedPy
 
 try {
-  $closedOut = & $Py $tmpClosedPy 2>&1
+  $closedOut = & $Py $tmpClosedPy 2>$null
   if ($LASTEXITCODE -ne 0) { "closed-orders: ERROR (exit $LASTEXITCODE)" | Tee-Object -FilePath $Report -Append }
   if ($closedOut) {
-    ($closedOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append | Out-Null }
+    ($closedOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append }
   } else {
     "(no output from closed-orders probe)" | Tee-Object -FilePath $Report -Append
   }
@@ -621,30 +677,14 @@ try {
 }
 " " | Tee-Object -FilePath $Report -Append
 
-# ---------- Recent Logs ----------
-"--- Recent Logs ---"                      | Tee-Object -FilePath $Report -Append
-Get-ChildItem "$LogDir\*.log" -ErrorAction SilentlyContinue |
-  Sort-Object LastWriteTime -Desc | Select-Object -First 3 |
-  ForEach-Object {
-    $logFile = $_
-    "`n### $($logFile.FullName) (last 60 lines)" | Tee-Object -FilePath $Report -Append
-    $logLines = Get-Content $logFile.FullName -Tail 60
-    # For listener.err.log: suppress verbose ib_insync position/portfolio dumps already shown in Positions section
-    if ($logFile.Name -like 'listener.err*') {
-      $logLines = $logLines | Where-Object {
-        $_ -notmatch 'ib_insync\.wrapper:(position|updatePortfolio|openOrder):' -and
-        $_ -notmatch 'ib_insync\.ib:Synchronization'
-      }
-    }
-    $logLines | Tee-Object -FilePath $Report -Append | Out-Null
-  }
-
 "==== END ===="                             | Tee-Object -FilePath $Report -Append
-# ---------- Order Attempts Summary (from latest attempts_*.csv) ----------
-"--- Order Attempts Summary (latest attempts_*.csv) ---" | Tee-Object -FilePath $Report -Append
+" " | Tee-Object -FilePath $Report -Append
+# ---------- Order Attempts Summary (from today's day folder) ----------
+"--- Order Attempts Summary (today's attempts_*.csv) ---" | Tee-Object -FilePath $Report -Append
 
-$attemptDir = 'C:\OptionsHistory\logs'
+$attemptDir = "C:\OptionsHistory\$dated"
 try {
+  # $dated = yy_MM_dd (today's folder) — all attempts_*.csv here are today's
   $latestAttempts = Get-ChildItem -Path $attemptDir -Filter 'attempts_*.csv' -File -ErrorAction SilentlyContinue |
                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
   if (-not $latestAttempts) {
@@ -799,6 +839,26 @@ $allTagged |
   Tee-Object -FilePath $Report -Append | Out-Null
 
 " " | Tee-Object -FilePath $Report -Append
+
+# ---------- Recent Logs ----------
+"--- Recent Logs ---"                      | Tee-Object -FilePath $Report -Append
+Get-ChildItem "$LogDir\*.log" -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Desc | Select-Object -First 3 |
+  ForEach-Object {
+    $logFile = $_
+    "`n### $($logFile.FullName) (last 60 lines)" | Tee-Object -FilePath $Report -Append
+    $logLines = Get-Content $logFile.FullName -Tail 60
+    # For listener.err.log: suppress verbose ib_insync position/portfolio dumps already shown in Positions section
+    if ($logFile.Name -like 'listener.err*') {
+      $logLines = $logLines | Where-Object {
+        $_ -notmatch 'ib_insync\.wrapper:(position|updatePortfolio|openOrder):' -and
+        $_ -notmatch 'ib_insync\.ib:Synchronization'
+      }
+    }
+    $logLines | Tee-Object -FilePath $Report -Append
+  }
+
+" " | Tee-Object -FilePath $Report -Append
 # ---- Minimal terminal summary only ----
 Write-Host ""
 Write-Host "--- SUMMARY ---"
@@ -835,9 +895,5 @@ try {
     [System.IO.File]::WriteAllText($Report, $content, [System.Text.UTF8Encoding]::new($false))
 } catch {}
 
-try {
-    Write-Host ""
-    [void](Read-Host "Press Enter to continue")
-} catch {
-    # Non-interactive terminal (scheduled task, piped) — skip silently
-}
+Write-Output "`nPress Enter to return to menu: "
+try { [void](Read-Host) } catch {}

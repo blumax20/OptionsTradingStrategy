@@ -406,8 +406,9 @@ def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
         put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma_otm, call=False)
         key = "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
         # Fix Y2b: clamp to >= 0 (debit spread value cannot be negative)
-        out[f"call_debit_theo_{key}"] = max(0.0, float(call_long - call_short))
-        out[f"put_debit_theo_{key}"]  = max(0.0, float(put_long - put_short))
+        # Fix CY: clamp to <= 0.75*W (no-arbitrage + conservative cap; skewed IV can exceed width)
+        out[f"call_debit_theo_{key}"] = min(0.75 * W, max(0.0, float(call_long - call_short)))
+        out[f"put_debit_theo_{key}"]  = min(0.75 * W, max(0.0, float(put_long - put_short)))
     return out
 
 # --- Parse TradingView/alert message for signal side and strategy position ---

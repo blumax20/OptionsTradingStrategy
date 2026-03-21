@@ -386,6 +386,8 @@ class DailyCycleManagementMixin:
             try:
                 ib.reqAllOpenOrders()  # Fix U1: was reqOpenOrders() - need ALL client IDs
                 ib.sleep(1.5)  # Fix BO: was 0.5 — allow cross-clientId order propagation (matches Fix AP/BB/BC/AR)
+                ib.reqOpenOrders()  # Fix DA: reclaim previous-session clientId=101 orders (orderId=0 → valid orderId)
+                ib.sleep(0.5)
             except Exception:
                 pass
 
@@ -500,8 +502,27 @@ class DailyCycleManagementMixin:
                         source="dcm-preclose",
                         extra={"cancelled": n_cxl},
                     )
-                # we just cancelled them; treat as if no working close exists
-                has_working = False
+                # Fix DA: Re-verify cancel actually cleared the order before running PlaceAnOrder.
+                # If n_cxl=0 (reqOpenOrders didn't find the order) or BO polling timed out,
+                # the old order may still be active — PlaceAnOrder's close guard would block anyway.
+                has_working = self._has_working_close_order(sym)
+                if has_working:
+                    LOG.warning(
+                        "[%s] Preclose: cancel returned n_cxl=%d but order still active — "
+                        "skipping replacement (old order stays)",
+                        sym, n_cxl,
+                    )
+                    try:
+                        self._attempt(
+                            symbol=sym,
+                            action="close",
+                            status="skipped",
+                            reason="preclose_cancel_failed_order_still_active",
+                            source="dcm-preclose",
+                        )
+                    except Exception:
+                        pass
+                    return
 
             # For non-preclose flows, keep the old guard: skip if a working close already exists
             if context != "preclose" and has_working:
@@ -587,6 +608,7 @@ class DailyCycleManagementMixin:
                 "--symbols", sym,
                 "--min-limit", "0.01" if context == "preclose" else "0.05",
                 "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
+                "--live-timeout", "10" if context == "preclose" else "5",  # Fix CD: 3s default too short on fresh subprocess connection
                 "--quantity", "50",
                 "--quiet",
                 "--fallback-individual-legs",  # Fix S: Enable worthless leg handling
@@ -1257,7 +1279,7 @@ class DailyCycleManagementMixin:
             LOG.warning("Live-close scheme determination failed for %s: %s, defaulting to 'mid'", symbol, e)
             return 'mid'  # Conservative default
 
-    def _try_close_from_positions(self, sym: str, prefer: str = "LMT", side: str | None = None) -> bool:
+    def _try_close_from_positions(self, sym: str, prefer: str = "LMT", side: str | None = None) -> tuple[bool, float | None]:
         """
         Best-effort direct close using current IB positions for `sym`.
         - If a long vertical debit is detected (CALL or PUT), submit a combo close as a BAG:
@@ -1275,21 +1297,21 @@ class DailyCycleManagementMixin:
             from ib_insync import IB, Contract, ComboLeg, ContractDetails, MarketOrder, LimitOrder
         except Exception as e:
             LOG.warning("direct-close: ib_insync unavailable: %s", e)
-            return False
+            return False, None
 
         ib = IB()
-        # Use a mostly-unique clientId per invocation to avoid "client id already in use"
-        try:
-            import random
-            client_id = 900 + random.randint(0, 99)  # Fix AB9b: avoid 882-891 (reconcile), 883-887 (DCM/guard)
-        except Exception:
-            client_id = 884  # fallback
+        # Fix BX: Use clientId=101 (same as PlaceAnOrder) so _cancel_symbol_close_orders()
+        # (also clientId=101) can cancel these orders at preclose time.
+        # IB only allows the placing clientId to cancel an order; using 900+random caused
+        # BO poll loop to time out at preclose leaving stale orders that blocked replacements.
+        # Safety: _try_close_from_positions() runs sequentially before PlaceAnOrder subprocesses.
+        client_id = 101
 
         try:
             ib.connect(IB_HOST, IB_PORT, clientId=client_id, timeout=6)
         except Exception as e:
             LOG.warning("direct-close: connect failed (clientId=%s): %s", client_id, e)
-            return False
+            return False, None
 
         # Helper to get theoretical close limit from CSV
         def _get_theo_limit(right: str, width: float) -> float | None:
@@ -1338,6 +1360,7 @@ class DailyCycleManagementMixin:
                 return None
 
         submitted = False
+        _bv_limit_used = None  # Fix BV: capture limit from _place_combo for return
         up = (sym or '').upper()
         try:
             # Collect all open legs for symbol (OPT and STK)
@@ -1372,6 +1395,7 @@ class DailyCycleManagementMixin:
 
             # Helper to place a combo close
             def _place_combo(right: str, low: float, high: float, longConId: int, shortConId: int, is_long_vertical: bool) -> bool:
+                nonlocal _bv_limit_used  # Fix BV: capture limit for return from _try_close_from_positions
                 # Guard: Check for existing working orders before placing
                 if has_working_auto_close(up):
                     LOG.info("direct-close: existing working CLOSE found for %s - skipping duplicate order placement", up)
@@ -1438,6 +1462,7 @@ class DailyCycleManagementMixin:
 
                     tr = ib.placeOrder(bag, order)
                     LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, order_desc)
+                    _bv_limit_used = theo_limit  # Fix BV: capture limit for return
                     return True
                 except Exception as e:
                     LOG.warning("direct-close: combo place failed for %s %s %s/%s: %s", up, right, low, high, e)
@@ -1521,7 +1546,7 @@ class DailyCycleManagementMixin:
                 except Exception as e:
                     LOG.warning("direct-close: failed to flatten stock %s: %s", up, e)
 
-            return submitted
+            return submitted, _bv_limit_used  # Fix BV: return limit alongside success flag
         finally:
             try:
                 ib.disconnect()
@@ -2021,8 +2046,7 @@ class DailyCycleManagementMixin:
     def is_after_market_close(self, when: datetime | None = None) -> bool:
         dt = when or self._now_ny()
         if not self._is_trading_day(dt):
-            # allow running after close on non-trading days for nightly jobs if desired
-            return True
+            return False  # Fix CM: weekends/holidays are not "after market close"
         return dt.time() >= MARKET_CLOSE
 
     def _is_between(self, t: time, start: time, end: time) -> bool:
@@ -2600,12 +2624,12 @@ class DailyCycleManagementMixin:
                     LOG.info("Reconcile: positions-based CLOSE for %s side=%s reason=%s",
                             sym, (side_to_close or "both"), reason)
                     try_side = side_to_close  # "call", "put", or None
-                    ok = self._try_close_from_positions(sym, prefer="LMT", side=try_side)
+                    ok, _bv_limit = self._try_close_from_positions(sym, prefer="LMT", side=try_side)
 
                     if not ok and try_side is not None:
                         # Fallback: if we couldn't close the requested side, try closing any verticals in this symbol.
                         LOG.info("Reconcile: fallback CLOSE for %s (any side) after side=%s failure.", sym, try_side)
-                        ok = self._try_close_from_positions(sym, prefer="LMT", side=None)
+                        ok, _bv_limit = self._try_close_from_positions(sym, prefer="LMT", side=None)  # Fix BV: overwrite limit from fallback
 
                     if ok:
                         self._submitted_close_syms.add(sym)
@@ -2613,7 +2637,7 @@ class DailyCycleManagementMixin:
                         try:
                             _AttemptLogger.write(symbol=sym, action="close", status="placed",
                                                 reason=reason, exp="", right=(try_side.upper() if try_side else ""),
-                                                source="dcm-reconcile")
+                                                source="dcm-reconcile", limit=_bv_limit)  # Fix BV: log limit price
                         except Exception:
                             pass
                     else:
@@ -2633,7 +2657,7 @@ class DailyCycleManagementMixin:
                                 "--live-timeout", "5",
                                 "--fallback-individual-legs",
                                 "--allow-market-fallback",  # Fix AB2: MKT last resort when all limit pricing fails
-                                "--client-id", "102",  # Fix AB9c: avoid clientId 101 collision
+                                "--client-id", "101",  # Fix CC: use 101 so _cancel_symbol_close_orders() can cancel (was 102 → Error 10147 timeout)
                                 "--quiet",
                             ] + fc_side_arg)
                             # Check if PlaceAnOrder managed to submit something
@@ -2832,20 +2856,68 @@ class DailyCycleManagementMixin:
                                   sym, right, strike_low, strike_high, (now - t0).days, days_old)
                         return  # too new
                 else:
-                    # Fallback: estimate age from contract expiration (assume ~30 DTE at entry)
+                    # Execution history unavailable (cleared by IB restart).
+                    # Fix DD: attempt CSV lookup before DTE heuristic. The attempts CSV
+                    # records every open_call/open_put,placed,success with an exact timestamp —
+                    # it is persistent and never cleared by IB restarts.
+                    exp_str = getattr(long_leg.get("contract"), "lastTradeDateOrContractMonth", "") or ""
                     try:
-                        exp_str = getattr(long_leg.get("contract"), "lastTradeDateOrContractMonth", "") or ""
-                        if exp_str:
+                        import csv as _csv_de
+                        for _de_d in range(0, 21):
+                            _de_day = (now - timedelta(days=_de_d)).strftime("%y_%m_%d")
+                            _de_path = fr"C:\OptionsHistory\{_de_day}\attempts_{_de_day}.csv"
+                            if not os.path.exists(_de_path):
+                                continue
+                            with open(_de_path, "r", newline="") as _de_f:
+                                for _de_row in _csv_de.DictReader(_de_f):
+                                    if (_de_row.get("symbol", "").upper() == sym.upper()
+                                            and _de_row.get("action", "").lower().startswith("open_")
+                                            and _de_row.get("status", "") == "placed"
+                                            and _de_row.get("right", "").upper() == right.upper()
+                                            and _de_row.get("exp", "") == exp_str
+                                            and abs(float(_de_row.get("longK") or 0) - long_leg["strike"]) < 0.01
+                                            and abs(float(_de_row.get("shortK") or 0) - short_leg["strike"]) < 0.01):
+                                        try:
+                                            _de_t0 = datetime.fromisoformat(_de_row["ts"])
+                                            if t0 is None or _de_t0 < t0:
+                                                t0 = _de_t0
+                                        except Exception:
+                                            pass
+                            if t0 is not None:
+                                break  # found in this day's CSV; stop scanning
+                        if t0 is not None:
+                            _de_hours = (now - t0).total_seconds() / 3600
+                            LOG.info("Risk exits: %s %s %.0f/%.0f age from attempts CSV: %s (%.1fh old)",
+                                     sym, right, strike_low, strike_high, t0.isoformat(), _de_hours)
+                            if (now - t0) < timedelta(days=days_old):
+                                LOG.info("Risk exits: %s %s %.0f/%.0f skipped — too new "
+                                         "(%.1fh < %dd from attempts CSV)",
+                                         sym, right, strike_low, strike_high, _de_hours, days_old)
+                                return
+                    except Exception as _de_err:
+                        LOG.debug("Risk exits: %s attempts CSV age lookup failed: %s", sym, _de_err)
+
+                    # Final fallback: estimate age from contract expiration (assume ~30 DTE at entry).
+                    # Fix DD: use <= days_old (not <) to add 1-day buffer for estimation uncertainty.
+                    if t0 is None and exp_str:
+                        try:
                             from datetime import datetime as _dt_cls
                             exp_date = _dt_cls.strptime(exp_str, "%Y%m%d").date()
                             dte = (exp_date - now.date()).days
-                            estimated_age = max(0, 30 - dte)
-                            if estimated_age < days_old:
-                                LOG.debug("Risk exits: %s %s %.0f/%.0f skipped - estimated too new (est_age=%dd, dte=%d, min=%dd)",
-                                          sym, right, strike_low, strike_high, estimated_age, dte, days_old)
-                                return  # estimated too new
-                    except Exception:
-                        pass  # skip age check if we can't determine it
+                            if dte < 30:
+                                # Short-DTE: estimate age as days since position was ~30 DTE
+                                estimated_age = max(0, 30 - dte)
+                                if estimated_age <= days_old:
+                                    LOG.info("Risk exits: %s %s %.0f/%.0f DTE=%d, est_age=%dd <= %dd min; skipping (too new)",
+                                             sym, right, strike_low, strike_high, dte, estimated_age, days_old)
+                                    return  # estimated too new
+                            else:
+                                # Fix CA: DTE >= 30 — can't estimate age (entry DTE could be 30-60+ days).
+                                # Skip age filter; evaluate TP/SL regardless.
+                                LOG.info("Risk exits: %s %s %.0f/%.0f DTE=%d >= 30 — age unknown, skipping age filter",
+                                         sym, right, strike_low, strike_high, dte)
+                        except Exception:
+                            pass  # skip age check if we can't determine it
 
                 # --- Entry price: use avgCost from positions (always available) ---
                 long_entry = long_leg["avgCost"] / 100.0   # avgCost is per-contract; /100 for per-share
@@ -2948,7 +3020,21 @@ class DailyCycleManagementMixin:
                                 has_working = True
                                 break
                     if has_working:
-                        LOG.info("Risk exits: %s already has working close order; skipping", sym)
+                        LOG.info("Risk exits: %s already has working close order; skipping (Z4)", sym)
+                        try:
+                            _AttemptLogger.write(
+                                symbol=sym,
+                                action="close",
+                                status="skipped",
+                                reason="z4_working_close_exists",
+                                right=(right[0].upper() if right else ""),
+                                atm=strike_low,
+                                oth=strike_high,
+                                source="dcm-risk-exit",
+                                close_reason=reason,
+                            )
+                        except Exception:
+                            pass
                         return
                 except Exception as e:
                     LOG.debug("Risk exits: guard check failed for %s: %s (proceeding anyway)", sym, e)
@@ -3059,6 +3145,11 @@ class DailyCycleManagementMixin:
         try:
             ib.reqAllOpenOrders()
             ib.sleep(1.5)  # Fix BC: allow IB to propagate cross-clientId orders (same as Fix AP)
+            # Fix CZ: reqOpenOrders() re-assigns previous-session clientId=101 orders to the
+            # current session, giving them valid orderIds. Without this, previous-day API orders
+            # show as orderId=0 and cancelOrder(orderId=0) silently bounces (PendingCancel → Submitted).
+            ib.reqOpenOrders()
+            ib.sleep(0.5)
             trades = ib.openTrades()
             if not trades:
                 LOG.info("RTH cleanup: no open trades to evaluate.")
@@ -3128,8 +3219,23 @@ class DailyCycleManagementMixin:
                     # at least one leg has confirmed-good OI — keep order
                     continue
                 # No leg confirmed good; at least one known-low or unknown (both unknown excluded above).
+                # Fix CZ: skip manual TWS orders (clientId=0) — API cannot cancel them.
+                _order_client = getattr(s, "clientId", -1)
+                if o.orderId == 0 and _order_client == 0:
+                    LOG.warning("RTH cleanup: skipping %s — manual TWS order (clientId=0, orderId=0); cancel in TWS manually", sym)
+                    continue
                 try:
                     ib.cancelOrder(o)
+                    # Fix CZ: verify cancel wasn't silently bounced (PendingCancel → Submitted pattern)
+                    ib.sleep(1.0)
+                    _still_active = any(
+                        getattr(t.order, "permId", 0) == getattr(o, "permId", -1)
+                        and t.orderStatus.status.lower() in ("presubmitted", "submitted")
+                        for t in ib.openTrades()
+                    )
+                    if _still_active:
+                        LOG.warning("RTH cleanup: cancel bounced for %s (permId=%s) — order still Submitted; likely manual TWS order. Cancel in TWS.", sym, getattr(o, "permId", "?"))
+                        continue
                     cancelled += 1
                     lmt = getattr(o, 'lmtPrice', None)
                     net = ("MKT" if (getattr(o, 'orderType', '').upper() == 'MKT') else (f"LMT {lmt:.2f}" if lmt not in (None, 0) else "-"))
@@ -3162,13 +3268,13 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-    def _cancel_low_oi_working_orders_from_csv(self, threshold: int = MIN_OI_FOR_RTH, lookback_days: int = 2) -> None:
+    def _cancel_low_oi_working_orders_from_csv(self, threshold: int = MIN_OI_FOR_RTH) -> None:
         """
         9:35am RTH guard: cancel *working* combo orders (BAG) where BOTH legs have OI < threshold
         using the combined_listener_spreads.csv from today, with automatic fallback to the prior day.
         This avoids keeping thin orders intraday while still allowing after-hours placement without
         an OI guard. We only cancel when we can positively read OI for both legs from the CSV.
-        Preference order for OI data: today first, then yesterday (… up to `lookback_days`).
+        Loads today's CSV and the most recent prior trading day's CSV (weekend/holiday-aware).
         """
         # Populate OI in combined CSVs first (today and previous trading day)
         try:
@@ -3183,8 +3289,30 @@ class DailyCycleManagementMixin:
             LOG.warning("CSV OI cancel: ib_insync unavailable: %s", e)
             return
 
-        # Load rows from today (preferred) and prior day(s)
-        rows = DailyCycleManagementMixin._load_csv_rows_with_source(days=max(1, lookback_days))
+        # Fix CN (revised): walk backward through calendar days, skip Sat/Sun, load up to 2
+        # existing CSVs. Holiday folders won't have a CSV so the walk continues to the prior
+        # trading day — handles weekends AND holidays without needing a holiday calendar.
+        from datetime import timedelta as _td
+        rows: list[dict] = []
+        _ref = self._now_ny().date()
+        _labels = ["today", "yesterday", "d-2"]
+        _found = 0
+        for _back in range(0, 15):          # 0=today; up to 14 calendar days back
+            _d = _ref - _td(days=_back)
+            if _d.weekday() >= 5:           # skip Sat/Sun
+                continue
+            _fp = fr"C:\OptionsHistory\{_d.strftime('%y_%m_%d')}\combined_listener_spreads.csv"
+            if os.path.exists(_fp):
+                _lbl = _labels[_found] if _found < len(_labels) else f"d-{_found}"
+                try:
+                    with open(_fp, newline="", encoding="utf-8") as _fh:
+                        for _r in csv.DictReader(_fh):
+                            _r2 = dict(_r); _r2["_csv_src"] = _lbl; rows.append(_r2)
+                except Exception as _e:
+                    LOG.warning("CSV OI cancel: failed to read %s: %s", _fp, _e)
+                _found += 1
+                if _found >= 2:             # today (usually empty at 9:45) + prev trading day
+                    break
         if not rows:
             LOG.info("CSV OI cancel: no combined CSV rows available (today/prior-day missing); skipping.")
             return
@@ -3284,6 +3412,11 @@ class DailyCycleManagementMixin:
         try:
             ib.reqAllOpenOrders()
             ib.sleep(1.5)  # Fix BB: allow IB to propagate cross-clientId orders (same as Fix AP)
+            # Fix CZ: reqOpenOrders() re-assigns previous-session clientId=101 orders to the
+            # current session, giving them valid orderIds. Without this, previous-day API orders
+            # show as orderId=0 and cancelOrder(orderId=0) silently bounces (PendingCancel → Submitted).
+            ib.reqOpenOrders()
+            ib.sleep(0.5)
             trades = ib.openTrades() or []
             if not trades:
                 LOG.info("CSV OI cancel: no open trades.")
@@ -3356,8 +3489,23 @@ class DailyCycleManagementMixin:
                     continue
 
                 # No leg confirmed good; at least one known-low (or unknown with both excluded above).
+                # Fix CZ: skip manual TWS orders (clientId=0) — API cannot cancel them.
+                _order_client = getattr(s, "clientId", -1)
+                if o.orderId == 0 and _order_client == 0:
+                    LOG.warning("CSV OI cancel: skipping %s — manual TWS order (clientId=0, orderId=0); cancel in TWS manually", sym)
+                    continue
                 try:
                     ib.cancelOrder(o)
+                    # Fix CZ: verify cancel wasn't silently bounced (PendingCancel → Submitted pattern)
+                    ib.sleep(1.0)
+                    _still_active = any(
+                        getattr(t.order, "permId", 0) == getattr(o, "permId", -1)
+                        and t.orderStatus.status.lower() in ("presubmitted", "submitted")
+                        for t in ib.openTrades()
+                    )
+                    if _still_active:
+                        LOG.warning("CSV OI cancel: cancel bounced for %s (permId=%s) — order still Submitted; likely manual TWS order. Cancel in TWS.", sym, getattr(o, "permId", "?"))
+                        continue
                     cancelled += 1
                     LOG.info("CSV OI cancel [%s]: cancelled %s %s %s atm/oth=%s/%s OI=%s/%s<thr(%d)",
                              (src or "unknown"), sym, exp, right, atm, oth, oi_atm, oi_oth, threshold)
@@ -3381,12 +3529,70 @@ class DailyCycleManagementMixin:
                 ib.disconnect()
             except Exception:
                 pass
-    def run_rth_open_cleanup(self, lookback_days: int = 2) -> None:
+    def _retry_skipped_opens_from_prev_day(self) -> None:
+        """Fix CP: Retry OPEN orders skipped last evening (no_viable_limit_or_conditions).
+        Called at 10:00 AM after the 9:45 AM CSV enrichment has populated live prices.
+        """
+        import csv as _csv_cp
+        from datetime import timedelta as _td_cp
+
+        # Walk back to find previous trading day folder (skip weekends/holidays)
+        _ref = self._now_ny().date()
+        _prev_folder: str | None = None
+        for _back in range(1, 10):
+            _d = _ref - _td_cp(days=_back)
+            if _d.weekday() >= 5:
+                continue
+            _cand = _d.strftime('%y_%m_%d')
+            _fp = fr"C:\OptionsHistory\{_cand}\attempts_{_cand}.csv"
+            if os.path.exists(_fp):
+                _prev_folder = _cand
+                break
+
+        if not _prev_folder:
+            LOG.info("Fix CP: no prev-day attempts CSV found; skipping retry")
+            return
+
+        _attempts_path = fr"C:\OptionsHistory\{_prev_folder}\attempts_{_prev_folder}.csv"
+        try:
+            with open(_attempts_path, newline="", encoding="utf-8") as _fh:
+                _rows = list(_csv_cp.DictReader(_fh))
+        except Exception as _e:
+            LOG.warning("Fix CP: failed to read %s: %s", _attempts_path, _e)
+            return
+
+        _syms: list[str] = []
+        for _r in _rows:
+            if (_r.get("action") in ("open_call", "open_put")
+                    and _r.get("status") == "skipped"
+                    and _r.get("reason") == "no_viable_limit_or_conditions"
+                    and _r.get("symbol")):
+                _sym = _r["symbol"].strip()
+                if _sym and _sym not in _syms:
+                    _syms.append(_sym)
+
+        if not _syms:
+            LOG.info("Fix CP: no skipped OPENs in %s; nothing to retry", _prev_folder)
+            return
+
+        LOG.info("Fix CP: retrying %d skipped OPEN(s) from %s: %s", len(_syms), _prev_folder, _syms)
+        self._run_place_an_order([
+            "--mode", "from-signal",
+            "--date", _prev_folder,
+            "--symbols", ",".join(_syms),
+            "--min-limit", "0.05",
+            "--bump-to-min",
+            "--use-live-open", "mid",
+            "--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
+            "--oi-check", "off",       # Fix CQ: OI not populated for skipped-opens; 10:30 AM cleanup handles low-OI cancellation
+            "--quiet",
+        ])
+
+    def run_rth_open_cleanup(self) -> None:
         """
         Call this once shortly after the market opens (~09:35 ET).
         Ensures OI is enriched for today and previous trading day, then cancels low-OI working orders
         using both CSV-based and live-OI checks.
-        The `lookback_days` parameter controls how many recent combined_listener_spreads.csv files are scanned when canceling low‑OI working orders from CSV (default: 2).
         """
         now = self._now_ny()
         if not self._is_trading_day(now):
@@ -3398,7 +3604,7 @@ class DailyCycleManagementMixin:
             return
         # Enrich and cleanup
         self._enrich_today_and_prev_trading_day(only_rth=True)
-        self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=lookback_days)
+        self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH)
         self._rth_liquidity_cleanup()
         try:
             self._summarize_latest_attempts()
@@ -3506,7 +3712,7 @@ class DailyCycleManagementMixin:
             try:
                 tnow = now.time()
                 if tnow >= time(9, 35):
-                    self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=2)
+                    self._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH)
             except Exception as e:
                 LOG.warning("CSV OI cancel step skipped due to error: %s", e)
             # New: cancel open unfilled orders if neither leg has OI > threshold (based on today's CSV)
@@ -3539,7 +3745,10 @@ class DailyCycleManagementMixin:
                 LOG.exception("Market open cycle failed: %s", e)
                 return
         else:
-            # Outside RTH but not yet past MARKET_CLOSE (e.g., weekends before 17:00).
+            if not self._is_trading_day(now):  # Fix CM: no reconcile on weekends/holidays
+                LOG.info("Fix CM: weekend/holiday — skipping reconcile lookback at %s", now)
+                return
+            # Outside RTH but not yet past MARKET_CLOSE (e.g., pre-market on weekdays).
             LOG.info("Outside RTH and not after close; running reconcile lookback at %s", now)
             try:
                 self._reconcile_positions_with_signals_lookback(days=21)
@@ -3632,6 +3841,44 @@ if __name__ == "__main__":
         r = _Runner()
         # Reset the active attempts log path before each run to avoid stale logs
         _AttemptLogger._active_path = None
+
+        # Fix CH: intercept --preclose and --risk-exits-only CLI flags before daily_trading_cycle().
+        # The argparse block below (second if __name__==__main__) is dead code because sys.exit()
+        # fires here first. Dispatch directly so menu/scheduled-task flags take effect.
+        _ch_argv = set(sys.argv[1:])
+
+        if "--preclose" in _ch_argv:
+            LOG.info("--preclose: running _pre_close_market_conversion() directly (no time guard)")
+            r._pre_close_market_conversion()
+            sys.exit(0)
+
+        if "--place-skipped-opens" in _ch_argv:
+            LOG.info("--place-skipped-opens: retrying skipped OPEN orders from previous evening (Fix CP)")
+            # Strike population and enrichment already done by 9:45 AM task (Fix CP-A via --risk-exits-only).
+            # Removed Fix CP-B enrichment calls here to avoid spawning 4 LiquidityFilter subprocesses
+            # in quick succession (4 IB connections) which degraded IB Gateway before the 10:30 AM retry.
+            r._retry_skipped_opens_from_prev_day()
+            sys.exit(0)
+
+        if "--risk-exits-only" in _ch_argv:
+            LOG.info("--risk-exits-only: running risk exits retry (Fix Y6)")
+            try:
+                r._enrich_today_and_prev_trading_day(only_rth=True)
+            except Exception as _ch_enrich_err:
+                LOG.warning("Risk exits retry: CSV enrichment failed (%s); proceeding", _ch_enrich_err)
+            # Fix CO: re-run OI cleanup at 10:30 AM when market data is reliably available
+            try:
+                r._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH)
+            except Exception as _co_csv_err:
+                LOG.warning("Risk exits retry: CSV OI cancel failed (%s); proceeding", _co_csv_err)
+            try:
+                r._rth_liquidity_cleanup()
+            except Exception as _co_live_err:
+                LOG.warning("Risk exits retry: live OI cleanup failed (%s); proceeding", _co_live_err)
+            r._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
+            sys.exit(0)
+
+        # No specific flag: run the full time-aware daily cycle (PlaceOpen.cmd / scheduled tasks)
         r.daily_trading_cycle()
         LOG.info("DailyCycleManagement runner completed.")
         sys.exit(0)

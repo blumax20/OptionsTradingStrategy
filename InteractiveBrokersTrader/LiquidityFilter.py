@@ -357,7 +357,15 @@ def populate_missing_strikes(day_dir: str,
         atm_missing = not atm_val or str(atm_val).strip() == "" or _parse_float(atm_val) is None
         price_missing = not price_val or str(price_val).strip() == "" or _parse_float(price_val) is None
 
-        if atm_missing or price_missing:
+        # Fix CP-A: also trigger when both OTM strikes are empty — ATM may be present but
+        # invalid (rounded non-IB strike). _get_atm_and_otm_strikes() re-snaps to real IB grid.
+        otm_call_val = row.get(otm_call_col, "")
+        otm_put_val  = row.get(otm_put_col,  "")
+        otm_call_missing = not otm_call_val or str(otm_call_val).strip() == "" or _parse_float(otm_call_val) is None
+        otm_put_missing  = not otm_put_val  or str(otm_put_val).strip()  == "" or _parse_float(otm_put_val)  is None
+        otm_missing = otm_call_missing and otm_put_missing
+
+        if atm_missing or price_missing or otm_missing:
             symbol = str(row.get(sym_col, "")).strip().upper()
             exp = str(row.get(exp_col, "")).strip()
             stype = str(row.get(stype_col, "")).strip().upper() if stype_col else ""

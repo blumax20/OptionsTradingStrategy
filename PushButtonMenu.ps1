@@ -331,9 +331,12 @@ while ($true) {
             Write-Host "  3) Reconcile held positions vs latest signals (21d) - outside RTH"
             Write-Host "  4) After-hours batch (OPENs plus CLOSE delegates 7d/21d)"
             Write-Host "  5) Enforce CLOSES from last N days (fallback) → enter N"
-            $flow = Read-Host "Select [1-5]"
+            Write-Host "  6) OI cleanup + risk exits retry (Fix CN/CO) -- cancel low-OI orders, then run risk exits"
+            Write-Host "  7) Place skipped OPEN orders from prior day (10 AM retry -- Fix CP/CQ)"
+            $flow = Read-Host "Select [1-7]"
 
             $argList = @("`"$DCMSrc`"")
+            $skipGenericLaunch = $false
             $wantVerbose = Read-Host "Verbose logs? (y/N)"
             if ($wantVerbose -and $wantVerbose.ToLower().StartsWith('y')) { $argList += "--verbose" }
 
@@ -346,6 +349,17 @@ while ($true) {
                     $n = Read-Host "Enter lookback days (e.g., 7)"
                     if ([string]::IsNullOrWhiteSpace($n)) { $n = "7" }
                     $argList += @("--enforce-closes", $n)
+                }
+                '6' {
+                    $skipGenericLaunch = $true
+                    & powershell.exe -NonInteractive -File "C:\OptionsHistory\bin\OiRiskRetry.ps1"
+                    Pause-Enter
+                }
+                '7' {
+                    $skipGenericLaunch = $true
+                    Write-Host "Running PlaceSkippedOpens.cmd ..." -ForegroundColor Cyan
+                    & cmd.exe /c "C:\OptionsHistory\bin\PlaceSkippedOpens.cmd"
+                    Pause-Enter
                 }
                 Default {
                     Write-Host "Invalid selection." -ForegroundColor Yellow
@@ -427,6 +441,7 @@ while ($true) {
             # } catch {
             #     Write-Host ("Attempts summary (post-OPEN) error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
             # }
+            if ($skipGenericLaunch) { break }  # option 6 already handled above; skip generic launch
             # Fix AA8: Redirect stdout/stderr to session log for post-mortem analysis
             $logErr = $log -replace '\.log$', '.err.log'
             try {

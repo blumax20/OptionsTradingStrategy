@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 6, 2026 (Fix BS: Error 201 async rejection detection in individual leg orders)
+**Last Updated:** March 20, 2026 (Fix DG: Pre-warm API clientIds after IBGateway restart to prevent live-account approval dialogs; Fix DF: 3 PM re-auth diagnostics)
 
 ---
 
@@ -2783,3 +2783,944 @@ if context == "preclose":
 **Fix:** After each `_await_working()` returns True at all 6 individual leg placement sites, add `ib.sleep(1.0)` + check `trade.log` for "Order rejected"/"trading permissions". If detected: `ok=False`, `why="bs_rejected"`, WARNING logged. Also gated `legs_closed`/`submitted`/`CLOSE_SEEN_KEYS` on `ok=True`.
 
 **Impact:** Rejected SELL logs `close_individual_leg,error,bs_rejected` (not `placed`). On next RTH run (9:45 AM), AH2 finds no working SELL (Cancelled ≠ working) → retries successfully during RTH where covered SELL is accepted.
+
+---
+
+### Fix BT: DST Task Schedule Fix — All Tasks Reset to Local Time (Mar 9)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** Windows Task Scheduler (all IB_* tasks); `FixDSTTaskTimes.ps1` (repo root, one-time script)
+
+**Issue:** US clocks sprang forward March 9 (EST→EDT). All scheduled tasks were stored with UTC-based triggers ("Synchronize across time zones" enabled). Tasks shifted +1 hour in local time:
+- `IB_Open_PlaceMissing_0945` ran at 10:45 AM instead of 9:45 AM
+- `IB_RiskExits_Retry_1030` ran at 11:30 AM instead of 10:30 AM
+- `IB_ForceClose_MarketOrders_1500` (preclose) ran at **4:00 PM** instead of 3:00 PM — ran after market close
+
+**Fix:** Created `FixDSTTaskTimes.ps1` which uses `New-ScheduledTaskTrigger` to reset all task triggers to local time (no UTC sync). `New-ScheduledTaskTrigger` stores local time without UTC anchoring, so future DST changes auto-adjust. Updated all 9 daily tasks + `IB_Watchdog_Every15Min`.
+
+**Impact:** All tasks run at correct local ET times. Next fall DST change (Nov 1, 2026) requires no action.
+
+---
+
+### Fix BU: Accept Zero Portfolio Price in AM Scan + Worthless Guard on Skip Gate (Mar 9)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`force_close_symbol_via_positions`, AM portfolio scan ~line 2042 and skip gate ~line 2064)
+
+**Issue:** BK 130/135 and NWG 20/22.5 CALL spreads are worthless (stock well below strikes) but `no_viable_limit_all_fallbacks_failed` fires instead of the worthless-detection path. Two compounding failures:
+
+1. **AF2 wrong-strike cached row**: Fix AF1 correctly discards the wrong-strike CSV row, but also caches it for AF2. BK's cached row has `call_debit_theo_5 ≈ $1.97` (computed for ATM=120, not position longK=130). AF2 sees 1.97 > 0.05 → does NOT set `_af2_theo_worthless = True` → skip gate fires.
+
+2. **AM scan rejects `_mp=0.0`**: Deeply OTM options report `marketPrice=0.0` in `ib.portfolio()`. The original `if _mp and not math.isnan(_mp) and _mp > 0:` fails because `if 0.0:` is `False` in Python. Both legs invisible → skip gate fires before worthless detection.
+
+**Fix — three changes:**
+
+1. **AM portfolio scan — accept `_mp >= 0`:**
+```python
+# BEFORE:
+if _mp and not math.isnan(_mp) and _mp > 0:
+# AFTER:
+if isinstance(_mp, (int, float)) and not math.isnan(_mp) and _mp >= 0:
+```
+
+2. **After AM "spread too small" else-branch — set worthless flag:**
+```python
+if _am_spread <= 0.05:  # Fix BU: near-zero portfolio spread = worthless spread
+    _af2_theo_worthless = True
+    logger.info("[%s] Fix BU: AM portfolio spread=%.4f <= 0.05 -- treating as worthless", symbol, _am_spread)
+```
+
+3. **Skip gate guard — bypass when worthless:**
+```python
+# BEFORE:
+if limit is None:
+# AFTER:
+if limit is None and not _af2_theo_worthless:  # Fix BU: let worthless fall through
+```
+
+**Impact:**
+- BK/NWG: `ib.portfolio()` returns `marketPrice=0.0` for both legs → `_am_spread=0.0 <= 0.05` → `_af2_theo_worthless=True` → skip gate bypassed → `both_worthless=True, skip_combo=True` → `$0.05` individual leg orders
+- AF2 wrong-strike theo no longer falsely blocks worthless detection
+- Normal spreads with valid portfolio prices (> 0.05 combined) unchanged
+
+---
+
+### Fix BV: Log Limit Price in DCM Reconcile Close Attempts (Mar 9)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_try_close_from_positions` ~line 1260; `_reconcile_positions_with_signals_lookback` ~lines 2606–2619)
+
+**Issue:** DCM-directly-placed close orders via `_try_close_from_positions()` / `_place_combo()` logged `placed` in the attempts CSV without any limit price. CP's reconcile entry showed `reconcile_flip_call_to_put,placed` with empty `limit`, `longK`, `shortK`, `order_type` columns — impossible to audit what was submitted.
+
+**Root cause:** `_try_close_from_positions()` returned `bool`. The `theo_limit` value was computed inside the nested `_place_combo()` closure but never surfaced to the outer function or the reconcile caller.
+
+**Fix — three changes:**
+
+1. **`_try_close_from_positions()` return type → `tuple[bool, float | None]`**: Used `nonlocal _bv_limit_used` closure variable to capture `theo_limit` at the `return True` site inside `_place_combo()`. Changed outer `return submitted` → `return submitted, _bv_limit_used`. All early `return False` sites became `return False, None`.
+
+2. **`_bv_limit_used = theo_limit` before `return True`:**
+```python
+_bv_limit_used = theo_limit  # Fix BV: capture limit for return
+return True
+```
+
+3. **Callers unpack and log limit:**
+```python
+ok, _bv_limit = self._try_close_from_positions(sym, prefer="LMT", side=try_side)
+# ...
+_AttemptLogger.write(..., limit=_bv_limit)  # Fix BV: log limit price
+```
+
+**Impact:** Reconcile-placed close orders now show the LMT price in the attempts CSV. For MKT fallback orders, `_bv_limit = None` (correct — no limit). For LMT orders, shows the CSV theo value (e.g., CP: `limit=1.94`, PBR: `limit=0.50`).
+
+---
+
+### Fix BX: `_try_close_from_positions()` Use clientId=101 — Preclose Cancel Race (Mar 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_try_close_from_positions()`, line ~1286)
+
+**Issue:** `_try_close_from_positions()` (reconcile's direct BAG close) used `clientId = 900 + random.randint(0, 99)`. `_cancel_symbol_close_orders()` (preclose cancel) uses `clientId=101`. IB only allows the placing clientId to cancel an order. Result: preclose called `ib.cancelOrder()` for reconcile-placed orders (clientId=9XX) → IB silently returned Error 10147 → BO polling loop timed out after 10s → preclose proceeded with stale order still active → PlaceAnOrder's close guard found it → `close_call,skipped,existing_working_close` → new live-join order blocked.
+
+**Affected on March 10:** CP (`force_close,error,place_failed_positions,limit=1.86`), CTVA (same). Both eventually closed at 5 PM reconcile.
+
+**Fix:** `client_id = 101` (hard-coded). Sequential safety: `_try_close_from_positions()` runs inside `_reconcile_positions_with_signals_lookback()` at 5 PM, which runs BEFORE `_after_hours_batch_placement()` launches PlaceAnOrder subprocesses. No concurrent clientId=101 session.
+
+**Impact:** Reconcile close orders can be cancelled by preclose. CP/CTVA-style stale blocking eliminated.
+
+---
+
+### Fix BY: Worthless Spreads — Qualify Contract Before Individual SELL (Mar 11)
+**Status:** ✓ IMPLEMENTED (revised after investigation)
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, `both_worthless` SELL placement, line ~2741)
+
+**Issue:** NWG and BK individual SELL legs got Error 201. Initial theory (account Level 3 spread-only permissions) was incorrect — selling a long option you hold is Level 1, never needs special permissions. The one-leg-worthless path already called `qualifyContracts()`; the both-worthless path used raw position contracts from `ib.positions()` which may lack `localSymbol`/`tradingClass`/`multiplier` fields IB needs for routing.
+
+**Fix — qualifyContracts before SELL (both_worthless path):**
+```python
+try:
+    _qc_by = ib.qualifyContracts(c)
+    if _qc_by:
+        c = _qc_by[0]
+except Exception as _qc_err:
+    logger.warning("[%s] Fix BY: qualifyContracts failed for SELL %s: %s", ...)
+```
+
+Also removed `[:120]` truncation from Fix BS rejection warning so the full IB error is visible.
+
+**Impact:** Qualified contract fields filled in → IB accepts individual SELL for long-held option → Error 201 resolved.
+
+---
+
+### Fix BZ: `both_worthless` Always Uses Individual Legs — Remove BAG MKT Override (Mar 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, `both_worthless` detection block, line ~2234)
+
+**Issue:** Fix BY originally added `if allow_market_fallback: skip_combo=False, order_type=MKT` — forcing a BAG MKT SELL at preclose for worthless spreads instead of the intended `$0.05` individual leg close. This was based on an incorrect assumption about account permissions (since fixed by qualifyContracts). Additionally, it bypassed the join-limit → MKT-last-resort flow for worthless spreads at preclose.
+
+**Fix:**
+```python
+# BEFORE (Fix BY incorrect branch):
+elif long_worthless and short_worthless:
+    both_worthless = True
+    if getattr(args, "allow_market_fallback", False):
+        skip_combo = False
+        order_type = "MKT"   # bypasses individual legs AND join-limit attempt
+    else:
+        skip_combo = True
+
+# AFTER (Fix BZ):
+elif long_worthless and short_worthless:
+    both_worthless = True
+    skip_combo = True  # always → individual legs ($0.05 each)
+```
+
+**Preclose MKT last resort** (for non-worthless spreads only) remains at the skip gate (line ~2079): live join → CSV → portfolio → if all fail and `allow_market_fallback` → MKT. Worthless spreads never reach that gate.
+
+**Impact:**
+- `both_worthless` at any context → individual legs: SELL long @$0.05, BUY short @$0.05
+- MKT at preclose only for non-worthless spreads where all pricing sources fail
+- Attempts CSV: `close_individual_leg,placed,both_worthless_fixed_price` (no `market_fallback_preclose` for worthless)
+
+---
+
+### Fix CA: DTE Age Filter — Skip When DTE ≥ 30 (Mar 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_process_vertical()`, DTE estimate block ~line 2845)
+
+**Issue:** CUBE/GLPI/NI (April 17 expiry) were never queued for risk exits. Root cause: fallback DTE age estimate `max(0, 30 - dte)` returned 0 for dte=37 (0 < days_old=2 → "too new"). For positions with DTE ≥ 30, we can't estimate age from DTE alone (entry DTE could be 30–60+ days), so the estimate is meaningless.
+
+**Fix:** When DTE < 30, keep the estimate logic unchanged. When DTE ≥ 30, skip the age filter entirely — evaluate TP/SL regardless. Log at INFO level (was LOG.debug) so it's visible.
+
+**Impact:** April/May options evaluated for TP/SL on their own merit, not wrongly blocked as "too new".
+
+---
+
+### Fix CB: Z4 Guard Writes Attempts CSV Entry (Mar 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_process_vertical()`, Z4 guard block ~line 2960)
+
+**Issue:** When Z4 found an existing working close order and skipped PlaceAnOrder, it only called `LOG.info()`. The attempts CSV showed a `queued` entry with no follow-up — invisible in post-trade audit (BK/CP/PBR at 9:47 AM today).
+
+**Fix:** Added `_AttemptLogger.write(action="close", status="skipped", reason="z4_working_close_exists")` inside the Z4 skip block.
+
+**Impact:** After the `queued` entry, the CSV now shows `skipped,z4_working_close_exists` explaining why PlaceAnOrder was not called.
+
+---
+
+### Fix CD: Add `--live-timeout 10` to Preclose Force-Close Args (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_submit_close_shared()`, `force_close_args` ~line 584)
+
+**Issue:** Preclose PlaceAnOrder subprocess called `live_spread_price()` with the default 3.0s timeout (`--live-timeout` not passed). On a fresh subprocess connection, IB returns `bid=-1` for the first 3+ seconds → join returns None → stale CSV fallback fires with previous day's prices → SELL limits placed above today's mid (PBR $0.47 > mid $0.44, GLPI $0.45 > mid $0.30).
+
+**Root cause confirmed** by reverse-computing from portfolio prices in ib_cycle.log: GLPI $0.45 ≈ CSV($0.50)×0.95×0.95; PBR $0.47 ≈ CSV($0.52)×0.95×0.95. Join for ITM PBR should give bid(17C)-ask(17.5C) = 2.28-2.04 = $0.24.
+
+**Fix:** Add `"--live-timeout", "10" if context == "preclose" else "5"` to `force_close_args`.
+
+**Why 10s**: Risk exits use 8s (Fix Y1). At 3 PM (deep RTH), feeds are active — 10s conservatively ensures bid/ask populates.
+
+**Impact:** ITM options (PBR type): join returns the correct ~$0.24 within 10s → fills immediately.
+
+---
+
+### Fix CE: Try "mid" Scheme Before Fix AM Portfolio Fallback (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, after `live_spread_price()` call ~line 1935)
+
+**Issue:** For OTM options (GLPI 50C with stock below $48), `bid(long)=0` structurally → `val = 0 - ask(short) < 0` → join returns None regardless of timeout. Fix AM then fires and gives above-mid pricing from IB's theoretical portfolio marks ($0.45 from AM vs true mid $0.30).
+
+**Fix:** When join returns None, try `live_spread_price()` with `scheme="mid"` before falling through to CSV/AM. Mid uses `(bid+ask)/2` per leg — even when bid=0, `mid = ask/2` ≤ displayed ask, which is a valid below-mid price.
+
+```python
+if lim is None and scheme == "join":
+    lim = live_spread_price(..., scheme="mid", timeout=getattr(args, "live_timeout", 3.0))
+    if lim is not None:
+        logger.warning("[%s] Fix CE: join returned None; mid fallback=%.2f ...", ...)
+```
+
+**Impact:** GLPI 50/52.5C (bid=0 OTM): mid ≈ ask(50C)/2 - mid(52.5C) ≈ $0.12 (below displayed mid $0.30). Fix AM only fires when both join AND mid fail (structurally broken market data).
+
+---
+
+### Fix CH: Wire Up `--preclose` and `--risk-exits-only` CLI Flags in DCM `__main__` (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (first `if __name__ == "__main__":` block, ~line 3655)
+
+**Issue:** Two `if __name__ == "__main__":` blocks existed. The first (line 3624) called `r.daily_trading_cycle()` + `sys.exit()`, making the second argparse block (line 3666) entirely dead code. Menu 8→2 (`--preclose`) and `ForceMktClose.cmd` ran the full time-aware `daily_trading_cycle()` instead of `_pre_close_market_conversion()` directly. At 11 AM the cycle hung on enrichment subprocesses. `--risk-exits-only` from `RiskExitsRetry.cmd` was also silently ignored.
+
+**Fix:** Added CLI flag interception before `daily_trading_cycle()` in the first block:
+```python
+_ch_argv = set(sys.argv[1:])
+if "--preclose" in _ch_argv:
+    r._pre_close_market_conversion()   # no time guard
+    sys.exit(0)
+if "--risk-exits-only" in _ch_argv:
+    r._enrich_today_and_prev_trading_day(only_rth=True)  # best-effort
+    r._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
+    sys.exit(0)
+# default: daily_trading_cycle() for PlaceOpen.cmd / no-args scheduled tasks
+```
+
+**Impact:**
+- Menu 8→2 at any time → directly runs `_pre_close_market_conversion()`, completes in ~1 min
+- `ForceMktClose.cmd` at 3 PM → same (was relying on time-aware cycle, now explicit)
+- `RiskExitsRetry.cmd` at 10:30 AM → now correctly runs risk exits retry (not full cycle)
+- `PlaceOpen.cmd` (no args) → unchanged, still runs `daily_trading_cycle()`
+
+---
+
+### Fix CG: Error 10197 Fast-Fail + Delayed Data Retry in `live_spread_price()` (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`live_spread_price()`, lines ~765–870)
+
+**Issue:** IB paper trading returns Error 10197 "No market data during competing live session" immediately when PlaceAnOrder subprocess calls `reqMktData()` while the OptionsListener holds the live data session. `live_spread_price()` had no error detection — it polled for 10s (Fix CD timeout) then silently returned None. With join + mid both trying: 10s + 10s = 20s wasted per symbol before falling through to Fix AM.
+
+**Fix — two phases:**
+
+1. **Hook `ib.errorEvent`** before `reqMktData()`. When error codes 10197, 10091, or 354 are received, fast-fail the real-time poll (after ~0.2s instead of 10s) with a WARNING log naming the exact error code.
+
+2. **Retry with delayed data** (`ib.reqMktDataType(3)`): 15-minute delayed quotes use a separate IB feed not blocked by competing live session restrictions. If delayed bid/ask arrives within 5s, compute and return the price. Always restores `reqMktDataType(1)` in `finally`.
+
+```python
+# Error 10197 fires at ~0.1s after reqMktData → first poll tick → fast-fail
+# → ib.reqMktDataType(3) → reqMktData again → delayed price in ~1-2s
+```
+
+**Log output (paper trading):**
+```
+[PBR] live_spread_price(join): IB Error 10197 'No market data...' after 0.2s — retrying with delayed data
+[PBR] Fix CG: delayed data (15-min) result=0.24 (scheme=join, waited=1.4s)
+```
+
+**On live trading:** Error 10197 doesn't occur → Phase 1 returns real-time price normally. No change in live behaviour.
+
+**Impact:** Per-symbol preclose time drops from ~20s (two 10s timeouts) to ~0.2s (fast-fail) + ~1-5s (delayed data). Paper trading gets accurate 15-min delayed bid/ask for limit pricing instead of falling through to Fix AM portfolio marks.
+
+---
+
+### Fix CI: Multi-Expiration Close Guard Bypass (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`place_debit_spread()` ~line 977; `force_close_symbol_via_positions()` ~line 1991)
+
+**Issue:** PBR had two active CALL spreads with different expirations (17/17.5C exp April 2 and 18/18.5C exp March 13). `force_close_symbol_via_positions()` correctly iterated both pairs, but `place_debit_spread()`'s close guard `has_working_auto_close(symbol)` checks symbol only — no expiration. After the April 2 spread was placed, the guard found a working SELL BAG for "PBR" and blocked the March 13 spread → `place_failed_positions`.
+
+**Fix — three changes:**
+1. Added `skip_close_guard: bool = False` parameter to `place_debit_spread()`. Guard becomes `if not skip_close_guard and has_working_auto_close(symbol):`
+2. In `force_close_symbol_via_positions()`, initialized `_ci_submitted_right_exp: set[tuple[str, str]] = set()` before the spread pair loop.
+3. After the `CLOSE_SEEN_KEYS` check (which is exp-aware), compute `_ci_skip_guard = any(placed_right == right and placed_exp != str(exp) for placed_right, placed_exp in _ci_submitted_right_exp)`. Pass `skip_close_guard=_ci_skip_guard` to `place_debit_spread()`. On success, add `(right, str(exp))` to the tracker.
+
+**Safety:** Only bypasses the guard when a different-expiration spread for the same right was already submitted this run. Same-exp duplicates are caught by `CLOSE_SEEN_KEYS` before `_ci_skip_guard` is even evaluated.
+
+**Impact:** Symbols with two active spreads of different expirations (rollover scenario, double entries) now get both spreads closed in the same preclose/reconcile run.
+
+---
+
+### Fix CJ: `openClose = "C"` on All Individual Leg Orders (Mar 13)
+**Status:** ✓ IMPLEMENTED (but did NOT fix Error 201 — see Fix CK)
+
+**Location:** `PlaceAnOrder.py` (6 individual leg placement sites)
+
+**Fix:** Added `leg_order.openClose = "C"` to all individual leg orders. The theory was IB would recognize the SELL as "closing" (not "opening"). In practice, Error 201 still fires — `openClose` on the `Order` object does not affect IB's strategy-level permissions check.
+
+---
+
+### Fix CK: Error 201 on Individual SELL → BAG Combo Fallback (Mar 13, price updated Mar 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, `both_worthless` block inside `if skip_combo and use_fallback and both_worthless:`)
+
+**Issue:** NWG CALL 20/22.5 and BK CALL 130/135 — individual SELL orders for the long (worthless) leg fail with Error 201. Fix BS detects the rejection; Fix BY + Fix CJ do not prevent it. Root cause: IB's risk engine classifies any individual API OPT SELL as "writing an option" (permissions check), regardless of `openClose="C"` or `qualifyContracts()`. A BAG combo SELL is classified as "closing a held debit spread" (no permissions check).
+
+**Fix:** After the individual SELL's Fix BS check, if `why == "bs_rejected"`, retry as BAG combo SELL at $0.05 via `place_debit_spread()`:
+```python
+if not ok and why == "bs_rejected":
+    tr_ck = place_debit_spread(ib, symbol, str(exp), float(longK), float(shortK), right,
+                               limit_price=0.05, quantity=qty,
+                               action="SELL", order_type="LMT", role="force_close")
+    if tr_ck is not None:
+        # log both_worthless_bag_e201_fallback, increment submitted
+    else:
+        # log both_worthless_bag_e201_failed
+    break  # BAG handles both legs; skip individual BUY
+```
+
+Individual legs tried first (user preference). BAG only as Error 201 fallback.
+
+Why $0.05: minimum exchange tick — matches individual leg pricing, higher fill probability than $0.01.
+
+**Impact:**
+- Attempts CSV: `close_individual_leg,error,bs_rejected` → `force_close,placed,both_worthless_bag_e201_fallback,limit=0.05`
+- No second Error 201 (BAG = spread close, no permissions check)
+- On live accounts where individual SELL is allowed: `why != "bs_rejected"` → BAG fallback never triggers
+
+---
+
+### Fix CL: Single-Leg Orphan Close in force_close Path (Mar 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, after spread-pair loop, before `return submitted`)
+
+**Issue:** After manually buying back a short leg (e.g., O 70C), the long leg (O 67.5C) remains as an isolated position. `_iter_spread_pairs_from_positions()` only yields matched pairs — isolated longs are silently excluded and never enter any close path during 9:45 AM cleanup, 10:30 AM retry, or 3 PM preclose runs.
+
+**Note on existing coverage:** Fix AA6 (DCM) already handles single-leg orphans in the 5 PM reconcile via `len(legs)==1` detection. Fix CL covers the gap for force_close invocations from PlaceAnOrder.py.
+
+**Key insight:** Selling an isolated long with NO paired short does NOT create naked exposure (unlike NWG/BK where selling the long while still short the other strike = naked short). Individual SELL of an isolated long = covered close = Level 1. Error 201 should not fire.
+
+**Fix:** Added `_cl_covered` set (tracks `(right, exp, longK)` tuples seen by the spread-pair loop). After the loop, scans `ib.positions()` for OPT longs for the same symbol not in `_cl_covered`. For each orphan:
+1. `qualifyContracts()` + `LimitOrder("SELL", qty, 0.05)` with `outsideRth=True`, `openClose="C"`
+2. Fix BS 1.0s check for async Error 201
+3. Success → `close_individual_leg,placed,single_leg_orphan` in attempts CSV
+4. Error 201 → `close_individual_leg,error,cl_error_201` (cannot use BAG — no paired short)
+
+**Impact:**
+- Isolated long positions auto-close during morning cleanup and preclose runs
+- Attempts CSV shows `single_leg_orphan` reason so these are auditable
+- If Error 201 still fires (unexpected), logged clearly so it's diagnosable
+
+---
+
+### Fix CN: `lookback_days=2` Misses Prior-Week CSV on Mondays (Mar 16)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_cancel_low_oi_working_orders_from_csv` signature ~line 3189; Cycle C call ~line 3533)
+
+**Issue:** `_csv_paths_by_priority(days=lookback_days)` uses calendar days. On Monday: d=0=today (no CSV), d=1=Sunday (no CSV) — Thursday's CSV (d=3) was never checked. Log confirmed `"CSV OI cancel: no combined CSV rows available (today/prior-day missing); skipping."` on March 16 while FER/HTO/PFS/WBD BUY orders sat uncancelled.
+
+**Fix:** Changed `lookback_days=2` → `lookback_days=7` in both the default parameter and the Cycle C call. `_csv_paths_by_priority` skips missing files, so extra days cost only `os.path.exists` checks.
+
+**Impact:** Monday 9:45 AM correctly finds Thursday's CSV (d=3). 4-day holiday weekends (d=5) also covered.
+
+---
+
+### Fix CP: Retry Skipped OPEN Orders at 10:00 AM (Mar 16)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (new `_retry_skipped_opens_from_prev_day()` method; `--place-skipped-opens` CLI flag ~line 3751); `C:\OptionsHistory\bin\PlaceSkippedOpens.cmd`; Windows Task Scheduler (`IB_PlaceSkippedOpens_1000`); `LiquidityFilter.py` (`populate_missing_strikes()` trigger ~line 360)
+
+**Issue:** At 5 PM, `_delegate_open_from_recent_csvs()` skips signals with `no_viable_limit_or_conditions` when all pricing fails — market is closed (no live bid/ask) and listener theo values are missing or invalid. On 2026-03-16: LOW, ROST, RYCEY, SHEL were all skipped.
+
+**Root cause for LOW/ROST/RYCEY/SHEL specifically:** the listener's `qualify_options` stage failed at signal time. The `except` handler set `atm_strike = round(current_price)` — a rounded non-IB value (e.g. LOW=242, real strikes are 240/245). `otm_strike_call/put` were left empty. PlaceAnOrder inferred `k_call = 242+5 = 247` (also invalid). `qualifyContracts(242/247)` fails → `no_viable_limit_or_conditions`. Plain 9:45 AM enrichment can't fix this: it uses the bad ATM from the CSV and silently fails.
+
+**Fix — three parts:**
+
+**Fix CP (core):** New `_retry_skipped_opens_from_prev_day()` method that finds the previous day's attempts CSV, collects all `open_call/open_put,skipped,no_viable_limit_or_conditions` symbols, and runs `PlaceAnOrder --mode from-signal --date {prev_day} --symbols ... --use-live-open join`.
+
+**Fix CP-A** (`LiquidityFilter.py` ~line 360): Extended `populate_missing_strikes()` trigger to also fire when both `otm_strike_call` AND `otm_strike_put` are empty (even if `atm_strike` is present but invalid). `_get_atm_and_otm_strikes()` re-snaps to the nearest real IB strike and fills in proper OTM strikes.
+
+**Fix CP-B** (`DailyCycleManagement.py` ~line 3751): Added `_populate_missing_strikes_today_and_prev()` call to `--place-skipped-opens` block BEFORE enrichment. Order: snap invalid strikes → enrich (now with valid ATM/OTM) → retry skipped opens.
+
+**New files:**
+- `C:\OptionsHistory\bin\PlaceSkippedOpens.cmd` — same pattern as `RiskExitsRetry.cmd`, logs to `ib_cycle.log`
+- Windows task `IB_PlaceSkippedOpens_1000` — Mon–Fri at 10:00 AM
+
+**Timeline:** 9:45 AM enrichment → 10:00 AM `PlaceSkippedOpens.cmd` (snap strikes → enrich → retry skipped OPENs) → 10:30 AM `RiskExitsRetry.cmd` (cancels any low-OI orders placed at 10:00 AM + risk exits)
+
+**Impact:** LOW/ROST/RYCEY/SHEL-type signals skipped at 5 PM are automatically retried the next morning with corrected strikes and live pricing. No duplicate-open risk — PlaceAnOrder's position guard skips symbols already held.
+
+---
+
+### Fix CQ: `--allow-prev-day-opens` — 10 AM Retry Was Filtering Out All Prev-Day Signals (Mar 17)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (argparse ~line 497; same-day filter ~line 3141); `InteractiveBrokersTrader/DailyCycleManagement.py` (`_retry_skipped_opens_from_prev_day()` ~line 3484)
+
+**Issue:** `PlaceSkippedOpens.cmd` (10 AM retry via Fix CP) called PlaceAnOrder with `--date 26_03_16` but placed 0 orders — no entries in the prev-day attempts CSV. Root cause: PlaceAnOrder has a same-day filter (~line 3138) that drops OPEN signals whose timestamp ≠ today's date. Signals in the March 16 CSV are timestamped March 16; today is March 17 → all 9 OPEN signals filtered out. Log: `"Filtered OPEN signals to same-day: 0/9 (date=2026-03-17)"`.
+
+**Fix — two changes:**
+
+1. **`PlaceAnOrder.py`** — added `--allow-prev-day-opens` flag (default False). When set with `--date`, uses the CSV date instead of today for the same-day filter:
+```python
+if getattr(args, "allow_prev_day_opens", False) and args.date:
+    _y, _m, _d = args.date.split("_")
+    today_ny = datetime(2000 + int(_y), int(_m), int(_d)).date()
+else:
+    today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+```
+
+2. **`DailyCycleManagement.py`** `_retry_skipped_opens_from_prev_day()` — passes both new flags:
+```python
+"--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
+"--oi-check", "off",       # Fix CQ: OI not populated for skipped-opens; 10:30 AM cleanup cancels low-OI orders
+```
+
+**Safety:** `--allow-prev-day-opens` defaults to False — zero change to all other PlaceAnOrder callers (nightly cycle, preclose, risk exits). Only the 10 AM retry path passes it.
+
+**Result on March 17:** LOW placed C 245/250 Apr 10 @ $2.26 ✓; SHEL placed C 92.5/95 Apr 17 @ $1.35 ✓; ROST/RYCEY still skipped (`qualify_failed` — ROST only has $10 spreads, RYCEY has no options).
+
+---
+
+### Fix CO: Add OI Cleanup to 10:30 AM Risk Exits Retry (Mar 16)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`--risk-exits-only` block ~line 3673)
+
+**Issue:** `_rth_liquidity_cleanup()` and `_cancel_low_oi_working_orders_from_csv()` only ran at 9:45 AM. If live OI was unavailable at open (market data not initialized), there was no retry — low-OI orders sat uncancelled all day.
+
+**Fix:** Added both OI cleanup calls to the `--risk-exits-only` path (10:30 AM `RiskExitsRetry.cmd`), after the existing enrichment call and before risk exits:
+```python
+r._cancel_low_oi_working_orders_from_csv(threshold=MIN_OI_FOR_RTH, lookback_days=7)
+r._rth_liquidity_cleanup()
+```
+Both wrapped in individual try/except so a failure doesn't block risk exits.
+
+**Impact:** By 10:30 AM market data is reliably available. FER/HTO/PFS/WBD-type low-OI orders get a second cancellation pass.
+
+---
+
+### Fix CM: Gate Weekend Runs in daily_trading_cycle() (Mar 15)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`is_after_market_close()` ~line 2025; `daily_trading_cycle()` `else` branch ~line 3566)
+
+**Issue:** All scheduled tasks use Daily triggers (no weekday filter). `is_after_market_close()` returned `True` on non-trading days (line: `return True`), causing the Saturday 5 PM task to run the full after-hours batch + reconcile. The `else` branch in `daily_trading_cycle()` (pre-market / pre-close window) also ran `_reconcile_positions_with_signals_lookback()` on Saturday mornings.
+
+**Fix — two changes:**
+1. `is_after_market_close()`: changed `return True` on non-trading days → `return False`. Weekends/holidays are not "after market close" from the system's perspective.
+2. `else` branch: added `if not self._is_trading_day(now): return` guard at top so Saturday pre-market runs exit immediately.
+
+**Impact:**
+- Saturday: all `daily_trading_cycle()` calls return early — no orders placed, no reconcile runs
+- Sunday: `IB_Sunday_Reconcile_1700` task calls `_reconcile_positions_with_signals_lookback()` directly, unaffected by this change
+- Weekdays: `is_after_market_close()` still returns `True` after 4 PM ET as before
+
+---
+
+### Fix CF: Emit WARNING (not INFO) for Pricing Source in Preclose (Mar 13)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PlaceAnOrder.py` (`force_close_symbol_via_positions()`, CSV fallback ~line 2003 and Fix AM ~line 2085)
+
+**Issue:** `--quiet` flag sets root logger to WARNING, suppressing all `logger.info()` pricing decision logs. Which pricing path fired (join/mid/CSV/AM) was invisible in ib_cycle.log — required portfolio math to diagnose.
+
+**Fix:** Changed CSV fallback and Fix AM log lines from `logger.info` → `logger.warning`. Fix CE log already at WARNING. Updated log messages to include "Fix CF:" prefix for grepping.
+
+**Impact:** `ib_cycle.log` shows `[PlaceAnOrder stderr] Fix CF: CSV fallback limit=...` or `Fix CF: AM portfolio-based limit=...` or `Fix CE: join returned None; mid fallback=...` for each preclose order. No more mystery pricing.
+
+---
+
+### Fix CC: Reconcile Force-Close Uses clientId=101 (Not 102) (Mar 11)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_reconcile_positions_with_signals_lookback()`, reconcile force-close fallback `_run_place_an_order` args ~line 2639)
+
+**Issue:** CP/NI/PBR had BO cancel timeouts at 3 PM: `"Fix BO: Timeout waiting for cancel confirmation — proceeding anyway"`. Root cause: these orders were placed by the reconcile's force-close fallback with `--client-id 102`. `_cancel_symbol_close_orders()` uses clientId=101. IB only allows the placing clientId to cancel → Error 10147 → 10-poll timeout → DCM proceeds → PlaceAnOrder's close guard sees the still-active order → `existing_working_close` blocks new order → no replacement placed.
+
+CUBE worked because `_try_close_from_positions()` (clientId=101 after Fix BX) placed it — cancel via clientId=101 confirmed immediately.
+
+**Fix:** Changed `"--client-id", "102"` → `"--client-id", "101"` in the reconcile force-close fallback. Safe because reconcile runs sequentially (no concurrent PlaceAnOrder at 5 PM).
+
+**Impact:** All reconcile-placed close orders now use clientId=101. `_cancel_symbol_close_orders()` can cancel them. BO poll confirms immediately. New live-join order replaces the stale one at 3 PM.
+
+---
+
+### Fix BW: Risk Exit Placed Entries Missing from Attempts CSV (Mar 9)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`_attempts_append` ~line 280; `place_debit_spread` ~line 1115; `_await_working` ~line 324)
+
+**Issue:** PBR and CP risk exit orders were placed successfully (confirmed pending in TWS all day, cancelled at close; reconcile at 4 PM saw `working_close_order` for both) but their `force_close,placed,success` entries were absent from the attempts CSV. Only `queued` entries existed.
+
+**Root cause:** On Windows, if the attempts CSV file is briefly locked (OS hasn't fully released it from DCM's write 2 seconds prior, or antivirus scan), `path.open("a")` raises `PermissionError`. This was caught by `except Exception as e: logger.warning(...)` in `_attempts_append()` — but the warning only went to `logger` (stdout/stderr), and the caller in `place_debit_spread()` had `except Exception: pass` which silently discarded it entirely.
+
+**Fix — three changes:**
+
+1. **`_attempts_append()` — retry once on failure:**
+```python
+import time as _time_bw
+for _bw_retry in range(2):
+    try:
+        with path.open("a", ...) as f:
+            ...
+        return path  # success
+    except Exception as e:
+        if _bw_retry == 0:
+            _time_bw.sleep(0.5)  # Fix BW: pause then retry (Windows file lock)
+        else:
+            logger.warning(f"Failed to append attempts to {path} after retry: {e}")
+            return None
+```
+
+2. **`place_debit_spread()` — expose write failure instead of silent pass:**
+```python
+# BEFORE:
+except Exception:
+    pass
+# AFTER:
+except Exception as _bw_write_err:
+    logger.warning("Fix BW: record_attempt write failed for %s: %s", symbol, _bw_write_err)
+```
+Since `_run_place_an_order()` uses `capture_output=True`, this warning surfaces in DCM's `[PlaceAnOrder stderr]` log line in ib_cycle.log.
+
+3. **`_await_working()` — accept `Filled` as working state:**
+Added `"Filled"` check in the polling loop. TP orders that fill immediately (spread already at max profit price → crosses book on submission) will now return `True, "Filled"` instead of timing out at 3s and returning `False, "Filled"`. Entry logs as `placed,success` instead of `submitted,not_working:Filled`.
+
+**Impact:**
+- Transient Windows file lock on CSV → retry after 0.5s → entry written on second attempt
+- If write still fails after retry → visible error in ib_cycle.log (`[PlaceAnOrder stderr] Fix BW: record_attempt write failed for PBR: ...`) instead of silent drop
+- Immediately-filled TP orders logged as `placed,success` with correct limit value
+
+
+---
+
+### Fix CU: BounceServices — Poll Until Services Fully Stop Before Restarting (Mar 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd`
+
+**Issue:** BounceServices was triggering restart cascades with two recurring errors:
+1. `IBGateway: Unexpected status SERVICE_STOP_PENDING` — `nssm start IBGateway` fired while IBGateway was still stopping from a previous BounceServices call
+2. `[SC] StartService FAILED 1056: An instance of the service is already running` — `sc start OptionsListener` fired before `sc stop` completed
+
+Both caused failed restarts (rc=1, health not 200) which triggered the watchdog to call BounceServices again 15 minutes later, perpetuating the cascade.
+
+**Fix:** Added polling wait loops after each stop command:
+- After `nssm stop IBGateway` + force-kill: poll `nssm status IBGateway` up to 20s until `SERVICE_STOPPED`
+- After `sc stop OptionsListener`: poll `sc query OptionsListener` up to 20s until `STOPPED`
+- Each loop logs a WARN if the timeout is reached but proceeds anyway
+
+**Impact:** Clean stop-before-start sequencing eliminates the "already running" and "STOP_PENDING" errors that caused cascade failures.
+
+---
+
+### Fix CV: Watchdog — Soft-Fail Re-Check for "IB Not Connected" (Mar 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (Check 2 block)
+
+**Issue:** The watchdog was triggering a 15-minute crash cascade by itself. When the listener reported `/health=200` but `positions_error: "not connected"` (soft failure — port still listening, listener still responding), the watchdog immediately called BounceServices which **killed IBGateway**. This caused the port to go down, which the next watchdog cycle detected as a hard failure and restarted again. The 15-minute restart interval matched exactly the watchdog's check interval.
+
+The listener has auto-reconnect logic and would have recovered on its own within 1-2 minutes without any intervention. The watchdog was treating a transient soft failure as a hard failure requiring full service restart.
+
+**Fix:** When `positions_error` is detected (soft failure), wait 2 minutes and re-check before triggering BounceServices:
+```powershell
+if ($body.positions_error) {
+    Write-Log "SOFT-FAIL: ... - waiting 2 min for auto-reconnect"
+    Start-Sleep -Seconds 120
+    # re-check /health
+    if ($body2.positions_error) {
+        Write-Log "FAIL: IB still not connected after 2 min"
+        $needFullRestart = $true
+    } else {
+        Write-Log "RECOVERED: IB reconnected on its own - no restart needed"
+        $httpOk = $true
+    }
+}
+```
+
+Port-down (hard failure) still triggers BounceServices immediately.
+
+**Note:** File must be saved as pure ASCII — em dash characters (`—`) in the script caused PowerShell parse failures on this server's older PS version, silently breaking the watchdog (exit code 1, no log output).
+
+**Impact:** Transient IB disconnects (listener auto-reconnects within 2 min) no longer trigger unnecessary BounceServices calls. The 15-minute cascade loop is broken.
+
+---
+
+### Fix CY: Cap Theo Spread Debit at 75% of Width (Mar 18)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` (`_theo_spread_debits`, lines 409-410)
+
+**Issue:** SKT CALL_OPEN placed at **$1.17** for a **$1-wide** spread (35/36C, Apr 17). A debit spread can never be worth more than its width at expiration ($1 max). The $1.17 limit filled only by luck — any reasonable market maker would reject it as mispriced.
+
+**Root cause:** SKT had inverted IV skew (`iv_atm=0.46`, `iv_otm=0.28`). `_theo_spread_debits()` prices the long 35C at 46% IV and the short 36C at 28% IV. Using inconsistent volatility across legs violates the no-arbitrage constraint that debit spread value ≤ width. Fix Y2 clamped to `>= 0` but had no upper bound.
+
+LiquidityFilter's `_fetch_live_spread_price()` already had `min(debit, width)` at line 653. The listener's theo computation was missing the equivalent cap.
+
+**Fix:**
+```python
+# BEFORE:
+out[f"call_debit_theo_{key}"] = max(0.0, float(call_long - call_short))
+out[f"put_debit_theo_{key}"]  = max(0.0, float(put_long - put_short))
+
+# AFTER (Fix CY):
+out[f"call_debit_theo_{key}"] = min(0.75 * W, max(0.0, float(call_long - call_short)))
+out[f"put_debit_theo_{key}"]  = min(0.75 * W, max(0.0, float(put_long - put_short)))
+```
+
+**Why 75% not 100%:** Buying a debit spread at 100% of its width is a guaranteed loss (no time value, breaks even only at max profit). 75% is a conservative practical maximum — real spreads rarely trade above ~70-80% of width before expiration.
+
+**Impact:** SKT `call_debit_theo_1`: 1.17 → 0.75. Symbols with inverted IV skew (`iv_atm > iv_otm`) no longer generate over-width theo prices that result in uneconomical limit orders.
+
+---
+
+### Fix CZ: Detect Manual TWS Orders in Low-OI Cancel + reqOpenOrders + Bounce Detection (Mar 19)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_low_oi_working_orders_from_csv` and `_rth_liquidity_cleanup`)
+
+**Issue:** SKT's low-OI cancel logged `cancel_open,placed,low_oi_both_legs` twice (9:46 AM and 10:31 AM) but the order remained active in TWS. The cancel silently bounced: `PendingCancel → Submitted` 41 seconds later. No exception was thrown so the code falsely reported success.
+
+**Root cause:** The SKT $0.75 order was placed manually in TWS (not via PlaceAnOrder API). Manual orders have `clientId=0` and `orderId=0`. IB's API policy is that manual orders can only be cancelled from the TWS GUI — `cancelOrder(orderId=0)` from any API client is silently rejected with a `PendingCancel → Submitted` bounce.
+
+Two distinct `orderId=0` cases exist:
+| Case | clientId | Cancel works? |
+|------|----------|---------------|
+| Manual TWS order | 0 | ❌ Never — must cancel in TWS GUI |
+| Previous-session API order | 101 (after reqOpenOrders) | ✅ After `reqOpenOrders()` reclaims |
+
+**Fix — three changes in both cancel functions:**
+
+1. **`reqOpenOrders()` after `reqAllOpenOrders()`:** Re-assigns previous-session clientId=101 orders to the current session, giving them valid orderIds (fixes case 2):
+```python
+ib.reqAllOpenOrders()
+ib.sleep(1.5)
+ib.reqOpenOrders()   # Fix CZ: reclaim previous-session orders → valid orderIds
+ib.sleep(0.5)
+trades = ib.openTrades() or []
+```
+
+2. **Manual order guard before cancel:**
+```python
+_order_client = getattr(s, "clientId", -1)
+if o.orderId == 0 and _order_client == 0:
+    LOG.warning("... manual TWS order (clientId=0, orderId=0); cancel in TWS manually")
+    continue
+```
+
+3. **Post-cancel bounce detection:** After `ib.cancelOrder(o)`, sleep 1s and verify the order is actually gone. If it bounced back to Submitted, skip the "placed" log:
+```python
+ib.sleep(1.0)
+_still_active = any(permId matches and status in submitted/presubmitted for t in openTrades())
+if _still_active:
+    LOG.warning("... cancel bounced ... Cancel in TWS.")
+    continue
+cancelled += 1
+LOG.info(...)  # only logged if cancel actually worked
+_AttemptLogger.write(...)
+```
+
+**Impact:**
+- Manual TWS orders: skip with WARNING "cancel in TWS manually" — no false `placed` in attempts CSV
+- Previous-session API orders: `reqOpenOrders()` reclaims them → valid orderId → cancel works
+- Attempts CSV: `cancel_open,placed,low_oi_both_legs` only written when IB confirmed the cancel
+
+---
+
+### Fix DA: Preclose Cancel — reqOpenOrders in `_cancel_symbol_close_orders()` + Re-verify Before PlaceAnOrder (Mar 19)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_cancel_symbol_close_orders()` ~line 387; `_submit_close_shared()` ~line 503)
+
+**Issue:** SHEL 92.5/95C Apr 17 had an existing close order at $1.05. The 3 PM preclose was supposed to cancel it and replace with a live-join-priced order. Instead the old $1.05 order stayed active. LOW (same preclose) worked correctly.
+
+**Exact failure trace from attempts CSV:**
+```
+15:01:59 — SHEL close,queued,preclose_fallback_live_join          ← Stage 2 queued
+15:02:39 — SHEL close_call,skipped,existing_working_close          ← PlaceAnOrder blocked
+15:02:39 — SHEL force_close,error,place_failed_positions @$0.80    ← no order placed
+15:02:42 — SHEL close,submitted,preclose_delegated_live_join_working ← FALSE SUCCESS (old order)
+```
+
+**LOW for comparison (worked correctly):**
+```
+15:01:09 — LOW cancel_close,placed,cancelled,"permId1|1,permId2|-1"  ← cancel confirmed
+15:01:09 — LOW close,placed,preclose_cancel_existing_close            ← n_cxl > 0
+15:01:10 — LOW close,queued,preclose_fallback_live_join               ← Stage 2 queued
+15:01:21 — LOW force_close,placed,success @$0.35                     ← order placed
+```
+
+Key difference: SHEL has NO `cancel_close,placed,cancelled` entry — `_cancel_symbol_close_orders()` returned `n_cxl=0`.
+
+**Root Cause — two bugs:**
+
+**Bug 1:** `_cancel_symbol_close_orders()` called `reqAllOpenOrders()` but NOT `reqOpenOrders()`. Previous-session API orders (placed by clientId=101 in a prior session) appear with `orderId=0` in ib_insync — they cannot be targeted for cancellation. `reqOpenOrders()` (Fix CZ pattern) re-claims these orders under the current session, giving them valid orderIds. SHEL's $1.05 order was a previous-session order → invisible to cancel → `n_cxl=0`.
+
+**Bug 2:** In `_submit_close_shared()`, after `_cancel_symbol_close_orders()` returns `n_cxl=0`:
+```python
+# BEFORE (BUG): set unconditionally even when cancel found nothing
+has_working = False
+```
+This let PlaceAnOrder run even though the old order was still active. PlaceAnOrder's close guard (fresh clientId=884, which DOES run `reqOpenOrders()` via ib_insync init) found SHEL's order → `existing_working_close` → blocked. The post-check `_has_working_close_order()` then found the old order and falsely logged `preclose_delegated_live_join_working`.
+
+**Fix — two changes:**
+
+**Change 1:** Add `reqOpenOrders()` to `_cancel_symbol_close_orders()`:
+```python
+ib.reqAllOpenOrders()
+ib.sleep(1.5)  # Fix AP/AR
+ib.reqOpenOrders()   # Fix DA: reclaim previous-session clientId=101 orders (same as Fix CZ)
+ib.sleep(0.5)
+trades = ib.openTrades() or []
+```
+
+**Change 2:** Replace `has_working = False` with re-verify logic in `_submit_close_shared()`:
+```python
+# Fix DA: Re-verify cancel actually cleared the order before running PlaceAnOrder.
+# If n_cxl=0 (reqOpenOrders didn't find the order) or BO polling timed out,
+# the old order may still be active — PlaceAnOrder's close guard would block anyway.
+has_working = self._has_working_close_order(sym)
+if has_working:
+    LOG.warning(
+        "[%s] Preclose: cancel returned n_cxl=%d but order still active — "
+        "skipping replacement (old order stays)",
+        sym, n_cxl,
+    )
+    self._attempt(
+        symbol=sym, action="close", status="skipped",
+        reason="preclose_cancel_failed_order_still_active",
+        source="dcm-preclose",
+    )
+    return
+```
+
+**Expected outcome:**
+
+| Scenario | Before Fix DA | After Fix DA |
+|----------|--------------|-------------|
+| SHEL-type (prev-session order, orderId=0) | n_cxl=0, sets has_working=False, PlaceAnOrder blocked | reqOpenOrders reclaims order, cancel succeeds, PlaceAnOrder places new order |
+| Cancel bounces (BO timeout) | has_working=False, PlaceAnOrder blocked by guard | Re-verify detects still-active order, skip with `preclose_cancel_failed_order_still_active` log |
+| Normal cancel (LOW-type) | Works correctly | Unchanged |
+
+**Impact:**
+- SHEL-type symbols: stale previous-session close orders now cancelled and replaced with live-join prices at 3 PM
+- Attempts CSV: no more `preclose_delegated_live_join_working` false positives when cancel failed
+- Clear `preclose_cancel_failed_order_still_active` log when cancel genuinely fails
+
+---
+
+### Fix DB: BounceServices — Move CloudflareTunnel Restart to After IBGateway+OptionsListener (Mar 19)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 8–9 removed, new block added after OptionsListener restart)
+
+**Issue:** On March 19, IBGateway lost its IB server connection 6 times (SOFT-FAIL pattern). Each triggered BounceServices. CloudflareTunnel was stopped and immediately restarted at the **top** of BounceServices with no wait between `sc stop` and `sc start`:
+
+```cmd
+sc stop  CloudflareTunnel  >>"%LOG%" 2>&1
+sc start CloudflareTunnel  >>"%LOG%" 2>&1   ← fires while still STOP_PENDING
+```
+
+`sc start` fired while the service was still in STOP_PENDING state → tunnel started in a broken state. IBGateway and OptionsListener then took 60+ seconds to restart (network disruption during that window crashed the tunnel connection to Cloudflare). The watchdog's post-restart health check only tests `/health` (which returns 200 regardless of tunnel status) → logged `RESTART OK` while tunnel was actually stopped.
+
+Result: every IB connection drop caused the tunnel to go down, blocking TradingView webhooks for up to 15 minutes between watchdog cycles.
+
+**Root cause of repeated SOFT-FAILs:** Paper trading server reliability — IBGateway loses upstream IB server connection transiently. Not fixable in code. The watchdog correctly handles these via BounceServices.
+
+**Fix:** Removed CloudflareTunnel stop/start from lines 8–9. Added it **after** OptionsListener is running (step 3), with a 15-second poll-until-stopped loop matching the same pattern as OptionsListener (Fix CU):
+
+```cmd
+REM Fix DB: Restart CloudflareTunnel AFTER IBGateway+OptionsListener are stable.
+REM Was at top with no wait (race condition) — sc start fired while still STOP_PENDING,
+REM leaving tunnel broken for the 60s IBGateway restart window.
+sc stop CloudflareTunnel >>"%LOG%" 2>&1
+for /l %%w in (1,1,15) do (
+  sc query CloudflareTunnel 2>nul | find "STOPPED" >nul && goto cf_stopped
+  timeout /t 1 >nul
+)
+>>"%LOG%" echo [BounceServices] WARN: CloudflareTunnel did not reach STOPPED within 15s; starting anyway
+:cf_stopped
+sc start CloudflareTunnel >>"%LOG%" 2>&1
+```
+
+**New restart order:**
+1. Stop + restart IBGateway (20s stop wait, 30s start wait)
+2. Stop + restart OptionsListener (20s stop wait)
+3. Stop + restart CloudflareTunnel (15s stop wait) ← moved here from top
+4. Health poll
+
+**Impact:**
+- CloudflareTunnel starts after IBGateway+OptionsListener are stable (network settled, Cloudflare connection succeeds)
+- No more tunnel-down after every IB connection drop that triggers BounceServices
+- Manual `BounceServices.cmd` still restarts all three services correctly
+
+---
+
+### Fix DC: Disable IBC AutoRestartTime (Live Account + 2FA) (Mar 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\IBC\config.ini`
+
+**Issue:** `AutoRestartTime=05:00 AM` caused IBC to restart IBGateway every morning at 5 AM. On a live account with mandatory 2FA, IBC cannot auto-login — IBGateway sits waiting for manual 2FA. The watchdog (starting at 6:07 AM) finds port 7496 not listening and calls BounceServices, creating a cascade lasting until ~6:52 AM.
+
+**Fix:** `AutoRestartTime=` (blank). Also added `ColdRestartTime=06:30 PM` for a weekly Sunday restart (user handles 2FA once per week).
+
+**Impact:** IBGateway stays connected indefinitely. Watchdog sees port 7496 listening at 6:07 AM → OK. No cascade.
+
+---
+
+### Fix DD: Use Attempts CSV for Position Age in Risk Exits (Mar 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_process_vertical()` inside `_rth_risk_exits()`, ~line 2858)
+
+**Issue:** WY PUT 22/23 (April 17) opened March 19 5 PM, risk-exited March 20 9:47 AM (only 17 hours later). The 2-day age filter failed: IB execution history was cleared by the 5 AM restart (Fix DC disabled this), DTE fallback estimated_age=2 which equals days_old=2, and `2 < 2 = False` let it through.
+
+**Fix:** When execution history is unavailable (`t0=None`), scan the last 21 days of attempts CSV files for a matching `open_call/open_put,placed,success` entry (symbol + right + exp + longK + shortK). Use that timestamp as `t0`. The attempts CSV is persistent and never cleared by IB restarts. Falls through to the DTE heuristic only if CSV lookup also fails. DTE heuristic comparison changed from `< days_old` to `<= days_old` as additional buffer.
+
+**Impact:** WY-type same-day-open positions correctly identified as too new via CSV timestamp. No change when IB execution history is available (normal case). Sunday restart scenario: Friday positions appear in CSV as 3+ days old → passes filter correctly.
+
+---
+
+### Fix DE: Health.ps1 — Closed P/L with BAG Price Matching + Report Improvements (Mar 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `Health.ps1` (repo root)
+
+**Issues addressed:**
+
+1. **Closed P/L probe** — "Last 20 Orders Closed" section was empty or showing individual leg lines instead of spread-level P/L. The probe was grouping OPT fills by symbol+time without reliably distinguishing opens from closes, and P/L was always $0.00 because commission reports aren't attached on fresh 2-second IB connections.
+
+2. **Attempts CSV from wrong folder** — "Order Attempts Summary" was reading from `C:\OptionsHistory\logs\` (yesterday's file, e.g. `attempts_26_03_19_100007.csv`) instead of today's day folder (`C:\OptionsHistory\26_03_20\`).
+
+3. **Section order** — "Recent Logs" section appeared before the Order Attempts Summary and PlaceAnOrder activity summaries.
+
+4. **Readability** — No blank line after `==== END ====`.
+
+**Fix — four changes:**
+
+**1. Closed P/L probe rewrite:** Uses 30-day `reqExecutions()` lookback. Groups all fills by `permId`. For each group, identifies BAG BOT (open) vs BAG SLD (close) fills using `secType=BAG` and `execution.side`. Matches each CLOSE to the most recent OPEN for the same symbol+right+exp (falls back to sym+right if no exp match). Computes `P/L = (close_bag_px − open_bag_px) × 100 × qty`. Estimates commission as `qty × 4 × $0.65` (labelled `est.`; uses attached commission report value if > $0.01).
+
+Output format per closed spread:
+```
+2026-03-20 09:48 EDT  WY 20260417 P  open=0.38 -> close=0.34  P/L=-4.00  comm est.: -2.60  net=-6.60
+```
+
+**2. Attempts CSV path fix:**
+```powershell
+# BEFORE:
+$attemptDir = 'C:\OptionsHistory\logs'
+$latestAttempts = Get-ChildItem -Path $attemptDir -Filter "attempts_${todayTag}*.csv" ...
+
+# AFTER:
+$attemptDir = "C:\OptionsHistory\$dated"   # $dated already = yy_MM_dd
+$latestAttempts = Get-ChildItem -Path $attemptDir -Filter 'attempts_*.csv' ...
+```
+
+**3. Section reorder:** "Recent Logs" moved to the very end of the report. Final order:
+1. Services / Tasks / Ports / Probes / P&L Summary
+2. Last 20 Orders Submitted
+3. Current Positions
+4. Last 20 Orders Closed (with P/L)
+5. `==== END ====` + blank line
+6. Order Attempts Summary (today's day folder)
+7. Recent PlaceAnOrder activity (ib_cycle.log)
+8. Recent Logs
+
+**4. Blank line after `==== END ====`:** Added `" " | Tee-Object -FilePath $Report -Append` after the END marker.
+
+**Impact:** Health report "Last 20 Orders Closed" now shows spread-level P/L with open→close price, net P/L after commission estimate. Order Attempts Summary always reads today's file. Logs section appears last for easier scanning of key data.
+
+---
+
+### Fix DF: 3 PM Re-Authentication Diagnostics (Mar 20)
+**Status:** ✓ IMPLEMENTED (diagnostic only — root cause not resolved by this fix)
+
+**Location:** `C:\OptionsHistory\bin\Snapshot1458.cmd` (NEW); Windows Task Scheduler (`IB_Snapshot_1458`, `IB_Snapshot_1502`); `C:\OptionsHistory\bin\IB_Watchdog.ps1` (PID logging added)
+
+**Issue:** IBGateway was requiring re-authentication at ~15:00 on trading days. Root cause was unknown; suspected triggers included the preclose API connections, IBC's `AutoRestartTime`, or the watchdog cascade.
+
+**Diagnostics implemented:**
+- `Snapshot1458.cmd` — captures IBGateway PID, port 7496 connected clients (netstat), service states, and backs up IBC session log before any 3 PM event can overwrite it
+- `IB_Snapshot_1458` task — runs at 14:58 Mon-Fri (pre-preclose baseline)
+- `IB_Snapshot_1502` task — runs at 15:02 Mon-Fri (post-preclose comparison)
+- `IB_Watchdog.ps1` — added IBGateway PID logging at every check; a PID change between entries indicates a restart occurred in that 15-min window
+
+Both snapshot tasks write to `C:\OptionsHistory\logs\snapshot_1458.log`. Compare the `tasklist` PID at 14:58 vs 15:02 — an identical PID means no restart at 3 PM.
+
+**What was NOT the solution:** Disabling `IB_PreClose_RestartListener_1530` (the 3:30 PM listener restart task) was investigated and ruled out — the cascade originated from a wrong trigger time (14:30 instead of 15:30, fixed in Fix AQ), not from the preclose connections themselves.
+
+**Actual root cause (identified later):** After the Sunday 6:30 PM IBGateway restart, IBGateway had no record of clientIds 890 and 892. The first connection from an unrecognised clientId on a live account triggers an approval dialog — not a full 2FA re-login. Fixed by Fix DG (pre-warm).
+
+---
+
+### Fix DG: Pre-Warm API ClientIds After IBGateway Restart (Mar 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\PrewarmApiConnections.py` (NEW); `C:\OptionsHistory\bin\PrewarmConnections.cmd` (NEW); Windows Task Scheduler (`IB_PrewarmApiConnections_1833`)
+
+**Issue:** On a live IB account, the first connection from an unrecognised clientId after an IBGateway restart triggers an approval dialog requiring user interaction. The preclose (`_pre_close_market_conversion`) makes three rapid connections with clientIds 887, 890, and 892 within 2 seconds. After the Sunday 6:30 PM ColdRestart, IBGateway had no record of these clientIds — connecting at 3 PM on Monday triggered the dialog, interrupting live trading. ClientIds are already fixed (not random); the issue is purely that IBGateway forgets all approved clients on restart.
+
+**Diagnosis:** ib_cycle.log showed clientId=887 (`_working_close_limit_symbols`), 890 (`_collect_held_orientations`), and 892 (credit-scan) each connecting for 134–1740ms within a 2-second window at 15:00:04–15:00:06. These are sequential (not concurrent), so they do not conflict — but each represents a "new" client to IBGateway post-restart.
+
+**Fix:** `PrewarmApiConnections.py` connects briefly (0.5s hold, 0.8s pause) with all 10 system clientIds in sequence:
+
+| ClientId | Used by |
+|----------|---------|
+| 101 | PlaceAnOrder, cancel functions |
+| 878 | `_rth_risk_exits()` |
+| 881 | flatten-stock |
+| 883 | `_has_working_close_order()` |
+| 884 | `ib_close_guard.has_working_auto_close()` |
+| 885 | position filter / `_get_theo_limit` |
+| 886 | `_get_theo_limit` / related |
+| 887 | `_working_close_limit_symbols()` |
+| 890 | `_collect_held_orientations()` |
+| 892 | credit-scan |
+
+ClientId 42 (listener) is excluded — the OptionsListener service reconnects automatically on startup.
+
+**Scheduled Task:** `IB_PrewarmApiConnections_1833` — runs `PrewarmConnections.cmd` at 18:33 Sunday (3 minutes after the 18:30 ColdRestart gives IBGateway time to fully start). Total runtime ~13 seconds. Output logged to `ib_cycle.log` and `C:\OptionsHistory\logs\prewarm.log`.
+
+**Impact:** All system clientIds are pre-approved by IBGateway before the trading week begins. Monday–Friday connections from any DCM/PlaceAnOrder function connect silently without triggering the approval dialog.
+
+

@@ -277,17 +277,22 @@ def _attempts_append(rows: list[dict], date_override: str | None = None) -> Path
         # New file: use canonical ATTEMPT_FIELDS order
         header = ATTEMPT_FIELDS
 
-    try:
-        with path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
-            if not file_exists:
-                writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
-    except Exception as e:
-        logger.warning(f"Failed to append attempts to {path}: {e}")
-        return None
-    return path
+    import time as _time_bw
+    for _bw_retry in range(2):
+        try:
+            with path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+                if not file_exists:
+                    writer.writeheader()
+                for r in rows:
+                    writer.writerow(r)
+            return path  # success
+        except Exception as e:
+            if _bw_retry == 0:
+                _time_bw.sleep(0.5)  # Fix BW: brief pause then retry (Windows file lock)
+            else:
+                logger.warning(f"Failed to append attempts to {path} after retry: {e}")
+                return None
 
 def find_latest_combined_csv() -> Path | None:
     if not OUTPUT_BASE.exists():
@@ -323,6 +328,9 @@ def _await_working(trade, timeout=3.0) -> tuple[bool, str]:
         # IB path sometimes lowercases in logs; keep raw here
         if st in working:
             return True, st
+        # Fix BW: TP orders may fill immediately — Filled = successful placement
+        if st == "Filled":
+            return True, "Filled"
         # treat after-hours held GTC as "working"
         if st == "Inactive" and tif == "GTC":
             return True, "Inactive(GTC)"
@@ -487,6 +495,8 @@ def parse_args():
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     p.add_argument("--allow-market-fallback", action="store_true", default=False,
                    help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
+    p.add_argument("--allow-prev-day-opens", action="store_true", default=False,
+                   help="Fix CQ: use --date CSV date instead of today for the same-day OPEN signal filter (10 AM skipped-opens retry only).")
     p.add_argument("--live-timeout", type=float, default=3.0,
                    help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
     p.add_argument("--close-reason", type=str, default=None,
@@ -765,46 +775,117 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
                         CLOSE(SELL): bid(long) - ask(short)
       - scheme='mid' :  OPEN/CLOSE: mid(long) - mid(short)
     Returns a rounded positive float, or None if unavailable.
+
+    Fix CG: detects Error 10197/10091/354 (market data blocked) and retries with
+    15-min delayed data (reqMktDataType=3) before returning None.
     """
     longC = qualify_option(ib, symbol, exp, longK, right)
     shortC = qualify_option(ib, symbol, exp, shortK, right)
     if not longC or not shortC:
         return None
-    tL = ib.reqMktData(longC, '', False, False)
-    tS = ib.reqMktData(shortC, '', False, False)
-    waited = 0.0; step = 0.2
+
     import time, math
-    try:
-        while waited < timeout:
-            time.sleep(step); waited += step
-            L_bid = getattr(tL, 'bid', None); L_ask = getattr(tL, 'ask', None)
-            S_bid = getattr(tS, 'bid', None); S_ask = getattr(tS, 'ask', None)
-            if scheme == 'join':
-                if action.upper() == 'BUY':
-                    if isinstance(L_ask,(int,float)) and isinstance(S_bid,(int,float)) and L_ask is not None and S_bid is not None and not math.isnan(L_ask) and not math.isnan(S_bid) and L_ask > 0 and S_bid >= 0:
-                        val = float(L_ask) - float(S_bid)
-                        if val > 0:
-                            return round(val, 2)
-                else:
-                    # SELL (close): bid(long) - ask(short)
-                    # Symmetric with OPEN join (ask-bid): both legs cross the market for
-                    # maximum fill probability — sell long at its bid, buy short at its ask.
-                    if isinstance(L_bid,(int,float)) and isinstance(S_ask,(int,float)) and L_bid is not None and S_ask is not None and not math.isnan(L_bid) and not math.isnan(S_ask) and S_ask > 0 and L_bid >= 0:
-                        val = float(L_bid) - float(S_ask)
-                        if val > 0:
-                            return round(val, 2)
+
+    def _compute(tL, tS):
+        """Return rounded positive price from two tickers, or None."""
+        L_bid = getattr(tL, 'bid', None); L_ask = getattr(tL, 'ask', None)
+        S_bid = getattr(tS, 'bid', None); S_ask = getattr(tS, 'ask', None)
+        if scheme == 'join':
+            if action.upper() == 'BUY':
+                if isinstance(L_ask,(int,float)) and isinstance(S_bid,(int,float)) and not math.isnan(L_ask) and not math.isnan(S_bid) and L_ask > 0 and S_bid >= 0:
+                    val = float(L_ask) - float(S_bid)
+                    return round(val, 2) if val > 0 else None
             else:
-                mL = _ticker_mid(tL); mS = _ticker_mid(tS)
-                if mL is not None and mS is not None:
-                    val = float(mL) - float(mS)
-                    if val > 0:
-                        return round(val, 2)
+                # SELL (close): bid(long) - ask(short)
+                # Symmetric with OPEN join (ask-bid): both legs cross the market for
+                # maximum fill probability — sell long at its bid, buy short at its ask.
+                if isinstance(L_bid,(int,float)) and isinstance(S_ask,(int,float)) and not math.isnan(L_bid) and not math.isnan(S_ask) and S_ask > 0 and L_bid >= 0:
+                    val = float(L_bid) - float(S_ask)
+                    return round(val, 2) if val > 0 else None
+        else:
+            mL = _ticker_mid(tL); mS = _ticker_mid(tS)
+            if mL is not None and mS is not None:
+                val = float(mL) - float(mS)
+                return round(val, 2) if val > 0 else None
         return None
+
+    # Fix CG: hook errorEvent to detect market-data-blocked errors for fast-fail + delayed retry
+    _MD_FAIL_CODES = {10197, 10091, 354}
+    _mkt_errors: list[tuple[int, str]] = []
+
+    def _on_error(reqId, errorCode, errorString, contract):
+        if errorCode in _MD_FAIL_CODES:
+            _mkt_errors.append((errorCode, errorString))
+
+    ib.errorEvent += _on_error
+    try:
+        # --- Phase 1: real-time data (type 1, default) ---
+        tL = ib.reqMktData(longC, '', False, False)
+        tS = ib.reqMktData(shortC, '', False, False)
+        waited = 0.0; step = 0.2
+        try:
+            while waited < timeout:
+                # Fix CG: use ib.sleep so ib_insync event loop dispatches errorEvent callbacks
+                # (time.sleep blocks the event loop, preventing _on_error from firing)
+                try: ib.sleep(step)
+                except Exception: time.sleep(step)
+                waited += step
+                # Fix CG: fast-fail if IB reported a market-data error, retry with delayed data
+                if _mkt_errors:
+                    code, msg = _mkt_errors[0]
+                    logger.warning(
+                        "[%s] live_spread_price(%s): IB Error %d '%s' after %.1fs"
+                        " — retrying with delayed data (reqMktDataType=3)",
+                        symbol, scheme, code, msg[:80], waited,
+                    )
+                    break  # fall through to Phase 2
+                result = _compute(tL, tS)
+                if result is not None:
+                    return result
+            else:
+                return None  # clean timeout, no error — caller falls through to CSV/AM
+        finally:
+            try: ib.cancelMktData(longC)
+            except Exception: pass
+            try: ib.cancelMktData(shortC)
+            except Exception: pass
+
+        # --- Phase 2: delayed data (type 3) ---
+        # Only reached when _mkt_errors fired (10197/10091/354).
+        # reqMktDataType(3) uses a separate delayed feed not blocked by competing live sessions.
+        try:
+            ib.reqMktDataType(3)
+            tL2 = ib.reqMktData(longC, '', False, False)
+            tS2 = ib.reqMktData(shortC, '', False, False)
+            delayed_timeout = min(timeout, 5.0)
+            waited2 = 0.0
+            try:
+                while waited2 < delayed_timeout:
+                    time.sleep(step); waited2 += step
+                    result = _compute(tL2, tS2)
+                    if result is not None:
+                        logger.warning(
+                            "[%s] Fix CG: delayed data (15-min) result=%.2f (scheme=%s, waited=%.1fs)",
+                            symbol, result, scheme, waited2,
+                        )
+                        return result
+                logger.warning(
+                    "[%s] Fix CG: delayed data also returned None after %.1fs (scheme=%s)",
+                    symbol, delayed_timeout, scheme,
+                )
+                return None
+            finally:
+                try: ib.cancelMktData(longC)
+                except Exception: pass
+                try: ib.cancelMktData(shortC)
+                except Exception: pass
+        finally:
+            # Restore to real-time for any subsequent reqMktData calls in this process
+            try: ib.reqMktDataType(1)
+            except Exception: pass
+
     finally:
-        try: ib.cancelMktData(longC)
-        except Exception: pass
-        try: ib.cancelMktData(shortC)
-        except Exception: pass
+        ib.errorEvent -= _on_error  # always unhook
 # --- De-duplication helpers for opens (idempotency per run) ---
 OPEN_SEEN_KEYS: set[str] = set()
 # Prevent duplicate CLOSE submissions per (symbol, exp, right) in a single run
@@ -895,28 +976,32 @@ def place_debit_spread(
     action: str = "BUY",
     order_type: str = "LMT",
     role: str | None = None,
+    skip_close_guard: bool = False,  # Fix CI: bypass symbol-only guard for multi-expiration scenarios
 ):
     """
     Place a vertical spread (combo BAG).
 
     Parameters
     ----------
-    ib          : IB connection
-    symbol      : underlying ticker
-    expiration  : IB expiry (YYYYMMDD)
-    long_strike : strike treated as the *long* leg in canonical debit orientation
-    short_strike: strike treated as the *short* leg in canonical debit orientation
-    right       : 'C' or 'P'
-    limit_price : None for market, or a float limit
-    quantity    : combo size
-    action      : 'BUY' or 'SELL' at the BAG level
-    order_type  : 'LMT' or 'MKT'
-    role        : optional semantic tag, e.g. 'force_close'. When role == 'force_close'
-                  we always send a true MARKET order first (no after-hours MKT→LMT
-                  conversion), and only fall back to LMT if IB rejects as riskless.
+    ib               : IB connection
+    symbol           : underlying ticker
+    expiration       : IB expiry (YYYYMMDD)
+    long_strike      : strike treated as the *long* leg in canonical debit orientation
+    short_strike     : strike treated as the *short* leg in canonical debit orientation
+    right            : 'C' or 'P'
+    limit_price      : None for market, or a float limit
+    quantity         : combo size
+    action           : 'BUY' or 'SELL' at the BAG level
+    order_type       : 'LMT' or 'MKT'
+    role             : optional semantic tag, e.g. 'force_close'. When role == 'force_close'
+                       we always send a true MARKET order first (no after-hours MKT→LMT
+                       conversion), and only fall back to LMT if IB rejects as riskless.
+    skip_close_guard : when True, skip has_working_auto_close() check. Used by
+                       force_close_symbol_via_positions() when a different-expiration spread
+                       for the same symbol has already been submitted this run.
     """
     # --- HARD CLOSE GUARD ---
-    if has_working_auto_close(symbol):
+    if not skip_close_guard and has_working_auto_close(symbol):
         # Fix X1: Mark symbol as seen so subsequent CSV rows for the same symbol
         # are caught by CLOSE_SEEN_KEYS without needing another IB guard check
         try:
@@ -1112,8 +1197,8 @@ def place_debit_spread(
                     qty=int(quantity),
                     order_action=action.upper(),
                 )
-            except Exception:
-                pass
+            except Exception as _bw_write_err:
+                logger.warning("Fix BW: record_attempt write failed for %s: %s", symbol, _bw_write_err)
 
             # Riskless-combo handling (Option B: MKT first, then LMT nudge)
             try:
@@ -1905,11 +1990,14 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         else getattr(args, "force_close_side")
     )
 
+    _ci_submitted_right_exp: set[tuple[str, str]] = set()  # Fix CI: track (right, exp) submitted this run
+    _cl_covered: set[tuple[str, str, float]] = set()  # Fix CL: track (right, exp, longK) seen by spread-pair loop
     any_pair = False
     for exp, right, longK, shortK, qty in _iter_spread_pairs_from_positions(
         ib, symbol, side=side_opt, max_qty=args.quantity
     ):
         any_pair = True
+        _cl_covered.add((right.upper(), str(exp), float(longK)))  # Fix CL: mark this long as covered
         limit = None
         scheme = getattr(args, "use_live_close", "off")
         if scheme in ("join", "mid"):
@@ -1924,6 +2012,26 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 scheme=scheme,
                 timeout=getattr(args, "live_timeout", 3.0),  # Fix Y1: configurable timeout
             )
+            # Fix CE: join returned None (bid=0 OTM options or timeout) → try mid before CSV/AM fallback.
+            # mid uses (bid+ask)/2 per leg so even bid=0 options give ask/2, which is at or below ask.
+            # This is more conservative than Fix AM portfolio marks (which can exceed mid).
+            if lim is None and scheme == "join":
+                lim = live_spread_price(
+                    ib,
+                    symbol,
+                    exp,
+                    right,
+                    longK,
+                    shortK,
+                    action="SELL",
+                    scheme="mid",
+                    timeout=getattr(args, "live_timeout", 3.0),
+                )
+                if lim is not None:
+                    logger.warning(
+                        "[%s] Fix CE: join returned None; mid fallback=%.2f (long=%s short=%s %s %s)",
+                        symbol, lim, longK, shortK, right, exp,
+                    )
             if lim is not None:
                 try:
                     v = float(lim)
@@ -1959,10 +2067,10 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     _row_atm = pd.to_numeric(row.get("atm_strike"), errors="coerce")
                     if pd.notna(_row_atm) and longK is not None:
                         _atm_diff = abs(float(_row_atm) - float(longK))
-                        if _atm_diff > 1.5 * width:
+                        if _atm_diff >= 1.0 * width:  # Fix AF1b: tightened from > 1.5×width; Fix I CLOSE rows have diff=0
                             logger.warning(
                                 f"[{symbol}] CSV atm_strike={_row_atm} vs position longK={longK} "
-                                f"(diff={_atm_diff:.1f} > 1.5×width={1.5*width:.1f}): "
+                                f"(diff={_atm_diff:.1f} >= 1.0×width={1.0*width:.1f}): "
                                 f"discarding CSV pricing (wrong strikes — CSV generated for different spread)"
                             )
                             continue  # skip this CSV source; _csv_row_for_symbol cached for AF2
@@ -1972,8 +2080,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         buffered_csv_limit = csv_limit * 0.95
                         if buffered_csv_limit >= args.min_limit:
                             limit = buffered_csv_limit
-                            logger.info(f"[{symbol}] Force-close fallback: CSV limit from {csv_path}: "
-                                        f"csv=${csv_limit:.2f} (already 5%+cap), additional 5%=${limit:.2f}")
+                            logger.warning(f"[{symbol}] Fix CF: CSV fallback limit=${limit:.2f} from {csv_path} "
+                                           f"(csv_limit=${csv_limit:.2f}, additional 5% buffer)")
                             break  # Found valid limit, stop searching
                 except Exception as e:
                     logger.warning(f"[{symbol}] Failed to read CSV fallback from {csv_path}: {e}")
@@ -2039,7 +2147,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             if (getattr(_tc, "secType", "") == "OPT"
                                     and getattr(_tc, "symbol", "").upper() == symbol.upper()):
                                 _mp = _pi.marketPrice
-                                if _mp and not math.isnan(_mp) and _mp > 0:
+                                # Fix BU: accept _mp=0.0 (deeply OTM options IB prices at exactly $0)
+                                if isinstance(_mp, (int, float)) and not math.isnan(_mp) and _mp >= 0:
                                     _strk = float(getattr(_tc, "strike", 0))
                                     if longK is not None and abs(_strk - float(longK)) < 0.01:
                                         _am_long_val = _mp
@@ -2052,8 +2161,8 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         if _am_spread >= args.min_limit:
                             limit = round(_am_spread * 0.95, 2)
                             order_type = "LMT"
-                            logger.info(
-                                "[%s] AM: portfolio-based limit for %s %s/%s: long=%.4f short=%.4f limit=%.2f",
+                            logger.warning(
+                                "[%s] Fix CF: AM portfolio-based limit for %s %s/%s: long=%.4f short=%.4f limit=%.2f",
                                 symbol, right, longK, shortK, _am_long_val, _am_short_val, limit
                             )
                         else:
@@ -2061,7 +2170,13 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                                 "[%s] AM: portfolio spread too small for %s %s/%s: spread=%.4f < min_limit=%.2f",
                                 symbol, right, longK, shortK, _am_spread, args.min_limit
                             )
-                if limit is None:
+                            if _am_spread <= 0.05:  # Fix BU: near-zero portfolio spread = worthless
+                                _af2_theo_worthless = True
+                                logger.info(
+                                    "[%s] Fix BU: AM portfolio spread=%.4f <= 0.05 -- treating as worthless",
+                                    symbol, _am_spread,
+                                )
+                if limit is None and not _af2_theo_worthless:  # Fix BU: let worthless fall through
                     if getattr(args, "allow_market_fallback", False):
                         # Preclose mode: market is open, MARKET order is acceptable as last resort
                         logger.warning(f"[{symbol}] All limit pricing failed - using MARKET fallback (preclose mode)")
@@ -2094,6 +2209,18 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
         if ckey in CLOSE_SEEN_KEYS:
             logger.info(f"[{symbol}] CLOSE already submitted for {right} exp {exp}; skipping")
             continue
+
+        # Fix CI: bypass symbol-only close guard when a different-expiration spread for
+        # the same right was already submitted this run (guard is not expiration-aware).
+        _ci_skip_guard = any(
+            placed_right == right and placed_exp != str(exp)
+            for placed_right, placed_exp in _ci_submitted_right_exp
+        )
+        if _ci_skip_guard:
+            logger.info(
+                "[%s] Fix CI: skipping close guard — different-exp %s spread already submitted this run",
+                symbol, right,
+            )
 
         # Debit vs credit orientation from strikes:
         #   CALL debit  : longK < shortK -> SELL to close
@@ -2218,14 +2345,16 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                     )
                 elif long_worthless and short_worthless:
                     both_worthless = True
-                    # Fix AE: Always use fixed-price individual legs for truly worthless spreads.
-                    # $0.05 SELL (long) / $0.05 BUY (short) — both at exchange minimum tick.
-                    # MKT is not needed as primary; it stays as an outer fallback only if legs fail.
+                    # Fix BZ: Always use individual fixed-price legs for both_worthless.
+                    # BAG MKT at preclose was incorrect (based on wrong Error 201 diagnosis).
+                    # qualifyContracts() (Fix BY) already fixes Error 201 for individual SELL.
+                    # MKT last resort at preclose is handled by the skip gate (line ~2079) for
+                    # non-worthless spreads only — worthless spreads always go to individual legs.
                     skip_combo = True
                     logger.info(
                         f"[{symbol}] {right} {longK}/{shortK} exp {exp}: BOTH legs worthless "
                         f"(long=${long_value or 0:.2f}, short=${short_value or 0:.2f}, threshold=${worthless_threshold:.2f}); "
-                        f"will close with fixed pricing (sell long @$0.05, buy short @$0.05)"
+                        f"Fix BZ: individual legs (SELL long @$0.05, BUY short @$0.05)"
                     )
 
                 # Fix AI1: If limit is still None and portfolio prices are available for both legs,
@@ -2272,9 +2401,11 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                 action=action,
                 order_type=order_type,
                 role="force_close",
+                skip_close_guard=_ci_skip_guard,  # Fix CI
             )
         if tr is not None:
             CLOSE_SEEN_KEYS.add(ckey)
+            _ci_submitted_right_exp.add((right, str(exp)))  # Fix CI: track for next pair
             submitted += 1
             # Fix Z3: record_attempt already logged by place_debit_spread() with reason="success".
             # Don't log a second "positions_fallback" entry for the same order.
@@ -2325,13 +2456,14 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder("SELL", qty_leg, 0.01)
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True
+                        leg_order.openClose = "C"  # Fix CJ: closing an owned long position, not opening a short
                         if not getattr(c, 'exchange', ''):  # Fix AB6c
                             c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
                         # Fix BS: check for async Error 201 rejection
                         if ok_leg:
-                            ib.sleep(1.0)
+                            ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                             for _bs_le in getattr(trade_leg, "log", []) or []:
                                 _bs_msg = getattr(_bs_le, "message", "") or ""
                                 if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
@@ -2356,13 +2488,14 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder("BUY", qty_leg, 0.05)
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True
+                        leg_order.openClose = "C"  # Fix CJ: closing a written short position
                         if not getattr(c, 'exchange', ''):  # Fix AB6c
                             c.exchange = "SMART"
                         trade_leg = ib.placeOrder(c, leg_order)
                         ok_leg, why_leg = _await_working(trade_leg, timeout=3.0)
                         # Fix BS: check for async rejection (BUY rarely rejected, for symmetry)
                         if ok_leg:
-                            ib.sleep(1.0)
+                            ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                             for _bs_le in getattr(trade_leg, "log", []) or []:
                                 _bs_msg = getattr(_bs_le, "message", "") or ""
                                 if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
@@ -2490,6 +2623,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder(leg_action, int(abs(long_qty)), float(long_value))
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                        leg_order.openClose = "C"  # Fix CJ: closing an existing position, not opening new
 
                         if long_contract is not None:
                             long_opt_to_close = long_contract
@@ -2508,7 +2642,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                         # Fix BS: check for async Error 201 rejection (affects SELL of individual legs)
                         if ok:
-                            ib.sleep(1.0)
+                            ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                             for _bs_le in getattr(trade, "log", []) or []:
                                 _bs_msg = getattr(_bs_le, "message", "") or ""
                                 if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
@@ -2553,6 +2687,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         leg_order = LimitOrder(leg_action, int(abs(short_qty)), float(short_value))
                         leg_order.tif = "DAY"
                         leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                        leg_order.openClose = "C"  # Fix CJ: closing an existing position, not opening new
 
                         if short_contract is not None:
                             short_opt_to_close = short_contract
@@ -2571,7 +2706,7 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                         ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                         # Fix BS: check for async Error 201 rejection
                         if ok:
-                            ib.sleep(1.0)
+                            ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                             for _bs_le in getattr(trade, "log", []) or []:
                                 _bs_msg = getattr(_bs_le, "message", "") or ""
                                 if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
@@ -2707,23 +2842,31 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             price_str = "$0.05"
                             leg_order.tif = "DAY"
                             leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                            leg_order.openClose = "C"  # Fix CJ: closing an owned long, not opening a short
                             if not getattr(c, 'exchange', ''):  # Fix AB6c
                                 c.exchange = "SMART"
+                            # Fix BY: Qualify contract before placing — position contracts from
+                            # ib.positions() may lack localSymbol/tradingClass/multiplier fields
+                            # that IB requires. Missing fields cause Error 201 "Order rejected"
+                            # even though the long position is held. qualifyContracts() fills them.
+                            try:
+                                _qc_by = ib.qualifyContracts(c)
+                                if _qc_by:
+                                    c = _qc_by[0]
+                            except Exception as _qc_err:
+                                logger.warning("[%s] Fix BY: qualifyContracts failed for SELL %s: %s", symbol, longK, _qc_err)
                             trade = ib.placeOrder(c, leg_order)
                             ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
-                            # Fix BS: brief extra wait to catch async IB rejection (Error 201 arrives
-                            # ~0.6s after PreSubmitted — after _await_working already returned True).
-                            # After hours, IB rejects individual option SELLs without "selling
-                            # individual options" permission even when long position covers the sell.
+                            # Fix BS: brief extra wait to catch async IB rejection.
                             if ok:
-                                ib.sleep(1.0)
+                                ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                                 for _bs_le in getattr(trade, "log", []) or []:
                                     _bs_msg = getattr(_bs_le, "message", "") or ""
                                     if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
                                         ok = False
                                         why = "bs_rejected"
-                                        logger.warning("[%s] Fix BS: SELL %s rejected async (Error 201): %s",
-                                                       symbol, longK, _bs_msg[:120])
+                                        logger.warning("[%s] Fix BS: SELL %s rejected async: %s",
+                                                       symbol, longK, _bs_msg)
                                         break
                             logger.info(f"[{symbol}] Worthless long leg order status: ok={ok}, reason={why}")
                             if ok:
@@ -2736,6 +2879,63 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                                          limit=0.05,
                                          qty=qty, order_action="SELL", leg_type="long")
 
+                            # Fix CK: individual SELL got Error 201 (IB classifies as naked write,
+                            # not a covered close). Retry as BAG combo SELL @$0.05 — IB classifies
+                            # BAG SELL as "closing a held debit spread" (no permissions check).
+                            if not ok and why == "bs_rejected":
+                                logger.warning(
+                                    "[%s] Fix CK: Error 201 on individual SELL %s %s — retrying as BAG combo SELL @$0.05",
+                                    symbol, right, longK,
+                                )
+                                tr_ck = place_debit_spread(
+                                    ib, symbol, str(exp), float(longK), float(shortK), right,
+                                    limit_price=0.05, quantity=qty,
+                                    action="SELL", order_type="LMT",
+                                    role="force_close",
+                                )
+                                if tr_ck is not None:
+                                    CLOSE_SEEN_KEYS.add(ckey)
+                                    _ci_submitted_right_exp.add((right, str(exp)))
+                                    submitted += 1
+                                    record_attempt(
+                                        symbol, "force_close", "placed", "both_worthless_bag_e201_fallback",
+                                        exp=str(exp), right=right.upper(),
+                                        longK=float(longK), shortK=float(shortK), limit=0.05,
+                                        qty=qty, order_action="SELL",
+                                    )
+                                    # Fix CK supplement: BAG SELL covers both legs — cancel any
+                                    # stale individual BUY for shortK from a prior run.
+                                    # If both the BAG SELL and a stale individual BUY fill,
+                                    # the spread closes AND a new long shortK position opens.
+                                    try:
+                                        ib.reqAllOpenOrders()
+                                        ib.sleep(0.5)
+                                        for _ck_t in list(ib.openTrades()):
+                                            _ck_c = _ck_t.contract
+                                            _ck_o = _ck_t.order
+                                            _ck_st = (_ck_t.orderStatus.status or "").lower()
+                                            if (getattr(_ck_c, "secType", "") == "OPT"
+                                                    and getattr(_ck_c, "symbol", "").upper() == symbol.upper()
+                                                    and getattr(_ck_c, "right", "").upper() == right.upper()
+                                                    and abs(float(getattr(_ck_c, "strike", 0)) - float(shortK)) < 0.01
+                                                    and (getattr(_ck_o, "action", "") or "").upper() == "BUY"
+                                                    and _ck_st in ("presubmitted", "submitted", "inactive")):
+                                                logger.info(
+                                                    "[%s] Fix CK: cancelling stale individual BUY %s shortK=%s "
+                                                    "(BAG SELL covers both legs)",
+                                                    symbol, right, shortK,
+                                                )
+                                                ib.cancelOrder(_ck_t.order)
+                                    except Exception as _ck_cancel_err:
+                                        logger.warning("[%s] Fix CK: stale BUY cancel failed: %s", symbol, _ck_cancel_err)
+                                else:
+                                    record_attempt(
+                                        symbol, "force_close", "error", "both_worthless_bag_e201_failed",
+                                        exp=str(exp), right=right.upper(),
+                                        longK=float(longK), shortK=float(shortK),
+                                    )
+                                break  # BAG handles both legs — skip individual BUY
+
                     # Short position: buy at fixed price $0.05
                     if abs(strike - float(shortK)) < 0.01 and pos < 0:
                         if float(shortK) in _working_buys_ah:  # Fix AH2: dedup
@@ -2747,13 +2947,14 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
                             price_str = "$0.05"
                             leg_order.tif = "DAY"
                             leg_order.outsideRth = True  # Fix AB4: keep order active outside RTH
+                            leg_order.openClose = "C"  # Fix CJ: closing a written short position
                             if not getattr(c, 'exchange', ''):  # Fix AB6c
                                 c.exchange = "SMART"
                             trade = ib.placeOrder(c, leg_order)
                             ok, why = _await_working(trade, timeout=3.0)  # Fix AB5: confirm order
                             # Fix BS: check for async rejection (BUY rarely rejected but check for symmetry)
                             if ok:
-                                ib.sleep(1.0)
+                                ib.sleep(2.5)  # Fix BS: was 1.0s; Error 201 can arrive up to ~1.5s after PreSubmitted
                                 for _bs_le in getattr(trade, "log", []) or []:
                                     _bs_msg = getattr(_bs_le, "message", "") or ""
                                     if "Order rejected" in _bs_msg or "trading permissions" in _bs_msg:
@@ -2784,6 +2985,67 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
 
     if not any_pair:
         record_attempt(symbol, "force_close", "skipped", "no_spread_in_positions")
+
+    # Fix CL: close any isolated long-leg orphans not paired by the spread-pair loop.
+    # Example: after manually buying back the short leg, the long remains as a solo position.
+    # Selling an isolated long (no paired short) does NOT create naked exposure → Error 201
+    # should not fire (unlike NWG/BK where selling long while short the other strike = naked).
+    try:
+        for _cl_p in ib.positions():
+            _cl_c = _cl_p.contract
+            if (getattr(_cl_c, "secType", "") != "OPT"
+                    or getattr(_cl_c, "symbol", "").upper() != symbol.upper()
+                    or _cl_p.position <= 0):
+                continue
+            _cl_key = (
+                getattr(_cl_c, "right", "").upper(),
+                getattr(_cl_c, "lastTradeDateOrContractMonth", ""),
+                float(getattr(_cl_c, "strike", 0)),
+            )
+            if _cl_key in _cl_covered:
+                continue  # already handled by spread-pair loop
+            _cl_qty = int(_cl_p.position)
+            _cl_r, _cl_exp, _cl_k = _cl_key
+            _cl_ckey = f"{symbol}_{_cl_r}_{_cl_exp}_{_cl_k}"
+            if _cl_ckey in CLOSE_SEEN_KEYS:
+                logger.info("[%s] Fix CL: orphan %s %s exp=%s already in CLOSE_SEEN_KEYS; skipping",
+                            symbol, _cl_r, _cl_k, _cl_exp)
+                continue
+            logger.info("[%s] Fix CL: orphaned long %s %s exp=%s qty=%d — attempting individual SELL @$0.05",
+                        symbol, _cl_r, _cl_k, _cl_exp, _cl_qty)
+            _cl_qc = ib.qualifyContracts(_cl_c)
+            if _cl_qc:
+                _cl_c = _cl_qc[0]
+            _cl_order = LimitOrder("SELL", _cl_qty, 0.05)
+            _cl_order.tif = "DAY"
+            _cl_order.outsideRth = True
+            _cl_order.openClose = "C"
+            _cl_trade = ib.placeOrder(_cl_c, _cl_order)
+            _cl_ok, _cl_why = _await_working(_cl_trade, ib)
+            if _cl_ok:
+                ib.sleep(1.0)  # Fix BS: wait for async Error 201
+                _cl_errors = [
+                    e for e in _cl_trade.log
+                    if ("rejected" in str(getattr(e, "message", "")).lower()
+                        or "201" in str(getattr(e, "message", "")))
+                ]
+                if _cl_errors:
+                    logger.warning(
+                        "[%s] Fix CL: Error 201 on orphan SELL %s %s — cannot close via individual order: %s",
+                        symbol, _cl_r, _cl_k, _cl_errors[0].message,
+                    )
+                    record_attempt(symbol, "close_individual_leg", "error", "cl_error_201",
+                                   exp=_cl_exp, right=_cl_r, longK=_cl_k, qty=_cl_qty, limit=0.05)
+                else:
+                    CLOSE_SEEN_KEYS.add(_cl_ckey)
+                    submitted += 1
+                    record_attempt(symbol, "close_individual_leg", "placed", "single_leg_orphan",
+                                   exp=_cl_exp, right=_cl_r, longK=_cl_k, qty=_cl_qty, limit=0.05)
+            else:
+                record_attempt(symbol, "close_individual_leg", "error", f"cl_not_working:{_cl_why}",
+                               exp=_cl_exp, right=_cl_r, longK=_cl_k, qty=_cl_qty, limit=0.05)
+    except Exception as _cl_err:
+        logger.error("[%s] Fix CL: orphan sweep failed: %s", symbol, _cl_err)
 
     return submitted
 
@@ -2878,7 +3140,16 @@ def run_from_csv():
     # Filter OPEN signals to same-day only (preserve historical CLOSE signals for lookback)
     if "_ts" in df.columns and "signal_type" in df.columns:
         try:
-            today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+            # Fix CQ: --allow-prev-day-opens uses the --date CSV date instead of today,
+            # so the 10 AM skipped-opens retry can place signals from the previous day's CSV.
+            if getattr(args, "allow_prev_day_opens", False) and args.date:
+                try:
+                    _y, _m, _d = args.date.split("_")
+                    today_ny = datetime(2000 + int(_y), int(_m), int(_d)).date()
+                except Exception:
+                    today_ny = datetime.now(ZoneInfo("America/New_York")).date()
+            else:
+                today_ny = datetime.now(ZoneInfo("America/New_York")).date()
 
             # Split into OPEN vs CLOSE signals
             mask_open = df.get("signal_type", pd.Series(dtype=str)).astype(str).str.upper().isin(
@@ -2890,11 +3161,19 @@ def run_from_csv():
             # Apply date filter to opens only
             df_open_filtered = df_open[df_open["_ts"].notna() & (df_open["_ts"].dt.date == today_ny)]
 
-            # Recombine: same-day opens + all closes (historical allowed for lookback)
-            df = pd.concat([df_open_filtered, df_close], ignore_index=True)
-
-            logger.info(f"Filtered OPEN signals to same-day: {len(df_open_filtered)}/{len(df_open)} "
-                        f"(date={today_ny}), kept {len(df_close)} CLOSE signals")
+            # Fix CW: 10 AM retry (--allow-prev-day-opens) is OPEN-only.
+            # CLOSE signals must not be processed here — enforce_weekly_closures +
+            # the main loop each call has_working_auto_close() ~4x per symbol, creating
+            # ~9 spurious "existing_working_close" CSV entries and ~20s of IB guard calls.
+            if getattr(args, "allow_prev_day_opens", False):
+                df = df_open_filtered
+                logger.info(f"Filtered OPEN signals to same-day: {len(df_open_filtered)}/{len(df_open)} "
+                            f"(date={today_ny}), skipped {len(df_close)} CLOSE signals (Fix CW: open-only retry)")
+            else:
+                # Recombine: same-day opens + all closes (historical allowed for lookback)
+                df = pd.concat([df_open_filtered, df_close], ignore_index=True)
+                logger.info(f"Filtered OPEN signals to same-day: {len(df_open_filtered)}/{len(df_open)} "
+                            f"(date={today_ny}), kept {len(df_close)} CLOSE signals")
         except Exception as e:
             logger.warning(f"Failed to apply same-day filter for OPEN signals: {e}")
 
