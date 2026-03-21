@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 20, 2026 (Fix DG: Pre-warm API clientIds after IBGateway restart to prevent live-account approval dialogs; Fix DF: 3 PM re-auth diagnostics)
+**Last Updated:** March 21, 2026 (Fix DH/DI/DJ: targeted listener restart on SOFT-FAIL; port 7497 cleanup in bin scripts; 2FA detection to prevent BounceServices cascade)
 
 ---
 
@@ -3592,6 +3592,115 @@ sc start CloudflareTunnel >>"%LOG%" 2>&1
 - CloudflareTunnel starts after IBGateway+OptionsListener are stable (network settled, Cloudflare connection succeeds)
 - No more tunnel-down after every IB connection drop that triggers BounceServices
 - Manual `BounceServices.cmd` still restarts all three services correctly
+
+---
+
+### Fix DI: Fix Hardcoded Port 7497 in Bin Scripts + switch_trading_mode.py (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 10-11); `C:\OptionsHistory\bin\DailyHealthCheck.ps1` (new `$IB_PORT` var); `switch_trading_mode.py` (new `update_daily_health()` function); `C:\OptionsHistory\bin\EmailDailyBundle.ps1` (DELETED)
+
+**Issue:** Three bin scripts hardcoded port 7497 (paper trading) and were missed by `switch_trading_mode.py` (PushButtonMenu option 7). After switching to live (7496): `BounceServices.cmd` force-killed wrong port; `DailyHealthCheck.ps1` checked wrong port and connected to wrong IB account; `EmailDailyBundle.ps1` connected to wrong port.
+
+**Fix — four changes:**
+1. **`BounceServices.cmd`**: Kill BOTH 7497 and 7496 holders (belt-and-suspenders; one will always be empty regardless of trading mode)
+2. **`DailyHealthCheck.ps1`**: Added `$IB_PORT = 7496` variable (line 2); replaced hardcoded `7497` in port check (line 21) and Python block IB connect (line 43); removed "(paper)" label
+3. **`switch_trading_mode.py`**: Added `DAILY_HEALTH_PS1` constant and `update_daily_health()` function; added to update loop after Health.ps1 repo entry. Now updates 7 files total on mode switch.
+4. **`EmailDailyBundle.ps1`**: Deleted (obsolete)
+
+**Impact:** `python switch_trading_mode.py live` (PushButtonMenu option 7) now correctly updates DailyHealthCheck.ps1. BounceServices correctly kills processes on whichever port is in use.
+
+---
+
+### Fix DJ: 2FA Detection in Watchdog — Skip BounceServices When IBGateway Awaits Login (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (CHECK 1 block, after port-DOWN FAIL log)
+
+**Issue:** When IBGateway restarts and shows the 2FA authentication screen, port 7496 is DOWN — indistinguishable from a crash. Watchdog called BounceServices which killed the login screen, restarting IBGateway again (new 2FA screen). Repeated every 15 min creating a cascade until user manually logged in. After live account switch, every IBGateway restart (5 AM internal timer, cold restart, or manual stop) created a cascade.
+
+**Fix:** Before setting `$needFullRestart = $true`, check the most recently modified IBC log file (`C:\IBC\Logs\IBC-*.txt`) for "2FA dialog", "Exit Session Setting", or "Restart in progress" within the last 20 minutes. If found → log `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually` → `exit 0`. Watchdog retries in 15 min; once user logs in and port comes back, check passes normally.
+
+**watchdog.log pattern when 2FA detected:**
+```
+[05:07] FAIL: port 7496 not listening (IBGateway DOWN) PID=not-running
+[05:07] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
+[05:22] FAIL: port 7496 not listening ...
+[05:22] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
+[06:35] OK   ← user authenticated
+```
+
+**Test:** `nssm stop IBGateway` → wait up to 15 min → watchdog.log shows `FAIL (2FA)` (no BounceServices) → log in → `OK` on next cycle.
+
+**Impact:** 2FA scenarios no longer create cascades. Each watchdog cycle just logs and waits. User sees exactly one "login required" prompt per restart instead of a cleared/restarted screen every 15 minutes.
+
+---
+
+### Fix DH: SOFT-FAIL → RestartListener Only When IBGateway Port Still UP (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (SOFT-FAIL 2-min re-check block)
+
+**Issue:** When the listener lost its IB connection (SOFT-FAIL: port UP, `/health=200` but `positions_error: "not connected"`), the watchdog's 2-min re-check still escalated to `BounceServices` which kills IBGateway. On a live account, this required 2FA re-authentication. The listener has auto-reconnect logic and often recovers on its own; if it doesn't, restarting ONLY the OptionsListener (not IBGateway) is sufficient.
+
+**Root cause of unnecessary 2FA:**
+- SOFT-FAIL: IBGateway is running (port 7496 UP), but listener disconnected from IB
+- Fix CV's 2-min wait is correct, but after 2 min it called `$needFullRestart = $true` → BounceServices → IBGateway killed → 2FA required on restart
+- Restarting OptionsListener reconnects it to the already-running IBGateway — no 2FA
+
+**Fix:** After 2-min re-check still shows `positions_error` AND `$gw` (port) is still UP:
+1. Run `RestartListener.cmd` (which already handles stop/start/health polling)
+2. Poll `/health` every 5s for up to 60s
+3. If listener reconnects → log `RECOVERED: listener reconnected after RestartListener -- no 2FA needed` → done
+4. If still not recovered after 60s → escalate to `BounceServices` (full restart)
+5. If `$gw` went DOWN during the 2-min wait → IBGateway crashed → escalate immediately
+
+**Key safety:** `$gw` check at the branching point — only skips IBGateway kill when port is confirmed still listening.
+
+**Impact:**
+- Transient listener disconnections (daily IB server reset at ~5 PM ET) → OptionsListener restart only → no 2FA
+- watchdog.log shows `SOFT-FAIL-RETRY: port 7496 still UP -- restarting OptionsListener only (no IBGateway kill)`
+- IBGateway kill + 2FA only when port actually goes down (genuine IBGateway crash)
+
+---
+
+### Fix DL: Extend 2FA Detection Window 20 min → 90 min (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` line 63
+
+**Issue:** IBC writes "Second Factor Authentication initiated" to `FRIDAY.txt` at ~5:01 AM. The first watchdog check is at 6:07 AM (66 minutes later). The old 20-minute window (`AddMinutes(-20)`) failed the age check → 2FA not detected → watchdog called BounceServices instead of logging `FAIL (2FA)`. This produced a false `RESTART: calling BounceServices.cmd` log entry at 6:07 AM.
+
+**Fix:**
+```powershell
+# BEFORE:
+if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-20)) {
+# AFTER:
+if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {
+```
+
+**Why 90 min:** Gap from 5:01 AM (IBC writes) to 6:07 AM (first watchdog) = 66 minutes. 90 min covers this with margin for variance. Also serves as safety net if the 5:45 AM IBC autorestart takes longer than expected.
+
+**Impact:** Watchdog logs `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices` at 6:07 AM instead of the inaccurate `RESTART` entry. No BounceServices cascade.
+
+---
+
+### Fix DM: Prewarm Flag + On-OK Prewarm Run (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (FAIL(2FA) block ~line 72; RESTART block ~line 246; OK block ~lines 185-200)
+
+**Issue:** After IBGateway restarts (either FAIL(2FA) followed by user login, or RESTART via BounceServices), IBGateway's in-memory clientId registry is cleared. The first connection from any unrecognised clientId on a live account triggers an approval dialog. The watchdog had no mechanism to automatically run `PrewarmConnections.cmd` after recovery.
+
+**Fix — flag file approach:**
+- On `FAIL (2FA)`: write `C:\OptionsHistory\logs\watchdog_prewarm_needed.txt` with current timestamp
+- On `RESTART: calling BounceServices`: write same prewarm flag file
+- On `OK`: if flag file exists → log `ONLINE: IBGateway port back up after FAIL(2FA) or RESTART -- running pre-warm (flag was Xmin old)` → run `PrewarmConnections.cmd` → delete flag → log `PREWARM: registered all clientIds with IBGateway`
+
+**Impact:**
+- After user authenticates (FAIL(2FA) → user logs in → next watchdog sees OK): pre-warm runs automatically, registering all 10 system clientIds. No 3 PM approval dialogs.
+- After BounceServices restart (RESTART → IBGateway comes back → watchdog sees OK): same pre-warm runs.
+- Flag persists across watchdog cycles — if IBGateway is slow to accept connections, pre-warm runs on the first cycle where health check passes.
 
 ---
 

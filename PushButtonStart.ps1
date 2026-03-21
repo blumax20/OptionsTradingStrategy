@@ -7,7 +7,7 @@
 # -------------------------------------------
 
 param(
-  [int]$IBListenPort = 7497,     # you said you always use 7497 for paper
+  [int]$IBListenPort = 0,        # 0 = auto-detect from ib_config.py (Fix DK)
   [int]$IBWarmupSec  = 35,       # wait window for LISTEN socket to appear
   [switch]$Summary = $false
 )
@@ -20,6 +20,15 @@ try {
 # --- Paths ---
 $Root = "C:\Users\Administrator\code\OptionsTradingStrategy"
 $Py   = Join-Path $Root ".venv\Scripts\python.exe"
+
+# Fix DK: read IB_PORT from ib_config.py (single source of truth, updated by switch_trading_mode.py)
+if ($IBListenPort -eq 0) {
+    $ibConfigPath = Join-Path $Root "InteractiveBrokersTrader\ib_config.py"
+    $ibPortLine = Get-Content $ibConfigPath -ErrorAction SilentlyContinue |
+                  Where-Object { $_ -match "^IB_PORT\s*[:=]" } | Select-Object -First 1
+    $IBListenPort = if ($ibPortLine -match "(\d+)") { [int]$Matches[1] } else { 7496 }
+    Write-Host "Fix DK: IB_PORT=$IBListenPort (from ib_config.py)"
+}
 
 $Listener = Join-Path $Root "InteractiveBrokersTrader\listener.py"
 $Daily    = Join-Path $Root "InteractiveBrokersTrader\DailyCycleManagement.py"
@@ -127,10 +136,13 @@ if ($IBSvc) {
     }
 
     # Wait up to $IBWarmupSec for socket
+    Write-Host "Waiting for IBGateway port $IBListenPort (up to ${IBWarmupSec}s)..." -NoNewline
     for ($i=0; $i -lt $IBWarmupSec; $i++) {
         if (Test-IBGListening) { break }
         Start-Sleep 1
+        Write-Host "." -NoNewline
     }
+    Write-Host ""
     if (Test-IBGListening) {
         Write-Host "✅ IB Gateway listening on port $IBListenPort."
     } else {

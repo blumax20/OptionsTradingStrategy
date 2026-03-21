@@ -34,11 +34,12 @@ DRY_RUN: bool = False
 # ---------------------------------------------------------------------------
 SCRIPT_DIR   = Path(__file__).resolve().parent
 IB_CONFIG_PY = SCRIPT_DIR / "InteractiveBrokersTrader" / "ib_config.py"
-WATCHDOG_PS1    = Path(r"C:\OptionsHistory\bin\IB_Watchdog.ps1")
-HEALTH_PS1      = Path(r"C:\OptionsHistory\bin\Health.ps1")
-HEALTH_PS1_REPO = SCRIPT_DIR / "Health.ps1"   # Fix AW: also updated by PushButtonMenu + IB_Health_0715
-IBC_CONFIG      = Path(r"C:\IBC\config.ini")
-RUN_GATEWAY_CMD = Path(r"C:\IBC\run_gateway_service.cmd")
+WATCHDOG_PS1      = Path(r"C:\OptionsHistory\bin\IB_Watchdog.ps1")
+HEALTH_PS1        = Path(r"C:\OptionsHistory\bin\Health.ps1")
+HEALTH_PS1_REPO   = SCRIPT_DIR / "Health.ps1"   # Fix AW: also updated by PushButtonMenu + IB_Health_0715
+DAILY_HEALTH_PS1  = Path(r"C:\OptionsHistory\bin\DailyHealthCheck.ps1")  # Fix DI: IB_DailyHealth_0830 task
+IBC_CONFIG        = Path(r"C:\IBC\config.ini")
+RUN_GATEWAY_CMD   = Path(r"C:\IBC\run_gateway_service.cmd")
 
 # ---------------------------------------------------------------------------
 # Mode definitions
@@ -136,6 +137,18 @@ def update_watchdog_ps1(port: int) -> None:
         flags=re.MULTILINE,
     )
     _write(WATCHDOG_PS1, original, updated)
+
+
+def update_daily_health(port: int) -> None:
+    """Fix DI: Update $IB_PORT in DailyHealthCheck.ps1 (used by IB_DailyHealth_0830 task)."""
+    original = _read(DAILY_HEALTH_PS1)
+    updated = _sub(
+        r"^(\$IB_PORT\s*=\s*)\d+",
+        rf"\g<1>{port}",
+        original,
+        flags=re.MULTILINE,
+    )
+    _write(DAILY_HEALTH_PS1, original, updated)
 
 
 def update_health_ps1(port: int, path: Path = HEALTH_PS1) -> None:
@@ -339,6 +352,7 @@ def main() -> None:
         ("C:\\IBC\\config.ini",                    update_ibc_config,      (port, trading_mode)),
         ("C:\\IBC\\run_gateway_service.cmd",       update_run_gateway_cmd, (trading_mode,)),
         ("Health.ps1 (repo)",                      update_health_ps1,      (port, HEALTH_PS1_REPO)),
+        ("C:\\OptionsHistory\\bin\\DailyHealthCheck.ps1", update_daily_health, (port,)),  # Fix DI
     ]:
         try:
             fn(*fargs)

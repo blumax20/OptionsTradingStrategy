@@ -162,13 +162,36 @@ while ($true) {
         }
 
         2 {
-            if (Test-Path $StartScript) {
-                $doSum = Read-Host "Show account/positions summary after start? (y/N)"
-                $args = @()
-                if ($doSum -and $doSum.ToLower().StartsWith("y")) { $args += "-Summary" }
-                Run-And-Log -Title "Start" -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StartScript @args }
-            } else {
-                Write-Host ("Start script not found: {0}" -f $StartScript)
+            Write-Host ""
+            Write-Host "  1) Pre-warm API clientIds (register after IBGateway restart/login)"
+            Write-Host "  2) Start full system"
+            $sub = Read-Host "  Choose (1 or 2)"
+            switch ($sub.Trim()) {
+                '1' {
+                    $prewarmCmd = "C:\OptionsHistory\bin\PrewarmConnections.cmd"
+                    if (Test-Path $prewarmCmd) {
+                        Write-Host "Running pre-warm to register all API clientIds with IBGateway..." -ForegroundColor Cyan
+                        & cmd.exe /c $prewarmCmd
+                        $prewarmFlag = "C:\OptionsHistory\logs\watchdog_prewarm_needed.txt"
+                        if (Test-Path $prewarmFlag) { Remove-Item $prewarmFlag -ErrorAction SilentlyContinue }
+                        Write-Host "Pre-warm complete. ClientIds registered -- no 3 PM approval dialogs expected." -ForegroundColor Green
+                    } else {
+                        Write-Host "PrewarmConnections.cmd not found at $prewarmCmd" -ForegroundColor Red
+                    }
+                }
+                '2' {
+                    if (Test-Path $StartScript) {
+                        $doSum = Read-Host "Show account/positions summary after start? (y/N)"
+                        $args = @()
+                        if ($doSum -and $doSum.ToLower().StartsWith("y")) { $args += "-Summary" }
+                        Run-And-Log -Title "Start" -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StartScript @args }
+                    } else {
+                        Write-Host ("Start script not found: {0}" -f $StartScript)
+                    }
+                }
+                Default {
+                    Write-Host "Invalid selection." -ForegroundColor Yellow
+                }
             }
             Pause-Enter
         }
@@ -552,6 +575,7 @@ while ($true) {
             Write-Host "Rebooting system..."
             Start-Sleep -Seconds 1
             Restart-Computer -Force
+
         }
 
         Default {
