@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 21, 2026 (Fix DH/DI/DJ: targeted listener restart on SOFT-FAIL; port 7497 cleanup in bin scripts; 2FA detection to prevent BounceServices cascade)
+**Last Updated:** March 23, 2026 (Fix DN/DO: add "autorestart file not found" to 2FA pattern; remove -Tail 50 so pattern at line ~42 is actually found in IBC log; Fix DP: ColdRestartTime 12-hour → 24-hour format)
 
 ---
 
@@ -3595,150 +3595,6 @@ sc start CloudflareTunnel >>"%LOG%" 2>&1
 
 ---
 
-### Fix DI: Fix Hardcoded Port 7497 in Bin Scripts + switch_trading_mode.py (Mar 21)
-**Status:** ✓ IMPLEMENTED
-
-**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 10-11); `C:\OptionsHistory\bin\DailyHealthCheck.ps1` (new `$IB_PORT` var); `switch_trading_mode.py` (new `update_daily_health()` function); `C:\OptionsHistory\bin\EmailDailyBundle.ps1` (DELETED)
-
-**Issue:** Three bin scripts hardcoded port 7497 (paper trading) and were missed by `switch_trading_mode.py` (PushButtonMenu option 7). After switching to live (7496): `BounceServices.cmd` force-killed wrong port; `DailyHealthCheck.ps1` checked wrong port and connected to wrong IB account; `EmailDailyBundle.ps1` connected to wrong port.
-
-**Fix — four changes:**
-1. **`BounceServices.cmd`**: Kill BOTH 7497 and 7496 holders (belt-and-suspenders; one will always be empty regardless of trading mode)
-2. **`DailyHealthCheck.ps1`**: Added `$IB_PORT = 7496` variable (line 2); replaced hardcoded `7497` in port check (line 21) and Python block IB connect (line 43); removed "(paper)" label
-3. **`switch_trading_mode.py`**: Added `DAILY_HEALTH_PS1` constant and `update_daily_health()` function; added to update loop after Health.ps1 repo entry. Now updates 7 files total on mode switch.
-4. **`EmailDailyBundle.ps1`**: Deleted (obsolete)
-
-**Impact:** `python switch_trading_mode.py live` (PushButtonMenu option 7) now correctly updates DailyHealthCheck.ps1. BounceServices correctly kills processes on whichever port is in use.
-
----
-
-### Fix DJ: 2FA Detection in Watchdog — Skip BounceServices When IBGateway Awaits Login (Mar 21)
-**Status:** ✓ IMPLEMENTED
-
-**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (CHECK 1 block, after port-DOWN FAIL log)
-
-**Issue:** When IBGateway restarts and shows the 2FA authentication screen, port 7496 is DOWN — indistinguishable from a crash. Watchdog called BounceServices which killed the login screen, restarting IBGateway again (new 2FA screen). Repeated every 15 min creating a cascade until user manually logged in. After live account switch, every IBGateway restart (5 AM internal timer, cold restart, or manual stop) created a cascade.
-
-**Fix:** Before setting `$needFullRestart = $true`, check the most recently modified IBC log file (`C:\IBC\Logs\IBC-*.txt`) for "2FA dialog", "Exit Session Setting", or "Restart in progress" within the last 20 minutes. If found → log `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually` → `exit 0`. Watchdog retries in 15 min; once user logs in and port comes back, check passes normally.
-
-**watchdog.log pattern when 2FA detected:**
-```
-[05:07] FAIL: port 7496 not listening (IBGateway DOWN) PID=not-running
-[05:07] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
-[05:22] FAIL: port 7496 not listening ...
-[05:22] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
-[06:35] OK   ← user authenticated
-```
-
-**Test:** `nssm stop IBGateway` → wait up to 15 min → watchdog.log shows `FAIL (2FA)` (no BounceServices) → log in → `OK` on next cycle.
-
-**Impact:** 2FA scenarios no longer create cascades. Each watchdog cycle just logs and waits. User sees exactly one "login required" prompt per restart instead of a cleared/restarted screen every 15 minutes.
-
----
-
-### Fix DH: SOFT-FAIL → RestartListener Only When IBGateway Port Still UP (Mar 21)
-**Status:** ✓ IMPLEMENTED
-
-**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (SOFT-FAIL 2-min re-check block)
-
-**Issue:** When the listener lost its IB connection (SOFT-FAIL: port UP, `/health=200` but `positions_error: "not connected"`), the watchdog's 2-min re-check still escalated to `BounceServices` which kills IBGateway. On a live account, this required 2FA re-authentication. The listener has auto-reconnect logic and often recovers on its own; if it doesn't, restarting ONLY the OptionsListener (not IBGateway) is sufficient.
-
-**Root cause of unnecessary 2FA:**
-- SOFT-FAIL: IBGateway is running (port 7496 UP), but listener disconnected from IB
-- Fix CV's 2-min wait is correct, but after 2 min it called `$needFullRestart = $true` → BounceServices → IBGateway killed → 2FA required on restart
-- Restarting OptionsListener reconnects it to the already-running IBGateway — no 2FA
-
-**Fix:** After 2-min re-check still shows `positions_error` AND `$gw` (port) is still UP:
-1. Run `RestartListener.cmd` (which already handles stop/start/health polling)
-2. Poll `/health` every 5s for up to 60s
-3. If listener reconnects → log `RECOVERED: listener reconnected after RestartListener -- no 2FA needed` → done
-4. If still not recovered after 60s → escalate to `BounceServices` (full restart)
-5. If `$gw` went DOWN during the 2-min wait → IBGateway crashed → escalate immediately
-
-**Key safety:** `$gw` check at the branching point — only skips IBGateway kill when port is confirmed still listening.
-
-**Impact:**
-- Transient listener disconnections (daily IB server reset at ~5 PM ET) → OptionsListener restart only → no 2FA
-- watchdog.log shows `SOFT-FAIL-RETRY: port 7496 still UP -- restarting OptionsListener only (no IBGateway kill)`
-- IBGateway kill + 2FA only when port actually goes down (genuine IBGateway crash)
-
----
-
-### Fix DK: 2FA Prediction Tracking + Post-Weekend Comparison (Mar 21)
-**Status:** ⏳ ASSESSMENT PENDING (Monday March 23, 2026)
-
-**Location:** `C:\OptionsHistory\logs\2fa_predictions.txt` (predictions); `C:\OptionsHistory\bin\Compare2FA.ps1` (comparison script); `C:\OptionsHistory\logs\compare2fa.log` (output); Windows Task Scheduler (`IB_Compare2FA_Once`, runs Mon Mar 23 8 PM)
-
-**Purpose:** Before the weekend (Mar 21–24), write a fixed set of predicted 2FA events so there is a ground truth to compare against after the weekend. After the weekend, run `Compare2FA.ps1` to validate whether predictions matched reality and how long each authentication took.
-
-**Predictions written to `2fa_predictions.txt`:**
-```
-2026-03-22 05:00  IB server daily restart (5 AM) -- FULL 2FA expected (SATURDAY)
-2026-03-22 18:30  ColdRestartTime Sunday 6:30 PM -- FULL 2FA expected (SUNDAY)
-2026-03-23 05:00  IB server daily restart (5 AM) -- FULL 2FA expected (MONDAY, before autorestart kicks in)
-2026-03-23 15:00  Preclose clientId approval dialogs -- APPROVAL DIALOG expected (Mon 3 PM)
-```
-
-**What `Compare2FA.ps1` validates:**
-- Matches each prediction to nearest `FAIL (2FA)` or `RESTART` event in `watchdog.log` (±3 hour window)
-- Shows delta between predicted and actual time
-- Shows authentication duration (FAIL(2FA) → next OK/ONLINE)
-- Checks `ibc_backup\` logs for exact "Second Factor Authentication initiated" timestamps
-
-**`IB_Compare2FA_Once` task:** Runs `Compare2FA.ps1` Mon Mar 23 at 8 PM, writes to `compare2fa.log`. One-time task (not recurring).
-
-**What to look for in comparison output:**
-- Saturday 5 AM: FAIL(2FA) in watchdog.log ✓ (autorestart not yet in effect — first weekend after setting AutoRestartTime=05:45 AM)
-- Sunday 6:30 PM: FAIL(2FA) ✓ (ColdRestartTime always requires 2FA)
-- Monday 5 AM: Should show `OK` at 6:07 AM (no FAIL — 5:45 AM IBC autorestart with autorestart file → auto-login)
-  - If Monday shows FAIL(2FA): autorestart mechanism didn't work → investigate IBC config
-  - If Monday shows OK: autorestart successful → daily 2FA eliminated going forward
-- Monday 3 PM: If approval dialog occurred → add daily 6:00 AM prewarm task (`IB_PrewarmApiConnections_0600`)
-
-**Impact:** First systematic validation of the 2FA reduction changes (AutoRestartTime=05:45 AM + Fix DL/DM). Results determine whether additional fixes (daily prewarm task) are needed.
-
----
-
-### Fix DL: Extend 2FA Detection Window 20 min → 90 min (Mar 21)
-**Status:** ✓ IMPLEMENTED
-
-**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` line 63
-
-**Issue:** IBC writes "Second Factor Authentication initiated" to `FRIDAY.txt` at ~5:01 AM. The first watchdog check is at 6:07 AM (66 minutes later). The old 20-minute window (`AddMinutes(-20)`) failed the age check → 2FA not detected → watchdog called BounceServices instead of logging `FAIL (2FA)`. This produced a false `RESTART: calling BounceServices.cmd` log entry at 6:07 AM.
-
-**Fix:**
-```powershell
-# BEFORE:
-if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-20)) {
-# AFTER:
-if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {
-```
-
-**Why 90 min:** Gap from 5:01 AM (IBC writes) to 6:07 AM (first watchdog) = 66 minutes. 90 min covers this with margin for variance. Also serves as safety net if the 5:45 AM IBC autorestart takes longer than expected.
-
-**Impact:** Watchdog logs `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices` at 6:07 AM instead of the inaccurate `RESTART` entry. No BounceServices cascade.
-
----
-
-### Fix DM: Prewarm Flag + On-OK Prewarm Run (Mar 21)
-**Status:** ✓ IMPLEMENTED
-
-**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (FAIL(2FA) block ~line 72; RESTART block ~line 246; OK block ~lines 185-200)
-
-**Issue:** After IBGateway restarts (either FAIL(2FA) followed by user login, or RESTART via BounceServices), IBGateway's in-memory clientId registry is cleared. The first connection from any unrecognised clientId on a live account triggers an approval dialog. The watchdog had no mechanism to automatically run `PrewarmConnections.cmd` after recovery.
-
-**Fix — flag file approach:**
-- On `FAIL (2FA)`: write `C:\OptionsHistory\logs\watchdog_prewarm_needed.txt` with current timestamp
-- On `RESTART: calling BounceServices`: write same prewarm flag file
-- On `OK`: if flag file exists → log `ONLINE: IBGateway port back up after FAIL(2FA) or RESTART -- running pre-warm (flag was Xmin old)` → run `PrewarmConnections.cmd` → delete flag → log `PREWARM: registered all clientIds with IBGateway`
-
-**Impact:**
-- After user authenticates (FAIL(2FA) → user logs in → next watchdog sees OK): pre-warm runs automatically, registering all 10 system clientIds. No 3 PM approval dialogs.
-- After BounceServices restart (RESTART → IBGateway comes back → watchdog sees OK): same pre-warm runs.
-- Flag persists across watchdog cycles — if IBGateway is slow to accept connections, pre-warm runs on the first cycle where health check passes.
-
----
-
 ### Fix DC: Disable IBC AutoRestartTime (Live Account + 2FA) (Mar 20)
 **Status:** ✓ IMPLEMENTED
 
@@ -3747,6 +3603,8 @@ if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {
 **Issue:** `AutoRestartTime=05:00 AM` caused IBC to restart IBGateway every morning at 5 AM. On a live account with mandatory 2FA, IBC cannot auto-login — IBGateway sits waiting for manual 2FA. The watchdog (starting at 6:07 AM) finds port 7496 not listening and calls BounceServices, creating a cascade lasting until ~6:52 AM.
 
 **Fix:** `AutoRestartTime=` (blank). Also added `ColdRestartTime=06:30 PM` for a weekly Sunday restart (user handles 2FA once per week).
+
+**Note:** ColdRestartTime format was subsequently corrected to `18:30` (24-hour) in Fix DP — the original `06:30 PM` was misread by IBC as 6:30 AM.
 
 **Impact:** IBGateway stays connected indefinitely. Watchdog sees port 7496 listening at 6:07 AM → OK. No cascade.
 
@@ -3867,4 +3725,207 @@ ClientId 42 (listener) is excluded — the OptionsListener service reconnects au
 
 **Impact:** All system clientIds are pre-approved by IBGateway before the trading week begins. Monday–Friday connections from any DCM/PlaceAnOrder function connect silently without triggering the approval dialog.
 
+### Fix DH: SOFT-FAIL → RestartListener Only When IBGateway Port Still UP (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (SOFT-FAIL 2-min re-check block)
+
+**Issue:** When the listener lost its IB connection (SOFT-FAIL: port UP, `/health=200` but `positions_error: "not connected"`), the watchdog's 2-min re-check still escalated to `BounceServices` which kills IBGateway. On a live account, this required 2FA re-authentication. The listener has auto-reconnect logic and often recovers on its own; if it doesn't, restarting ONLY the OptionsListener (not IBGateway) is sufficient.
+
+**Root cause of unnecessary 2FA:**
+- SOFT-FAIL: IBGateway is running (port 7496 UP), but listener disconnected from IB
+- Fix CV's 2-min wait is correct, but after 2 min it called `$needFullRestart = $true` → BounceServices → IBGateway killed → 2FA required on restart
+- Restarting OptionsListener reconnects it to the already-running IBGateway — no 2FA
+
+**Fix:** After 2-min re-check still shows `positions_error` AND `$gw` (port) is still UP:
+1. Run `RestartListener.cmd` (which already handles stop/start/health polling)
+2. Poll `/health` every 5s for up to 60s
+3. If listener reconnects → log `RECOVERED: listener reconnected after RestartListener -- no 2FA needed` → done
+4. If still not recovered after 60s → escalate to `BounceServices` (full restart)
+5. If `$gw` went DOWN during the 2-min wait → IBGateway crashed → escalate immediately
+
+**Key safety:** `$gw` check at the branching point — only skips IBGateway kill when port is confirmed still listening.
+
+**Impact:**
+- Transient listener disconnections (daily IB server reset at ~5 PM ET) → OptionsListener restart only → no 2FA
+- watchdog.log shows `SOFT-FAIL-RETRY: port 7496 still UP -- restarting OptionsListener only (no IBGateway kill)`
+- IBGateway kill + 2FA only when port actually goes down (genuine IBGateway crash)
+
+---
+
+### Fix DI: Fix Hardcoded Port 7497 in Bin Scripts + switch_trading_mode.py (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 10-11); `C:\OptionsHistory\bin\DailyHealthCheck.ps1` (new `$IB_PORT` var); `switch_trading_mode.py` (new `update_daily_health()` function); `C:\OptionsHistory\bin\EmailDailyBundle.ps1` (DELETED)
+
+**Issue:** Three bin scripts hardcoded port 7497 (paper trading) and were missed by `switch_trading_mode.py` (PushButtonMenu option 7). After switching to live (7496): `BounceServices.cmd` force-killed wrong port; `DailyHealthCheck.ps1` checked wrong port and connected to wrong IB account; `EmailDailyBundle.ps1` connected to wrong port.
+
+**Fix — four changes:**
+1. **`BounceServices.cmd`**: Kill BOTH 7497 and 7496 holders (belt-and-suspenders; one will always be empty regardless of trading mode)
+2. **`DailyHealthCheck.ps1`**: Added `$IB_PORT = 7496` variable (line 2); replaced hardcoded `7497` in port check (line 21) and Python block IB connect (line 43); removed "(paper)" label
+3. **`switch_trading_mode.py`**: Added `DAILY_HEALTH_PS1` constant and `update_daily_health()` function; added to update loop after Health.ps1 repo entry. Now updates 7 files total on mode switch.
+4. **`EmailDailyBundle.ps1`**: Deleted (obsolete)
+
+**Impact:** `python switch_trading_mode.py live` (PushButtonMenu option 7) now correctly updates DailyHealthCheck.ps1. BounceServices correctly kills processes on whichever port is in use.
+
+---
+
+### Fix DJ: 2FA Detection in Watchdog — Skip BounceServices When IBGateway Awaits Login (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (CHECK 1 block, after port-DOWN FAIL log)
+
+**Issue:** When IBGateway restarts and shows the 2FA authentication screen, port 7496 is DOWN — indistinguishable from a crash. Watchdog called BounceServices which killed the login screen, restarting IBGateway again (new 2FA screen). Repeated every 15 min creating a cascade until user manually logged in. After live account switch, every IBGateway restart (5 AM internal timer, cold restart, or manual stop) created a cascade.
+
+**Fix:** Before setting `$needFullRestart = $true`, check the most recently modified IBC log file (`C:\IBC\Logs\IBC-*.txt`) for "2FA dialog", "Exit Session Setting", or "Restart in progress" within the last 20 minutes. If found → log `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually` → `exit 0`. Watchdog retries in 15 min; once user logs in and port comes back, check passes normally.
+
+**watchdog.log pattern when 2FA detected:**
+```
+[05:07] FAIL: port 7496 not listening (IBGateway DOWN) PID=not-running
+[05:07] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
+[05:22] FAIL: port 7496 not listening ...
+[05:22] FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually
+[06:35] OK   ← user authenticated
+```
+
+**Test:** `nssm stop IBGateway` → wait up to 15 min → watchdog.log shows `FAIL (2FA)` (no BounceServices) → log in → `OK` on next cycle.
+
+**Impact:** 2FA scenarios no longer create cascades. Each watchdog cycle just logs and waits. User sees exactly one "login required" prompt per restart instead of a cleared/restarted screen every 15 minutes.
+
+---
+
+### Fix DK: 2FA Prediction Tracking + Post-Weekend Comparison (Mar 21)
+**Status:** ✓ ASSESSED (Mar 23, 2026) — Compare2FA.ps1 scheduled 8 PM tonight
+
+**Location:** `C:\OptionsHistory\logs\2fa_predictions.txt` (predictions); `C:\OptionsHistory\bin\Compare2FA.ps1` (comparison script); `C:\OptionsHistory\logs\compare2fa.log` (output); Windows Task Scheduler (`IB_Compare2FA_Once`, runs Mon Mar 23 8 PM)
+
+**Purpose:** Before the weekend (Mar 21–24), write a fixed set of predicted 2FA events so there is a ground truth to compare against after the weekend.
+
+**Predictions vs Actual (Mar 22–23):**
+
+| Prediction | Actual | Result |
+|-----------|--------|--------|
+| Sat Mar 22 5:00 AM — FULL 2FA | `RESTART` at 6:07 + 6:22 AM (cascade) | ✗ — Fix DN/DO not yet applied; "autorestart file not found" at line 42 missed by -Tail 50 |
+| Sun Mar 22 6:30 PM — FULL 2FA (ColdRestartTime) | Did NOT trigger at 6:30 PM | ✗ — `ColdRestartTime=06:30 PM` was misread by IBC as 6:30 AM (already past). User fixed to `18:30` format (Fix DP). Next ColdRestart: Mar 29 18:30 |
+| Mon Mar 23 5:00 AM — FULL 2FA | Restart at **5:45 AM** (not 5:00 AM); cascade at 6:07 + 6:22 AM | ⚠️ Progress: restart shifted to 5:45 AM (AutoRestartTime=05:45 AM applied to UI by Sunday session). Still cascaded — Fix DN/DO not applied until Mar 23 afternoon |
+| Mon Mar 23 3:00 PM — approval dialogs | No approval dialogs — all OK | ✓ Prewarm (Fix DM) worked |
+
+**Key findings:**
+- AutoRestartTime=05:45 AM successfully shifted IBGateway's daily restart from 5:00 AM → 5:45 AM
+- Fix DN ("autorestart file not found" pattern) was insufficient alone — Fix DO (-Tail 50 removal) was also needed
+- Prewarm (Fix DM) prevents 3 PM approval dialogs — confirmed working
+- ColdRestartTime format must be 24-hour (`18:30`) not 12-hour (`06:30 PM`)
+
+**Impact:** Validated that Fix DN+DO together are required to stop the morning cascade. Both now applied (Mar 23).
+
+---
+
+### Fix DL: Extend 2FA Detection Window 20 min → 90 min (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` line 63
+
+**Issue:** IBC writes "Second Factor Authentication initiated" to `FRIDAY.txt` at ~5:01 AM. The first watchdog check is at 6:07 AM (66 minutes later). The old 20-minute window (`AddMinutes(-20)`) failed the age check → 2FA not detected → watchdog called BounceServices instead of logging `FAIL (2FA)`. This produced a false `RESTART: calling BounceServices.cmd` log entry at 6:07 AM.
+
+**Fix:**
+```powershell
+# BEFORE:
+if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-20)) {
+# AFTER:
+if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {
+```
+
+**Why 90 min:** Gap from 5:01 AM (IBC writes) to 6:07 AM (first watchdog) = 66 minutes. 90 min covers this with margin for variance. Also serves as safety net if the 5:45 AM IBC autorestart takes longer than expected.
+
+**Impact:** Watchdog logs `FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices` at 6:07 AM instead of the inaccurate `RESTART` entry. No BounceServices cascade.
+
+---
+
+### Fix DM: Prewarm Flag + On-OK Prewarm Run (Mar 21)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (FAIL(2FA) block ~line 72; RESTART block ~line 246; OK block ~lines 185-200)
+
+**Issue:** After IBGateway restarts (either FAIL(2FA) followed by user login, or RESTART via BounceServices), IBGateway's in-memory clientId registry is cleared. The first connection from any unrecognised clientId on a live account triggers an approval dialog. The watchdog had no mechanism to automatically run `PrewarmConnections.cmd` after recovery.
+
+**Fix — flag file approach:**
+- On `FAIL (2FA)`: write `C:\OptionsHistory\logs\watchdog_prewarm_needed.txt` with current timestamp
+- On `RESTART: calling BounceServices`: write same prewarm flag file
+- On `OK`: if flag file exists → log `ONLINE: IBGateway port back up after FAIL(2FA) or RESTART -- running pre-warm (flag was Xmin old)` → run `PrewarmConnections.cmd` → delete flag → log `PREWARM: registered all clientIds with IBGateway`
+
+**Impact:**
+- After user authenticates (FAIL(2FA) → user logs in → next watchdog sees OK): pre-warm runs automatically, registering all 10 system clientIds. No 3 PM approval dialogs.
+- After BounceServices restart (RESTART → IBGateway comes back → watchdog sees OK): same pre-warm runs.
+- Flag persists across watchdog cycles — if IBGateway is slow to accept connections, pre-warm runs on the first cycle where health check passes.
+
+---
+
+### Fix DN: Add "autorestart file not found" to 2FA Detection Pattern (Mar 22)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` line 71 (2FA pattern match)
+
+**Issue:** After Fix DJ, the watchdog still cascaded on March 22. When BounceServices restarted IBGateway at 6:07 AM, IBC started writing SUNDAY.txt with `"autorestart file not found: full authentication will be required"` as its first meaningful line. SUNDAY.txt became the most-recently-modified IBC log, overshadowing SATURDAY.txt which had `"Restart in progress"`. The detection pattern had no match for the new session file's text → `$twoFaDetected = $false` → BounceServices fired again at 6:22 AM.
+
+**Fix:** Added `"autorestart file not found"` to the pattern:
+```powershell
+if ($recent -match "2FA dialog|Second Factor Authentication|Exit Session Setting|Restart in progress|autorestart file not found") {
+```
+
+**Impact:** When IBC writes `"autorestart file not found"` at the very start of any new session requiring 2FA, the watchdog detects it immediately on the next check.
+
+---
+
+### Fix DO: Remove `-Tail 50` from IBC Log 2FA Search (Mar 23)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` line 70
+
+**Issue:** Fix DN added the correct pattern, but the watchdog still cascaded on March 23. Root cause confirmed from `ibc_backup/IBC-3.23.0_GATEWAY-1037_MONDAY_20260323_0605.txt`:
+- File has 198 lines at 6:05 AM (2 min before watchdog check)
+- `"autorestart file not found"` is at **line 42**
+- 156 lines of JVM system properties follow (lines 43–198)
+- `-Tail 50` reads lines 149–198 (the JVM dump) — **line 42 is never reached**
+- Pattern is correct, window is correct, file is selected correctly — only the tail size is wrong
+
+**Fix:**
+```powershell
+# BEFORE:
+$recent = Get-Content $ibcLog.FullName -Tail 50 -ErrorAction SilentlyContinue
+
+# AFTER (Fix DO):
+$recent = Get-Content $ibcLog.FullName -ErrorAction SilentlyContinue
+```
+
+**Why safe:** IBC log files are at most a few thousand lines per day (not a performance concern for a 15-min watchdog). Reading the entire file guarantees line 42 is always included regardless of how many JVM property lines follow it.
+
+**Impact:** Watchdog correctly detects `"autorestart file not found"` at line 42 → logs `FAIL (2FA): skipping BounceServices` instead of calling BounceServices. No cascade tomorrow morning.
+
+---
+
+### Fix DP: ColdRestartTime Format — 12-Hour "PM" → 24-Hour Format (Mar 22)
+**Status:** ✓ IMPLEMENTED (user config change)
+
+**Location:** `C:\IBC\config.ini`
+
+**Issue:** `ColdRestartTime=06:30 PM` was misread by IBC as 6:30 AM. The Sunday session started at 6:04 AM after BounceServices, so "cold restart at 06:30" referred to 6:30 AM that day — only 26 minutes away. The restart would have fired at 6:30 AM March 22 (already past by the time user authenticated at 6:33 AM) instead of Sunday evening at 6:30 PM. No Sunday-evening cold restart ever triggered.
+
+**IBC log evidence (SUNDAY.txt, tail):**
+```
+05:45:00  Restart in progress
+06:04:xx  [new IBC session starts after BounceServices at 6:22 AM]
+→ ColdRestartTime=06:30 PM was parsed as 06:30 → already past → no 6:30 PM restart scheduled
+```
+
+**Fix:** User changed `ColdRestartTime=06:30 PM` → `ColdRestartTime=18:30` (24-hour format).
+
+**Confirmed working:** Monday IBC log (MONDAY_0605 backup) shows:
+```
+Gateway will be cold restarted at 2026/03/29 18:30
+```
+Correctly scheduled for next Sunday March 29 at 6:30 PM.
+
+**Impact:** Weekly Sunday 6:30 PM cold restart now triggers correctly. This is the one weekly 2FA event that requires full re-authentication (ColdRestartTime always bypasses the autorestart file mechanism). Next occurrence: March 29, 2026 at 18:30.
+
+---
 
