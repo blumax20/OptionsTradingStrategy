@@ -13,7 +13,7 @@ set "MAX_HEALTH_WAIT=30" rem seconds to wait for /health 200
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 
 call :ts
->>"%LOG%" echo ==== [RestartListener %%TS%%] ====
+>>"%LOG%" echo ==== [RestartListener %TS%] ====
 
 rem ----- verify service exists -----
 sc query "%SVC%" >nul 2>&1
@@ -29,7 +29,7 @@ sc stop "%SVC%" >>"%LOG%" 2>&1
 
 set /a waited=0
 :WAIT_STOP
-for /f "tokens=3" %%s in ('sc query "%SVC%" ^| findstr /i STATE') do set "STATE=%%s"
+for /f "tokens=4" %%s in ('sc query "%SVC%" ^| findstr /i STATE') do set "STATE=%%s"
 if /i "!STATE!"=="STOPPED" goto STOP_OK
 if /i "!STATE!"=="RUNNING" (
   if !waited! geq %MAX_STOP_WAIT% goto STOP_FORCE
@@ -68,7 +68,7 @@ sc start "%SVC%" >>"%LOG%" 2>&1
 
 set /a waited=0
 :WAIT_RUN
-for /f "tokens=3" %%s in ('sc query "%SVC%" ^| findstr /i STATE') do set "STATE=%%s"
+for /f "tokens=4" %%s in ('sc query "%SVC%" ^| findstr /i STATE') do set "STATE=%%s"
 if /i "!STATE!"=="RUNNING" goto START_OK
 if !waited! geq %MAX_START_WAIT% (
   >>"%LOG%" echo ERROR: service failed to enter RUNNING after %MAX_START_WAIT%s (state=!STATE!).

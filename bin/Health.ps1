@@ -12,7 +12,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_PORT = 7497
 #   Live trading  : $IB_PORT = 7496
-$IB_PORT = 7497
+$IB_PORT = 7496
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
@@ -279,6 +279,7 @@ def main():
     cid = 830 + random.randint(0,19)
     try:
         ib.connect('127.0.0.1', $IB_PORT, clientId=cid)
+        ib.sleep(1.0)  # Wait for managed accounts list to populate after connect
     except Exception as e:
         out["error"] = f"connect: {e}"
         print(json.dumps(out)); return
@@ -286,8 +287,14 @@ def main():
     acct = ib.managedAccounts()[0] if ib.managedAccounts() else None
     vals = {}
     try:
-        summ = ib.accountSummary(acct)
-        vals = {s.tag: s.value for s in summ}
+        if acct:
+            ib.client.reqAccountUpdates(True, acct)   # non-blocking subscribe
+            ib.sleep(4.0)                               # wait for IB to push account values
+            avs = ib.accountValues(acct)
+            ib.client.reqAccountUpdates(False, acct)   # unsubscribe
+            for av in avs:  # prefer BASE (consolidated), fall back to USD
+                if av.currency == 'BASE' or (av.currency == 'USD' and av.tag not in vals):
+                    vals[av.tag] = av.value
     except Exception: pass
 
     day_real = f(vals.get("RealizedPnL"))
@@ -311,7 +318,7 @@ def main():
             json.dump(base, open(basef,"w"))
 
     if netliq is not None:
-        out["ytd_change"] = netliq - float(base.get("netliq", 0.0))
+        out["ytd_change"] = round(netliq - float(base.get("netliq", 0.0)), 2)
     out["ok"] = True
     print(json.dumps(out))
 if __name__ == "__main__":
@@ -563,21 +570,20 @@ def main():
         since = (datetime.now(UTC)-timedelta(days=7)).strftime("%Y%m%d-%H:%M:%S")
         fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
 
-        # Collect leg-level CLOSE fills (no market data)
+        # Collect leg-level fills (all OPT fills; openClose field is unreliable on paper accounts)
         legs=[]
         for f in fills:
             c,e=f.contract,f.execution
             if getattr(c,"secType","")!="OPT": continue
-            if getattr(e,"openClose","")!="C": continue
+            # Include all OPT fills — paper accounts often leave openClose="" on BAG legs
             t_utc=parse_ib_time(getattr(e,"time","")); t_ny=t_utc.astimezone(NY) if t_utc else None
             pnl=0.0
             try:
-                if getattr(e,"execId",None):
-                    cr=ib.reqCommissionReport(e.execId)
-                    if cr and cr.realizedPNL is not None:
-                        pnl=float(cr.realizedPNL)
+                # commissionReport is a direct attribute on Fill (ib_insync NamedTuple)
+                cr = f.commissionReport
+                if cr and cr.realizedPNL is not None:
+                    pnl=float(cr.realizedPNL)
             except Exception:
-                # Commission may be unavailable — treat as 0 and continue
                 pnl=0.0
             legs.append(dict(sym=c.symbol,
                              exp=getattr(c,"lastTradeDateOrContractMonth",""),
@@ -715,12 +721,17 @@ function Read-SharedFile([string]$path, [int]$tail = 2000) {
 
 $lines = Read-SharedFile $logPath 2500
 
-# Buckets
-$placed  = $lines | Select-String -SimpleMatch ' Placed ' | Select-Object -ExpandProperty Line
-$closed  = $lines | Select-String -SimpleMatch ' Submitted CLOSE ' | Select-Object -ExpandProperty Line
-$weekly  = $lines | Select-String -Pattern 'Weekly-enforce|FORCE-CLOSE' | Select-Object -ExpandProperty Line
-$failed  = $lines | Select-String -Pattern 'Failed to place|Failed to qualify|ERROR:' | Select-Object -ExpandProperty Line
-$skipped = $lines | Select-String -Pattern 'Skipping;|No matching spread quantity|limit below min|OI ' | Select-Object -ExpandProperty Line
+# Scope stats to today + yesterday to avoid multi-day accumulation from the cumulative log
+$_todayStr  = (Get-Date).ToString('yyyy-MM-dd')
+$_yesterStr = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
+$lines = $lines | Where-Object { $_ -match "^($_todayStr|$_yesterStr)" }
+
+# Buckets (current ib_insync log format)
+$placed  = $lines | Select-String -Pattern "orderStatus:.*status='(Submitted|PreSubmitted)'" | Select-Object -ExpandProperty Line
+$closed  = $lines | Select-String -Pattern "orderStatus:.*permId=\d+, action='SELL'.*status='(Submitted|PreSubmitted)'" | Select-Object -ExpandProperty Line
+$weekly  = $lines | Select-String -Pattern '[Ff]orce.close|[Ss]tage\s+2[^0-9]|force_close' | Select-Object -ExpandProperty Line
+$failed  = $lines | Select-String -Pattern '\bERROR\b|Exception:|no_viable_limit|SKIPPING order' | Select-Object -ExpandProperty Line
+$skipped = $lines | Select-String -Pattern 'skipped|defer_to_force|no_spread_in_positions' | Select-Object -ExpandProperty Line
 
 # Compact summary counts
 ("Placed (open/close) : {0}" -f ($placed.Count + $closed.Count))        | Tee-Object -FilePath $Report -Append
@@ -745,10 +756,17 @@ $skipped | Select-Object -Last 10 |
 "`nPer-symbol activity (last window):" | Tee-Object -FilePath $Report -Append
 $extractSym = {
   param($line)
-  if ($line -match '\[(?<sym>[A-Z\.]+)\]') { $matches.sym } else { $null }
+  # Limit to 1-5 char symbols; excludes [ERROR], [WARNING], [INFO], [DEBUG] (6+ chars)
+  $excluded = @('ERROR','WARNING','INFO','DEBUG','CRITICAL')
+  if ($line -match '\[(?<sym>[A-Z][A-Z\.]{0,4})\]') {
+    if ($matches.sym -notin $excluded) { return $matches.sym }
+  }
+  if ($line -match "symbol='(?<sym>[A-Z][A-Z\.]+)'") { return $matches.sym }
+  return $null
 }
 $allTagged = @()
-foreach ($l in ($placed + $closed)) { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='placed'} } }
+# Use $placed only (not $placed + $closed) — $closed is a subset of $placed and would double-count SELL orders
+foreach ($l in $placed)  { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='placed'} } }
 foreach ($l in $failed)            { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='failed'} } }
 foreach ($l in $skipped)           { $s = & $extractSym $l; if ($s){ $allTagged += [pscustomobject]@{Sym=$s; Kind='skipped'} } }
 
@@ -792,3 +810,9 @@ try {
 }
 
 Write-Host "Wrote OneShotHealth report: $Report"
+
+# Re-encode the saved report from UTF-16 LE (PS 5.1 Tee-Object default) to UTF-8 without BOM
+try {
+    $content = [System.IO.File]::ReadAllText($Report, [System.Text.Encoding]::Unicode)
+    [System.IO.File]::WriteAllText($Report, $content, [System.Text.UTF8Encoding]::new($false))
+} catch {}

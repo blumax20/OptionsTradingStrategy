@@ -1,4 +1,5 @@
 ﻿# DailyHealthCheck.ps1
+$IB_PORT = 7496  # Fix DI: updated by switch_trading_mode.py (7497=paper, 7496=live)
 $py = "C:\Users\Administrator\code\OptionsTradingStrategy\.venv\Scripts\python.exe"
 $root="C:\Users\Administrator\code\OptionsTradingStrategy"
 $logDir="C:\OptionsHistory\logs"
@@ -17,7 +18,7 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # Listening ports
 "--- Listening Ports ---" | Tee-Object -FilePath $report -Append
-Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 7497,5001 } |
+Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in $IB_PORT,5001 } |
   Format-Table -AutoSize LocalAddress,LocalPort,OwningProcess |
   Out-String | Tee-Object -FilePath $report -Append
 
@@ -33,13 +34,13 @@ try {
   "mdtest:  $($md.StatusCode) $($md.Content)" | Tee-Object -FilePath $report -Append
 } catch { "mdtest:  ERROR $($_.Exception.Message)" | Tee-Object -FilePath $report -Append }
 
-# Current positions (paper)
-"--- Current Positions (paper) ---" | Tee-Object -FilePath $report -Append
+# Current positions
+"--- Current Positions ---" | Tee-Object -FilePath $report -Append
 $tmpPy = Join-Path $env:TEMP "ib_positions_$stamp.py"
 $pyBlock = @"
 from ib_insync import IB
 ib = IB()
-ok = ib.connect('127.0.0.1', 7497, clientId=888)
+ok = ib.connect('127.0.0.1', $IB_PORT, clientId=888)
 print("connected:", ok)
 if ok:
     for p in ib.positions():
