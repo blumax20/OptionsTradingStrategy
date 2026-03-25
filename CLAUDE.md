@@ -3929,3 +3929,40 @@ Correctly scheduled for next Sunday March 29 at 6:30 PM.
 
 ---
 
+### Fix DQ: Write Prewarm Flag on SOFT-FAIL-RETRY Recovery (Mar 25)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (SOFT-FAIL-RETRY RECOVERED block, ~line 141)
+
+**Issue:** Prewarm did not run after the daily 6:00 AM IBC autorestart on 3/24 and 3/25. The prewarm flag (`watchdog_prewarm_needed.txt`) is only written on `FAIL (2FA)` or `RESTART: calling BounceServices`. The 6:00 AM autorestart completes before the first watchdog check at 6:07 AM, so the watchdog logs `OK` without ever writing the flag. IBGateway's clientId registry is cleared by the restart but prewarm never runs, leaving clientIds unregistered until 3 PM when approval dialogs appear.
+
+**Root cause of 6:22 AM SOFT-FAIL pattern:** After the 6:00 AM IBGateway autorestart, IBC finishes its backend IB server authentication handshake ~15-20 minutes later, briefly disconnecting all API clients. The listener reports `positions_error: "not connected"` while port 7496 is still UP. Fix DH's SOFT-FAIL-RETRY restarts OptionsListener only (correct — IBGateway stays running), listener reconnects in ~7 seconds, and execution falls through to the OK block. But no prewarm flag was written → prewarm skipped.
+
+**Fix:** Write the prewarm flag in the SOFT-FAIL-RETRY RECOVERED path:
+```powershell
+Write-Log "RECOVERED: listener reconnected after RestartListener -- no 2FA needed"
+# Fix DQ: 6AM autorestart clears IBGateway clientId registry before first
+# watchdog check. 6:22AM SOFT-FAIL is a reliable indicator -- write prewarm
+# flag so OK block registers all clientIds with IBGateway.
+Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+$recovered = $true; break
+```
+
+**Why correct:** The 6:22 AM SOFT-FAIL is a reliable proxy for the 6:00 AM IBGateway restart. Running prewarm after a listener-only restart is harmless (~13s total). The existing OK block already handles flag → run prewarm → delete flag → log PREWARM.
+
+**Expected log pattern after fix:**
+```
+[06:07] OK
+[06:22] SOFT-FAIL: ... waiting 2 min for auto-reconnect
+[06:24] FAIL: IB still not connected after 2 min
+[06:24] SOFT-FAIL-RETRY: port 7496 still UP -- restarting OptionsListener only
+[06:24] RECOVERED: listener reconnected after RestartListener -- no 2FA needed
+[06:24] ONLINE: IBGateway port back up after FAIL(2FA) or RESTART -- running pre-warm (flag was Xmin old)
+[06:24] PREWARM: registered all clientIds with IBGateway.
+[06:24] OK
+```
+
+**Impact:** All system clientIds registered with IBGateway daily after the 6:00 AM autorestart. No 3 PM approval dialogs on weekdays.
+
+---
+

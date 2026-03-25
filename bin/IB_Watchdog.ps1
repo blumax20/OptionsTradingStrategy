@@ -27,6 +27,10 @@
 # Fix DM:  On FAIL(2FA) or RESTART: write prewarm flag file. On OK after flag exists:
 #          run PrewarmConnections.cmd to register all API clientIds with IBGateway,
 #          then log ONLINE/PREWARM. Prevents 3 PM approval dialogs after restarts.
+# Fix DQ:  On SOFT-FAIL-RETRY RECOVERED: write prewarm flag. The 6AM IBGateway autorestart
+#          clears the clientId registry but completes before the 6:07AM watchdog check, so
+#          FAIL/RESTART are never logged. The 6:22AM listener disconnect (IBC backend auth
+#          handshake) is a reliable indicator -- flag ensures prewarm runs on next OK.
 # Runs every 15 min via Task Scheduler (daily 6:07AM-8:07PM).
 # Checks IB Gateway port, listener /health, and CloudflareTunnel service.
 # Tunnel-only failure: restart just CloudflareTunnel (no BounceServices).
@@ -131,6 +135,10 @@ if (-not $needFullRestart) {
                                                         $rBody = $rResp.Content | ConvertFrom-Json
                                                         if (-not $rBody.positions_error) {
                                                             Write-Log "RECOVERED: listener reconnected after RestartListener -- no 2FA needed"
+                                                            # Fix DQ: 6AM autorestart clears IBGateway clientId registry before first
+                                                            # watchdog check. 6:22AM SOFT-FAIL is a reliable indicator -- write prewarm
+                                                            # flag so OK block registers all clientIds with IBGateway.
+                                                            Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
                                                             $recovered = $true; break
                                                         }
                                                     } catch { $recovered = $true; break }
