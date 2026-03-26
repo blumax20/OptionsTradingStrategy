@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 23, 2026 (Fix DN/DO: add "autorestart file not found" to 2FA pattern; remove -Tail 50 so pattern at line ~42 is actually found in IBC log; Fix DP: ColdRestartTime 12-hour → 24-hour format)
+**Last Updated:** March 25, 2026 (Fix DU: `_rth_risk_exits()` mid-price max-polling — poll full 5s window and accumulate MAX mid per leg for TP/SL evaluation instead of breaking on first stale tick)
 
 ---
 
@@ -3929,6 +3929,44 @@ Correctly scheduled for next Sunday March 29 at 6:30 PM.
 
 ---
 
+### Fix DU: `_rth_risk_exits()` Mid-Price Max-Polling for TP/SL (Mar 25)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_process_vertical()` inside `_rth_risk_exits()`, polling loop ~line 2955)
+
+**Issue:** The mid-price polling loop for TP/SL evaluation broke on the **first** tick where both legs returned non-None (~1.6s max at 8 x 0.2s). Same stale-first-tick problem as Fix DT. A spread at or near the TP threshold could return a low initial stale quote and be skipped, only to be correctly valued on the next run.
+
+**Fix:** Replaced the early-exit loop with a max-accumulating loop over the full 5-second window (25 x 0.2s), accumulating the MAX mid seen for each leg independently:
+
+```python
+# Fix DU: poll full 5s window and accumulate MAX mid per leg
+_du_best_l: float | None = None
+_du_best_s: float | None = None
+for _ in range(25):          # 25 x 0.2s = 5 seconds
+    ib.sleep(0.2)
+    _v = _mid(tl)
+    if _v is not None:
+        if _du_best_l is None or _v > _du_best_l:
+            _du_best_l = _v
+    _v = _mid(ts)
+    if _v is not None:
+        if _du_best_s is None or _v > _du_best_s:
+            _du_best_s = _v
+curr = None
+ml = _du_best_l
+ms = _du_best_s
+```
+
+**MAX semantics for TP/SL:**
+- **TP** (`curr >= entry + gain_frac * (width - entry)`): MAX makes TP *easier* to trigger — correct, conservative toward capturing gains
+- **Stop-loss** (`curr <= (1 - loss_frac) * entry`): MAX makes stop-loss *harder* to trigger — correct, avoids false triggers from a single stale low tick
+
+Fix AG1 portfolio price fallback unchanged — still activates when both legs stay None after the 5s window.
+
+**Impact:** Risk exit TP/SL evaluation uses the best market maker quote seen over 5 seconds instead of the potentially stale first tick. Reduces false negatives (TP missed due to stale first quote).
+
+---
+
 ### Fix DQ: Write Prewarm Flag on SOFT-FAIL-RETRY Recovery (Mar 25)
 **Status:** ✓ IMPLEMENTED
 
@@ -3963,6 +4001,79 @@ $recovered = $true; break
 ```
 
 **Impact:** All system clientIds registered with IBGateway daily after the 6:00 AM autorestart. No 3 PM approval dialogs on weekdays.
+
+---
+
+### Fix DS: Menu 8→1 — Place OPEN Orders from Previous Day's CSV When Today's Is Absent (Mar 25)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_delegate_open_from_recent_csvs` ~line 824; `--place-opens` handler ~line 3923)
+
+**Issue:** Menu 8→1 (`--place-opens`) called `_delegate_open_from_recent_csvs(last_n_csvs=1)` which only checked today's folder. Before the 5 PM listener runs (e.g. morning manual replay), today's CSV doesn't exist → function returns empty → nothing placed.
+
+**Fix — two changes:**
+
+1. **`--place-opens` handler:** `last_n_csvs=1` → `last_n_csvs=2` so `_csv_paths_by_priority` checks both today and yesterday.
+
+2. **`_delegate_open_from_recent_csvs()`:** After building `to_submit`, if today's folder has OPEN signals, drop all older folders (Option B — fallback only when today absent). For previous-day folders, pass `--allow-prev-day-opens --oi-check off` to bypass PlaceAnOrder's same-day signal filter and skip stale OI validation.
+
+```python
+# Drop older folders if today's CSV has signals (Option B: fallback only)
+if today_folder in to_submit:
+    to_submit = {today_folder: to_submit[today_folder]}
+# Pass prev-day flags when using an older CSV
+_prev_day_flags = (["--allow-prev-day-opens", "--oi-check", "off"]
+                   if folder != today_folder else [])
+```
+
+**Pricing at different times of day:**
+- Before market open: live quotes unavailable → falls back to theo from yesterday's CSV (same as original 5 PM batch would have used)
+- During/after market hours: uses live join pricing
+
+**5 PM scheduled run:** Unaffected — when today's CSV exists, `today_folder in to_submit` is True → older folders dropped → only today's signals placed as before.
+
+**Impact:** Running menu 8→1 before today's listener CSV exists uses yesterday's signals and pricing. 10:30 AM low-OI cleanup cancels any stale-OI orders placed from the previous day's data.
+
+---
+
+### Fix DT: `live_spread_price()` Max-Polling — Return Best Join Over Full Window (Mar 25)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`live_spread_price()`, Phase 1 polling loop ~lines 825-858); `InteractiveBrokersTrader/DailyCycleManagement.py` (`_submit_close_shared()` `--live-timeout` ~line 611)
+
+**Issue:** At 3 PM preclose on Mar 25, LNG 285/290C was placed at $0.10 and LNT 67.5/65P at $0.05 using join pricing. Both filled immediately at much higher prices ($1.91 and $0.29). Root cause: `live_spread_price()` Phase 1 returned on the **FIRST non-None tick** from `_compute()` (~0.2s after `reqMktData()`). The initial quote reflects stale/wide market maker bids before the book updates. Both orders filled at exactly 3 PM (not delayed) confirming the market was liquid — the limit price was just too low due to the stale first tick.
+
+**Fix — two changes:**
+
+1. **Max-polling over full window:** Instead of `return result` on first non-None, accumulate the MAX over the full timeout:
+
+```python
+# BEFORE: early exit on first tick
+result = _compute(tL, tS)
+if result is not None:
+    return result
+else:  # clean timeout
+    return None
+
+# AFTER (Fix DT): accumulate MAX, return at end of window
+_dt_best: float | None = None
+result = _compute(tL, tS)
+if result is not None:
+    if _dt_best is None or result > _dt_best:
+        _dt_best = result
+# ... (at clean timeout):
+if _dt_best is not None:
+    logger.warning("[%s] Fix DT: join max-poll result=%.2f (scheme=%s, polled=%.1fs)", ...)
+return _dt_best
+```
+
+The `_mkt_errors` fast-fail path (Fix CG) still breaks out immediately to Phase 2 — unchanged.
+
+2. **Increase preclose `--live-timeout` from 10 → 15 seconds** to give sufficient window for quote stabilization (~75 ticks at 0.2s step).
+
+**What is NOT changed:** Fix AM factor (0.95) — only activates when join returns None entirely (e.g. 9:47 AM risk exit case). Phase 2 delayed data — still returns on first non-None.
+
+**Impact:** Next preclose, ib_cycle.log shows `[SYM] Fix DT: join max-poll result=X.XX (scheme=join, polled=15.0s)`. Limit prices reflect the best market maker quote seen over 15 seconds instead of the stale first tick. For liquid tight-spread options, max ≈ first tick → no behavior change.
 
 ---
 

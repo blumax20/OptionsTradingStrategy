@@ -823,6 +823,7 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
         tL = ib.reqMktData(longC, '', False, False)
         tS = ib.reqMktData(shortC, '', False, False)
         waited = 0.0; step = 0.2
+        _dt_best: float | None = None  # Fix DT: accumulate best result over full window
         try:
             while waited < timeout:
                 # Fix CG: use ib.sleep so ib_insync event loop dispatches errorEvent callbacks
@@ -840,10 +841,21 @@ def live_spread_price(ib: IB, symbol: str, exp: str, right: str,
                     )
                     break  # fall through to Phase 2
                 result = _compute(tL, tS)
+                # Fix DT: keep MAX over full window instead of returning on first tick.
+                # The initial quote after reqMktData() may be stale — subsequent ticks reflect
+                # improving market maker quotes. LNG/LNT preclose Mar 25: first tick=$0.05/$0.10,
+                # but natural combo bid was $0.29/$1.91; polling the full window catches better quotes.
                 if result is not None:
-                    return result
+                    if _dt_best is None or result > _dt_best:
+                        _dt_best = result
             else:
-                return None  # clean timeout, no error — caller falls through to CSV/AM
+                # Clean timeout (no market data error) — return best seen, or None
+                if _dt_best is not None:
+                    logger.warning(
+                        "[%s] Fix DT: join max-poll result=%.2f (scheme=%s, polled=%.1fs)",
+                        symbol, _dt_best, scheme, waited,
+                    )
+                return _dt_best
         finally:
             try: ib.cancelMktData(longC)
             except Exception: pass

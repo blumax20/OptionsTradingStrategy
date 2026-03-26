@@ -608,7 +608,7 @@ class DailyCycleManagementMixin:
                 "--symbols", sym,
                 "--min-limit", "0.01" if context == "preclose" else "0.05",
                 "--use-live-close", scheme,  # Dynamic: 'mid' for same-day, 'join' for previous-day
-                "--live-timeout", "10" if context == "preclose" else "5",  # Fix CD: 3s default too short on fresh subprocess connection
+                "--live-timeout", "15" if context == "preclose" else "5",  # Fix CD/DT: 15s for preclose max-poll window (was 10); 3s default too short on fresh subprocess connection
                 "--quantity", "50",
                 "--quiet",
                 "--fallback-individual-legs",  # Fix S: Enable worthless leg handling
@@ -821,11 +821,20 @@ class DailyCycleManagementMixin:
             except Exception as e:
                 LOG.warning("Open-delegate: failed reading %s: %s", path, e)
                 continue
+        today_folder = now_d.strftime("%y_%m_%d")
+        # Fix DS Option B: only use previous-day CSV as fallback when today's CSV has no OPEN signals.
+        # If today's folder is present, drop all older folders to avoid stale catch-up at 5 PM.
+        if today_folder in to_submit:
+            to_submit = {today_folder: to_submit[today_folder]}
         for folder, syms in to_submit.items():
             if not syms:
                 continue
+            # Fix DS: when placing from a previous day's CSV, bypass the same-day signal filter
+            # (Fix CQ) and skip stale OI check (10:30 AM cleanup cancels any low-OI orders).
+            _prev_day_flags = (["--allow-prev-day-opens", "--oi-check", "off"]
+                               if folder != today_folder else [])
             argv = ["--mode","from-signal","--date",folder,"--symbols", ",".join(sorted(syms)),
-                    "--min-limit","0.05","--bump-to-min","--use-live-open","join","--quiet"]
+                    "--min-limit","0.05","--bump-to-min","--use-live-open","join","--quiet"] + _prev_day_flags
             try:
                 self._attempt(action="open", status="queued", reason=f"from_csv_{folder}", source="dcm-open")
             except Exception:
@@ -2943,14 +2952,25 @@ class DailyCycleManagementMixin:
                     short_c = scd[0].contract
                     tl = ib.reqMktData(long_c, snapshot=False)
                     ts = ib.reqMktData(short_c, snapshot=False)
-                    # brief poll
-                    for _ in range(8):
+                    # Fix DU: poll full 5s window and accumulate MAX mid per leg (same pattern as Fix DT).
+                    # The first tick after reqMktData is often stale; subsequent ticks converge to live bid/ask.
+                    # MAX semantics: TP fires if spread ever reached threshold (conservative for gains);
+                    # stop-loss only fires if spread stayed low across the full window (avoids false triggers).
+                    _du_best_l: float | None = None
+                    _du_best_s: float | None = None
+                    for _ in range(25):          # 25 x 0.2s = 5 seconds
                         ib.sleep(0.2)
-                        if _mid(tl) is not None and _mid(ts) is not None:
-                            break
+                        _v = _mid(tl)
+                        if _v is not None:
+                            if _du_best_l is None or _v > _du_best_l:
+                                _du_best_l = _v
+                        _v = _mid(ts)
+                        if _v is not None:
+                            if _du_best_s is None or _v > _du_best_s:
+                                _du_best_s = _v
                     curr = None
-                    ml = _mid(tl)
-                    ms = _mid(ts)
+                    ml = _du_best_l
+                    ms = _du_best_s
                     # Fix AG1: fallback to portfolio market prices if reqMktData returns None
                     if ml is None:
                         ml = port_prices.get(long_leg["conId"])
@@ -3920,7 +3940,8 @@ if __name__ == "__main__":
     try:
         if args.place_opens:
             # Today & yesterday, DTE ≥ 20; delegated to PlaceAnOrder (robust pricing/idempotency)
-            host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=1)
+            # Fix DS: last_n_csvs=2 so yesterday's CSV is used when today's doesn't exist yet
+            host._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=2)
 
         if args.preclose:
             # Time guard: only allow preclose during 14:55-15:10 ET
