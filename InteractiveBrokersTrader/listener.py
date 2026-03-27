@@ -1350,6 +1350,11 @@ def signal_generic():
     return jsonify(result)
 
 
+# Fix DV: dedup cache — suppress duplicate (symbol, signal_type) within 60s
+_RECENT_SIGNAL_TIMES: dict = {}
+_DV_DEDUP_WINDOW_S: float = 60.0
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = _get_payload()
@@ -1360,6 +1365,16 @@ def webhook():
     if not symbol:
         return _fail("payload", "ticker missing from payload and not found in text", 400)
     sig = _parse_signal_fields(msg)
+    # Fix DV: suppress duplicate (symbol, signal_type) within 60s
+    import time as _time_dv
+    _dv_key = (symbol, (sig or {}).get("signal_type", ""))
+    _dv_now = _time_dv.time()
+    _dv_last = _RECENT_SIGNAL_TIMES.get(_dv_key, 0.0)
+    if _dv_now - _dv_last < _DV_DEDUP_WINDOW_S:
+        LOG.info("[%s] Fix DV: duplicate %s signal %.1fs after last; skipping CSV write",
+                 symbol, _dv_key[1], _dv_now - _dv_last)
+        return jsonify({"deduped": True, "symbol": symbol}), 200
+    _RECENT_SIGNAL_TIMES[_dv_key] = _dv_now
     result = get_option_data(symbol, signal_type=sig.get("signal_type"))
     if not result or result.get("_error"):
         # bubble up stage & detail if available, but do not fail the HTTP call

@@ -135,18 +135,22 @@ if ($IBSvc) {
         Write-Host "IB Gateway service already Running — ok."
     }
 
-    # Wait up to $IBWarmupSec for socket
-    Write-Host "Waiting for IBGateway port $IBListenPort (up to ${IBWarmupSec}s)..." -NoNewline
-    for ($i=0; $i -lt $IBWarmupSec; $i++) {
-        if (Test-IBGListening) { break }
-        Start-Sleep 1
-        Write-Host "." -NoNewline
-    }
-    Write-Host ""
+    # Wait up to $IBWarmupSec for socket — skip if already listening (Fix DX)
     if (Test-IBGListening) {
-        Write-Host "✅ IB Gateway listening on port $IBListenPort."
+        Write-Host "✅ IB Gateway already listening on port $IBListenPort."
     } else {
-        Write-Warning "IB Gateway not LISTENING on port $IBListenPort after ${IBWarmupSec}s (orders may fail until it finishes booting)."
+        Write-Host "Waiting for IBGateway port $IBListenPort (up to ${IBWarmupSec}s)..." -NoNewline
+        for ($i=0; $i -lt $IBWarmupSec; $i++) {
+            if (Test-IBGListening) { break }
+            Start-Sleep 1
+            Write-Host "." -NoNewline
+        }
+        Write-Host ""
+        if (Test-IBGListening) {
+            Write-Host "✅ IB Gateway listening on port $IBListenPort."
+        } else {
+            Write-Warning "IB Gateway not LISTENING on port $IBListenPort after ${IBWarmupSec}s (may need 2FA login)."
+        }
     }
 } else {
     Write-Warning "IB Gateway service not found (IBGateway)."
@@ -158,10 +162,6 @@ if ($ListenerSvc) {
 } else {
     Start-PyProc "listener" $Listener
 }
-
-# --- Start Python components (idempotent) ---
-Start-PyProc "DailyCycleManagement" $Daily
-Start-PyProc "PlaceAnOrder"         $Order "--watch"   # optional resident watcher
 
 Write-Host "🎬 All requested components started."
 

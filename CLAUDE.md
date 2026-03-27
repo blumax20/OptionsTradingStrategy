@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 25, 2026 (Fix DU: `_rth_risk_exits()` mid-price max-polling — poll full 5s window and accumulate MAX mid per leg for TP/SL evaluation instead of breaking on first stale tick)
+**Last Updated:** March 26, 2026 (Fix DX: PushButtonStart.ps1 hang on menu 2→2 — removed DCM/PlaceAnOrder Start-PyProc calls + IBGateway pre-check; Fix DY: --live-timeout 8 for PlaceSkippedOpens and menu 8→1 open order mid pricing)
 
 ---
 
@@ -3929,6 +3929,55 @@ Correctly scheduled for next Sunday March 29 at 6:30 PM.
 
 ---
 
+### Fix DV: Listener Webhook Deduplication — 60-Second Window (Mar 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` (module-level `_RECENT_SIGNAL_TIMES` dict; `webhook()` function, before `get_option_data()` call)
+
+**Issue:** TradingView webhooks have no deduplication. When two webhooks for the same (symbol, signal_type) arrive within seconds (TradingView retry, duplicate alert), both are appended to the CSV. The second row often has inferior data: stale/frozen stock price and missing IV (IB only sends IV ticks on change; the second `reqMktData()` subscription on the same contracts finds no new IV update to deliver). PlaceAnOrder's `drop_duplicates(keep="last")` then selects the worse row.
+
+**Root cause evidence (NVRI CLOSE, March 25):**
+- Row 1 (16:02:54): `current_price=18.79`, `iv_atm=0.32`, `iv_otm=0.24`, `call_debit_theo_2_5=1.38` → limit would be $1.31
+- Row 2 (16:03:03, USED): `current_price=18.25` (stale — stock never hit this), `iv_atm=NaN`, `iv_otm=NaN`, `call_debit_theo_2_5=0.91` → limit = $0.86
+- Why stale price: IB's `last` tick hadn't updated; returned a cached value
+- Why no IV: IB only sends IV ticks on change; second subscription consumed no new tick because the value hadn't changed
+
+**Fix:** Module-level `_RECENT_SIGNAL_TIMES: dict` + `_DV_DEDUP_WINDOW_S = 60.0`. In `webhook()`, after extracting `symbol` and `sig`, before `get_option_data()`: check if this `(symbol, signal_type)` was seen within 60 seconds. If so, return `{"deduped": True}` without calling `get_option_data()` or appending to CSV.
+
+**Why 60s:** Two NVRI webhooks were 9s apart. TradingView retries within seconds. Legitimate re-signals (strategy flips) are minutes/hours apart. 60s prevents duplicates without blocking real re-signals.
+
+**Impact:** Second NVRI CLOSE webhook (9s after first) → `deduped=True`, no CSV write. Only Row 1 (good price, good IV) persists. PlaceAnOrder uses $1.31 limit instead of $0.86.
+
+---
+
+### Fix DW: PlaceSkippedOpens — Re-enable OI Check Using Enriched CSV Data (Mar 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/LiquidityFilter.py` (Fix AO block, lines ~549-573); `InteractiveBrokersTrader/DailyCycleManagement.py` (`_retry_skipped_opens_from_prev_day()`, line ~3607)
+
+**Issue:** ROST CALL_OPEN (215/220C, April 24) was cancelled at 9:47 AM (OI 6/41, both below 100), then **re-placed at 10:00 AM** by PlaceSkippedOpens with `--oi-check off`, and filled at $2.80 before the 10:31 AM OI cleanup ran. Fix CQ passed `--oi-check off` with comment "OI not populated for skipped-opens; 10:30 AM cleanup handles low-OI cancellation." That assumption broke when the order fills before 10:30 AM.
+
+**Why `--oi-check off` was needed in Fix CQ:** Two separate OI column sets exist:
+- `_oi_ok()` in PlaceAnOrder reads `open_interest_atm_call` / `open_interest_otm_call` (written by listener at signal time, often empty for CALL_OPEN rows)
+- LiquidityFilter enrichment (Fix BL/AO) writes to `oi_atm` / `oi_oth` (different columns)
+- Fix AO only backfilled `open_interest_atm_put` / `open_interest_otm_put` for PUT rows — CALL rows like ROST CALL_OPEN never had `open_interest_atm_call` written by enrichment → `_oi_ok()` always read NaN → Fix CQ forced `--oi-check off`
+
+**Fix — two changes:**
+
+**Change 1** (`LiquidityFilter.py`): Extend Fix AO to also backfill CALL OI columns. Added symmetric `right == "C"` blocks immediately after each existing `right == "P"` block:
+- ATM: when `oi1 is not None and right == "C"` → write `int(oi1)` to `open_interest_atm_call` (if empty)
+- OTM: when `oi2 is not None and right == "C"` → write `int(oi2)` to `open_interest_otm_call` (if empty)
+
+Uses the same `_need()` guard as Fix AO — only fills empty/NaN cells, never overwrites existing values, never touches limit/theo/price columns.
+
+**Change 2** (`DailyCycleManagement.py`): `--oi-check off` → `--oi-check rth` in `_retry_skipped_opens_from_prev_day()`. At 10:00 AM, the 9:45 AM enrichment has already run and written `open_interest_atm_call` / `open_interest_otm_call` to the prev-day CSV. `--oi-check rth` reads these columns from the CSV only — zero live IB connections.
+
+**Important**: `--oi-check rth` reads OI from the **CSV row only** (no live IB connections). The 9:45 AM enrichment is the data source; 10:00 AM only reads what enrichment already wrote.
+
+**Impact:** ROST 215/220 CALL (OI 6/41): `open_interest_atm_call=6 < 100` → `open_call,skipped,oi_below_threshold` instead of `open_call,placed,success`. 10:30 AM OI cleanup as a second layer of defense is unchanged.
+
+---
+
 ### Fix DU: `_rth_risk_exits()` Mid-Price Max-Polling for TP/SL (Mar 25)
 **Status:** ✓ IMPLEMENTED
 
@@ -4074,6 +4123,36 @@ The `_mkt_errors` fast-fail path (Fix CG) still breaks out immediately to Phase 
 **What is NOT changed:** Fix AM factor (0.95) — only activates when join returns None entirely (e.g. 9:47 AM risk exit case). Phase 2 delayed data — still returns on first non-None.
 
 **Impact:** Next preclose, ib_cycle.log shows `[SYM] Fix DT: join max-poll result=X.XX (scheme=join, polled=15.0s)`. Limit prices reflect the best market maker quote seen over 15 seconds instead of the stale first tick. For liquid tight-spread options, max ≈ first tick → no behavior change.
+
+---
+
+### Fix DX: PushButtonStart.ps1 Hangs Menu 2→2 (Mar 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `PushButtonStart.ps1` (repo root)
+
+**Issue:** Menu option 2→2 ("Start full system") hung indefinitely after Fix DK created `PushButtonStart.ps1`. `Run-And-Log` runs `powershell.exe -File PushButtonStart.ps1` synchronously. PushButtonStart called `Start-PyProc "DailyCycleManagement"` which used `[System.Diagnostics.Process]` with `BeginOutputReadLine()` — async reader threads hold a pipe open to DCM.py. DCM.py calls `daily_trading_cycle()` (long-running). The parent `powershell.exe` cannot exit until those threads terminate, so `Run-And-Log` waited forever.
+
+**Fix — two changes:**
+
+1. **Remove `Start-PyProc` calls** for DailyCycleManagement and PlaceAnOrder (lines 162–164). These are run by scheduled tasks — not persistent processes. `PlaceAnOrder --watch` is also an invalid argparse flag.
+
+2. **Pre-check IBGateway port** before the wait loop — skip the 35-second poll if port is already listening (normal case when IBG is already running).
+
+**Impact:** Menu 2→2 returns promptly (~10 seconds) after OptionsListener starts. No infinite hang.
+
+---
+
+### Fix DY: `--live-timeout 8` for Open Order Mid Pricing (Mar 26)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_retry_skipped_opens_from_prev_day()` ~line 3599; `_delegate_open_from_recent_csvs()` ~line 836)
+
+**Issue:** PlaceSkippedOpens (10 AM) and Menu 8→1 open order placement used the default 3-second `--live-timeout`. On paper trading, Fix CG fast-fails join (Error 10197 ~0.2s) and falls back to delayed data — 3s was sufficient. On **live trading**, `reqMktData()` returns real-time quotes with no Error 10197, so the full timeout window runs. Fix DT's max-poll accumulates the best mid over the full window, but 3 seconds gives only ~15 ticks. The initial tick may be stale (market maker hasn't updated yet), leading to underpriced open limits.
+
+**Fix:** Added `"--live-timeout", "8"` to both paths. Matches the risk exits timeout (Fix Y1). `--use-live-open mid` unchanged — patient limit order, not aggressive.
+
+**Impact:** PlaceSkippedOpens and Menu 8→1 now poll for 8 seconds (~40 ticks) to accumulate the best mid price. ib_cycle.log shows `Fix DT: join max-poll result=X.XX (scheme=mid, polled=8.0s)`. On paper trading: Fix CG still fast-fails at ~0.2s to delayed data (no change in behavior).
 
 ---
 
