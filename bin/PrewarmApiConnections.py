@@ -24,8 +24,6 @@ ClientId registry:
   887  _working_close_limit_symbols()
   890  _collect_held_orientations()
   892  credit-scan
-  915  LiquidityFilter.py main (--client-id default)
-  916  LiquidityFilter.py enrichment (client_id + 1)
 """
 
 import sys
@@ -43,9 +41,7 @@ logging.basicConfig(
 LOG = logging.getLogger("prewarm")
 
 # All clientIds used by the system except 42 (listener handles its own reconnect)
-# Fix: added 915/916 (LiquidityFilter main + enrichment) — missing caused 10-min hangs
-# after IBGateway restarts on live accounts (approval dialog for unrecognised clientId)
-CLIENT_IDS = [101, 878, 881, 883, 884, 885, 886, 887, 890, 892, 915, 916]
+CLIENT_IDS = [101, 878, 881, 883, 884, 885, 886, 887, 890, 892]
 
 PAUSE_BETWEEN = 0.8   # seconds between connections
 HOLD_DURATION = 0.5   # seconds to hold each connection open

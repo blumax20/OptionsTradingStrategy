@@ -555,12 +555,6 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
                     if _col_put_atm in cols and _need(row.get(_col_put_atm)):
                         row[_col_put_atm] = int(oi1)
                         updates += 1
-                # Fix DW: symmetric extension of Fix AO for CALL rows — open_interest_atm_call is what _oi_ok() reads
-                if right == "C":
-                    _col_call_atm = "open_interest_atm_call"
-                    if _col_call_atm in cols and _need(row.get(_col_call_atm)):
-                        row[_col_call_atm] = int(oi1)
-                        updates += 1
             if iv1 is not None:
                 row["iv_atm"] = float(iv1)
                 updates += 1
@@ -576,12 +570,6 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
                     _col_put_oth = "open_interest_otm_put"
                     if _col_put_oth in cols and _need(row.get(_col_put_oth)):
                         row[_col_put_oth] = int(oi2)
-                        updates += 1
-                # Fix DW: symmetric extension of Fix AO for CALL rows — open_interest_otm_call is what _oi_ok() reads
-                if right == "C":
-                    _col_call_oth = "open_interest_otm_call"
-                    if _col_call_oth in cols and _need(row.get(_col_call_oth)):
-                        row[_col_call_oth] = int(oi2)
                         updates += 1
             if iv2 is not None:
                 row["iv_oth"] = float(iv2)

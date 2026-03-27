@@ -834,8 +834,7 @@ class DailyCycleManagementMixin:
             _prev_day_flags = (["--allow-prev-day-opens", "--oi-check", "off"]
                                if folder != today_folder else [])
             argv = ["--mode","from-signal","--date",folder,"--symbols", ",".join(sorted(syms)),
-                    "--min-limit","0.05","--bump-to-min","--use-live-open","join",
-                    "--live-timeout","8","--quiet"] + _prev_day_flags  # Fix DT: 8s on live trading for max-poll; was 3s default
+                    "--min-limit","0.05","--bump-to-min","--use-live-open","join","--quiet"] + _prev_day_flags
             try:
                 self._attempt(action="open", status="queued", reason=f"from_csv_{folder}", source="dcm-open")
             except Exception:
@@ -3604,9 +3603,8 @@ class DailyCycleManagementMixin:
             "--min-limit", "0.05",
             "--bump-to-min",
             "--use-live-open", "mid",
-            "--live-timeout", "8",     # Fix DT: on live trading, mid runs full window; 3s default too short to accumulate max mid
             "--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
-            "--oi-check", "rth",       # Fix DW: 9:45 AM enrichment now writes open_interest_atm/otm_call via extended Fix AO
+            "--oi-check", "off",       # Fix CQ: OI not populated for skipped-opens; 10:30 AM cleanup handles low-OI cancellation
             "--quiet",
         ])
 
