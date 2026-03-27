@@ -61,32 +61,24 @@ function Test-AlreadyRunning($name) {
 }
 
 function Start-PyProc($displayName, $scriptPath, $args = "") {
-    if (-not (Test-Path $scriptPath)) { Write-Host "✖ $displayName not found: $scriptPath"; return }
-    if (Test-AlreadyRunning $displayName) { Write-Host "⚠️  $displayName already running; skipping."; return }
+    if (-not (Test-Path $scriptPath)) { Write-Host "X $displayName not found: $scriptPath"; return }
+    if (Test-AlreadyRunning $displayName) { Write-Host "$displayName already running; skipping."; return }
 
-    $logPath = Join-Path $Logs "$displayName.log"
     $pidFile = Join-Path $Runtime "$displayName.pid"
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Py
-    $psi.Arguments = "`"$scriptPath`" $args"
-    $psi.WorkingDirectory = Split-Path $scriptPath
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-
-    $p = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
-
-    $stdOutWriter = [System.IO.StreamWriter]::new($logPath, $true)
-    $p.add_OutputDataReceived({ param($s,$e) if ($e.Data) { $stdOutWriter.WriteLine($(Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " [OUT] " + $e.Data); $stdOutWriter.Flush() } })
-    $p.add_ErrorDataReceived( { param($s,$e) if ($e.Data) { $stdOutWriter.WriteLine($(Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " [ERR] " + $e.Data); $stdOutWriter.Flush() } })
-
-    if (-not $p.Start()) { throw "Failed to start $displayName" }
-    $p.BeginOutputReadLine(); $p.BeginErrorReadLine()
+    # Fix DX: Use Start-Process (fully detached) instead of .NET BeginOutputReadLine().
+    # BeginOutputReadLine() creates async IO threads tied to the parent PowerShell host.
+    # Since DCM.py never exits, threads never complete, parent PS cannot exit -- causing
+    # Run-And-Log in PushButtonMenu.ps1 to hang indefinitely (menu 2->2 blocked).
+    # Start-Process -WindowStyle Hidden creates a truly detached process; parent exits immediately.
+    # DCM.py writes output to ib_cycle.log via Python's logging file handler -- no stdout capture needed.
+    $p = Start-Process -FilePath $Py `
+        -ArgumentList ("`"$scriptPath`"" + $(if ($args) { " $args" } else { "" })) `
+        -WorkingDirectory (Split-Path $scriptPath) `
+        -WindowStyle Hidden `
+        -PassThru
     $p.Id | Out-File -Encoding ascii -FilePath $pidFile -Force
-    Write-Host "✅ Started $displayName (PID $($p.Id)). Logs: $logPath"
+    Write-Host "Started $displayName (PID $($p.Id))."
 }
 
 function Start-ServiceSafe {

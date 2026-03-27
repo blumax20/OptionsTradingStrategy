@@ -2776,6 +2776,12 @@ class DailyCycleManagementMixin:
 
         if not legs_by_sym:
             LOG.info("Risk exits: no open option legs to evaluate.")
+            _AttemptLogger.write(
+                action="risk_exits",
+                status="skipped",
+                reason="no_open_option_legs",
+                source="dcm-risk-exit",
+            )
             try: ib.disconnect()
             except: pass
             return
@@ -3067,7 +3073,7 @@ class DailyCycleManagementMixin:
                         "--mode", "force-close",
                         "--symbols", sym,
                         "--quantity","50",
-                        "--use-live-close", "join",  # Use join pricing for limit orders instead of market
+                        "--use-live-close", "mid",   # Fix DZ: mid pricing for morning risk exits; preclose converts to join
                         "--live-timeout", "8",        # Fix Y1: longer timeout at market open
                         "--close-reason", reason,     # Fix Z5: pass TP/SL reason to PlaceAnOrder attempts
                         "--fallback-individual-legs",  # Fix AI1: enable portfolio price fallback for limit computation
@@ -3604,7 +3610,7 @@ class DailyCycleManagementMixin:
             "--bump-to-min",
             "--use-live-open", "mid",
             "--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
-            "--oi-check", "off",       # Fix CQ: OI not populated for skipped-opens; 10:30 AM cleanup handles low-OI cancellation
+            "--oi-check", "rth",       # Fix DW: 9:45 AM enrichment now writes open_interest_atm/otm_call via extended Fix AO
             "--quiet",
         ])
 

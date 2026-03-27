@@ -534,146 +534,82 @@ try {
 
 # ---------- Last 20 Orders Closed (with P/L) ----------
 "--- Last 20 Orders Closed (with P/L) ---" | Tee-Object -FilePath $Report -Append
-$tmpClosedPy = Join-Path $env:TEMP ("closed_" + [guid]::NewGuid().ToString('N') + ".py")
-@"
-from ib_insync import IB, util, ExecutionFilter
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import collections, math
+# Attempts-CSV-based closed P/L — no IB connection needed, survives IBGateway restarts.
+# Scans last 30 days of C:\OptionsHistory\YY_MM_DD\attempts_*.csv.
+# OPEN  rows: action=open_call/open_put,  status=placed, reason=success, limit+longK present.
+# CLOSE rows: action=force_close/close_*, status=placed, order_action=SELL, limit+longK present.
+# Match key: symbol+right+longK. P/L = (close_limit - open_limit) * 100 * qty.
+$allAttempts = @()
+$today_dt = Get-Date
+for ($dOff = 0; $dOff -le 30; $dOff++) {
+    $d = $today_dt.AddDays(-$dOff)
+    $folder = "C:\OptionsHistory\{0}" -f $d.ToString("yy_MM_dd")
+    $csvFile = Get-ChildItem -Path $folder -Filter "attempts_*.csv" -File -EA SilentlyContinue |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($csvFile) {
+        $rows = Import-Csv $csvFile.FullName -EA SilentlyContinue
+        if ($rows) { $allAttempts += $rows }
+    }
+}
 
-NY, UTC = ZoneInfo("America/New_York"), ZoneInfo("UTC")
+# Pre-parse timestamps so we can compare in Where-Object (try/catch not valid in PS5 filter blocks)
+$csvOpens = @()
+foreach ($r in $allAttempts) {
+    if ($r.action -notin @('open_call','open_put')) { continue }
+    if ($r.status -ne 'placed' -or $r.reason -ne 'success') { continue }
+    if ($r.limit -eq '' -or $r.longK -eq '') { continue }
+    $ts = $null; try { $ts = [datetime]$r.ts } catch {}
+    if (-not $ts) { continue }
+    $r | Add-Member -NotePropertyName PsTs -NotePropertyValue $ts -Force
+    $csvOpens += $r
+}
+$csvCloses = @()
+foreach ($r in $allAttempts) {
+    if ($r.action -notin @('force_close','close_call','close_put','close')) { continue }
+    if ($r.status -ne 'placed' -or $r.order_action -ne 'SELL') { continue }
+    if ($r.limit -eq '' -or $r.longK -eq '') { continue }
+    if ($r.reason -notmatch 'success|worthless') { continue }
+    $ts = $null; try { $ts = [datetime]$r.ts } catch {}
+    if (-not $ts) { continue }
+    $r | Add-Member -NotePropertyName PsTs -NotePropertyValue $ts -Force
+    $csvCloses += $r
+}
 
-def parse_ib_time(s):
-    try:
-        if isinstance(s, datetime):
-            return s if s.tzinfo else s.replace(tzinfo=UTC)
-        dt = util.parseIBDatetime(s)
-        if dt.tzinfo is None: return dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
-    except: return None
+$closedMatched = @()
+foreach ($cl in $csvCloses) {
+    # Trim fields before building key — CSV values may have surrounding spaces
+    $key = "$($cl.symbol.Trim())|$($cl.right.Trim())|$($cl.longK.Trim())"
+    $op = $csvOpens | Where-Object {
+        "$($_.symbol.Trim())|$($_.right.Trim())|$($_.longK.Trim())" -eq $key -and $_.PsTs -lt $cl.PsTs
+    } | Sort-Object PsTs -Descending | Select-Object -First 1
+    if (-not $op) { continue }
+    $qty = if ($cl.qty.Trim() -match '^\d+$') { [int]$cl.qty } else { 1 }
+    $pnl = ([double]$cl.limit - [double]$op.limit) * 100 * $qty
+    $closedMatched += [pscustomobject]@{
+        CloseTs     = $cl.PsTs
+        Symbol      = $cl.symbol.Trim()
+        Exp         = $cl.exp.Trim()
+        Right       = $cl.right.Trim()
+        Spread      = "$($cl.longK.Trim())/$($cl.shortK.Trim())"
+        OpenLimit   = [double]$op.limit
+        CloseLimit  = [double]$cl.limit
+        PnL         = $pnl
+        CloseReason = $cl.close_reason.Trim()
+    }
+}
 
-def sum_commission(group):
-    total = 0.0
-    for f in group:
-        try:
-            cr = f.commissionReport
-            if cr and cr.commission is not None:
-                v = float(cr.commission)
-                if not math.isnan(v) and v > 0: total += v
-        except: pass
-    return total
-
-def main():
-    ib=IB()
-    try:
-        ib.connect('127.0.0.1',$IB_PORT,clientId=901,timeout=6)
-    except Exception as e:
-        print(f"(closed) error: connect: {e}")
-        return
-
-    try:
-        # 30-day window captures multi-day positions (open one day, close later)
-        since = (datetime.now(UTC)-timedelta(days=30)).strftime("%Y%m%d-%H:%M:%S")
-        fills = ib.reqExecutions(ExecutionFilter(time=since)) or []
-        ib.sleep(2.0)
-
-        # Group fills by permId; each BAG order = one permId group
-        by_perm = collections.defaultdict(list)
-        for f in fills:
-            pid = int(getattr(f.execution, "permId", 0) or 0)
-            by_perm[pid].append(f)
-
-        opens  = []  # (t_utc, sym, exp, right, bag_px, commission)
-        closes = []  # (t_utc, sym, exp, right, bag_px, commission)
-
-        for pid, group in by_perm.items():
-            bag  = [f for f in group if getattr(f.contract, "secType", "") == "BAG"]
-            opts = [f for f in group if getattr(f.contract, "secType", "") == "OPT"]
-            if not bag or not opts:
-                continue
-
-            bag_fill = bag[0]
-            bag_side = (getattr(bag_fill.execution, "side", "") or "").upper()
-            bag_px   = float(getattr(bag_fill.execution, "price", 0) or 0)
-
-            sym = exp = right = "?"
-            t_max = None
-            for f in opts:
-                c = f.contract
-                if sym   == "?": sym   = getattr(c, "symbol", "?")
-                if exp   == "?": exp   = getattr(c, "lastTradeDateOrContractMonth", "")
-                if right == "?": right = (getattr(c, "right", "") or "").upper()
-                t_utc = parse_ib_time(getattr(f.execution, "time", ""))
-                if t_utc and (t_max is None or t_utc > t_max): t_max = t_utc
-            if t_max is None: t_max = datetime.now(UTC)
-
-            commission = sum_commission(group)
-            bag_qty = int(float(getattr(bag_fill.execution, "shares", 1) or 1))
-            entry = (t_max, sym, exp, right, bag_px, bag_qty, commission)
-            if bag_side == "SLD":
-                closes.append(entry)
-            else:
-                opens.append(entry)
-
-        if not closes:
-            print("(no closed spreads in last 30 days)")
-            return
-
-        results = []
-        for (t_cl, sym, exp, right, cl_px, qty, cl_comm) in closes:
-            # Find the most recent matching open (same sym+right+exp, before close time)
-            candidates = [o for o in opens if o[1]==sym and o[3]==right and o[2]==exp and o[0]<=t_cl]
-            if not candidates:
-                # Fallback: match by sym+right only (different expiration)
-                candidates = [o for o in opens if o[1]==sym and o[3]==right and o[0]<=t_cl]
-            if candidates:
-                t_op, _, _, _, op_px, _, op_comm = max(candidates, key=lambda x: x[0])
-                pnl = round((cl_px - op_px) * 100 * qty, 2)
-                # Commission from IB reports if attached, else estimate: $0.65/leg * 2 legs * 2 orders
-                attached_comm = cl_comm + op_comm
-                est_comm = round(qty * 4 * 0.65, 2)
-                comm = attached_comm if attached_comm > 0.01 else est_comm
-                comm_label = "" if attached_comm > 0.01 else " est."
-            else:
-                op_px = None
-                pnl = None
-                comm = 0.0
-                comm_label = ""
-            results.append((t_cl, sym, exp, right, op_px, cl_px, qty, pnl, comm, comm_label))
-
-        results.sort(key=lambda r: r[0], reverse=True)
-        for (t_cl, sym, exp, right, op_px, cl_px, qty, pnl, comm, comm_label) in results[:20]:
-            tny = t_cl.astimezone(NY).strftime("%Y-%m-%d %H:%M %Z")
-            op_str = f"{op_px:.2f}" if op_px is not None else "?"
-            qty_str = f" x{qty}" if qty > 1 else ""
-            pnl_str = f"  P/L={pnl:+.2f}" if pnl is not None else "  P/L=?"
-            if comm > 0.01:
-                net = round(pnl - comm, 2) if pnl is not None else None
-                net_str = f"  net={net:+.2f}" if net is not None else ""
-                pnl_str += f"  comm{comm_label}: -{comm:.2f}{net_str}"
-            print(f"{tny}  {sym} {exp} {right}{qty_str}  open={op_str} -> close={cl_px:.2f}{pnl_str}")
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        print(f"(closed) error: {e}")
-    finally:
-        try: ib.disconnect()
-        except: pass
-
-if __name__=='__main__': main()
-"@ | Set-Content -Encoding ASCII $tmpClosedPy
-
-try {
-  $closedOut = & $Py $tmpClosedPy 2>$null
-  if ($LASTEXITCODE -ne 0) { "closed-orders: ERROR (exit $LASTEXITCODE)" | Tee-Object -FilePath $Report -Append }
-  if ($closedOut) {
-    ($closedOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append }
-  } else {
-    "(no output from closed-orders probe)" | Tee-Object -FilePath $Report -Append
-  }
-} catch {
-  "closed-orders: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
-} finally {
-  Remove-Item -Force -ErrorAction SilentlyContinue $tmpClosedPy
+if (-not $closedMatched) {
+    "  (no matched open->close pairs in last 30 days of attempts CSVs)" | Tee-Object -FilePath $Report -Append
+} else {
+    $closedMatched | Sort-Object CloseTs -Descending | Select-Object -First 20 | ForEach-Object {
+        $ts   = $_.CloseTs.ToString("yyyy-MM-dd HH:mm")
+        $rsn  = if ($_.CloseReason) { "  [$($_.CloseReason)]" } else { "" }
+        $sign = if ($_.PnL -ge 0) { "+" } else { "-" }
+        $pnlStr = "{0}`${1:N2}" -f $sign, [Math]::Abs($_.PnL)
+        ("  {0}  {1,-6} {2} {3}  {4,-11}  open=`${5:N2} -> close=`${6:N2}  P/L={7}{8}" -f `
+            $ts, $_.Symbol, $_.Exp, $_.Right, $_.Spread,
+            $_.OpenLimit, $_.CloseLimit, $pnlStr, $rsn) | Tee-Object -FilePath $Report -Append
+    }
 }
 " " | Tee-Object -FilePath $Report -Append
 

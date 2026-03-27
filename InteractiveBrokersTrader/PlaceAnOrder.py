@@ -924,7 +924,7 @@ def has_working_open_order(ib: IB, symbol: str, exp: str, right: str, longK: flo
         return False
     target_ids = {longC.conId, shortC.conId}
     try:
-        ib.reqOpenOrders(); ib.sleep(0.25)
+        ib.reqAllOpenOrders(); ib.sleep(1.5)  # Fix DX2: reqOpenOrders only sees current session; reqAllOpenOrders needed for prior-session Inactive+DAY orders (same fix as U1/BB/BC)
     except Exception:
         pass
     for tr in ib.trades():

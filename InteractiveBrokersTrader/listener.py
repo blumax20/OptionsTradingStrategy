@@ -136,11 +136,14 @@ def _preferred_md_type() -> int:
         return 4
 
 def _nearest_valid_strike(strikes_all: list[float], target: float, prefer: str = "above") -> float | None:
-    """Pick nearest available strike to target. prefer 'above' or 'below' when tie/choice."""
+    """Pick nearest available strike to target. prefer 'above' or 'below' when tie/choice.
+    Uses strictly > / < so the result is always a DIFFERENT strike from target.
+    (>= / <= caused the fallback to return the same failing strike, retrying the same 8 exchanges.)
+    """
     if not strikes_all:
         return None
-    above = [s for s in strikes_all if s >= target]
-    below = [s for s in strikes_all if s <= target]
+    above = [s for s in strikes_all if s > target]
+    below = [s for s in strikes_all if s < target]
     if prefer == "above":
         if above:
             return above[0]
@@ -168,7 +171,7 @@ def _collect_secdef(ib: IB, symbol: str, con_id: int, max_retries: int = 3) -> t
     Returns (expirations, strikes, tradingClasses, multipliers) from reqSecDefOptParams.
     Retries with exponential backoff if strikes list is empty.
     """
-    delays = [0.5, 1.0, 2.0]  # Exponential backoff delays
+    delays = [2.0, 5.0, 10.0]  # Increased: IB option chain data can be temporarily stale at market close (16:00 ET)
 
     for attempt in range(max_retries):
         params = ib.reqSecDefOptParams(symbol, '', 'STK', con_id)
@@ -287,6 +290,8 @@ from typing import Dict
 import re
 import platform
 import time
+_RECENT_SIGNAL_TIMES: dict = {}  # Fix DV: (symbol, signal_type) -> time.monotonic() of last accepted webhook
+_DV_DEDUP_WINDOW_S = 60.0        # Fix DV: ignore duplicate (symbol, signal_type) within this many seconds
 # Optional production WSGI server on Windows (safer under services)
 try:
     from waitress import serve as _serve
@@ -1360,6 +1365,13 @@ def webhook():
     if not symbol:
         return _fail("payload", "ticker missing from payload and not found in text", 400)
     sig = _parse_signal_fields(msg)
+    # Fix DV: deduplicate within 60-second window (TradingView retries can produce stale duplicate rows)
+    _dv_key = (symbol, sig.get("signal_type") or "")
+    _dv_now = time.monotonic()
+    _dv_last = _RECENT_SIGNAL_TIMES.get(_dv_key)
+    if _dv_last is not None and (_dv_now - _dv_last) < _DV_DEDUP_WINDOW_S:
+        logger.info("Fix DV: dedup %s %s (%.0fs since last); skipping", symbol, _dv_key[1], _dv_now - _dv_last)
+        return jsonify({"deduped": True, "symbol": symbol, "signal_type": _dv_key[1]}), 200
     result = get_option_data(symbol, signal_type=sig.get("signal_type"))
     if not result or result.get("_error"):
         # bubble up stage & detail if available, but do not fail the HTTP call
@@ -1371,6 +1383,7 @@ def webhook():
             "detail": msg
         }), 200
     _append_listener_result_to_csv(result, sig)
+    _RECENT_SIGNAL_TIMES[_dv_key] = _dv_now  # Fix DV: mark seen only after successful CSV write
     if sig:
         result.update({
             "signal_side": sig.get("signal_side"),
