@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 26, 2026 (Fix DX: PushButtonStart.ps1 hang on menu 2→2 — removed DCM/PlaceAnOrder Start-PyProc calls + IBGateway pre-check; Fix DY: --live-timeout 8 for PlaceSkippedOpens and menu 8→1 open order mid pricing)
+**Last Updated:** March 27, 2026 (Fix DS2/DS3/DS4/DS5: Watchdog async IBGateway start + SOFT-FAIL-RETRY port check + ExecutionTimeLimit PT30M — prevent multi-hour task hangs on live account 2FA)
 
 ---
 
@@ -4153,6 +4153,69 @@ The `_mkt_errors` fast-fail path (Fix CG) still breaks out immediately to Phase 
 **Fix:** Added `"--live-timeout", "8"` to both paths. Matches the risk exits timeout (Fix Y1). `--use-live-open mid` unchanged — patient limit order, not aggressive.
 
 **Impact:** PlaceSkippedOpens and Menu 8→1 now poll for 8 seconds (~40 ticks) to accumulate the best mid price. ib_cycle.log shows `Fix DT: join max-poll result=X.XX (scheme=mid, polled=8.0s)`. On paper trading: Fix CG still fast-fails at ~0.2s to delayed data (no change in behavior).
+
+---
+
+### Fix DS2: SOFT-FAIL-RETRY — Skip BounceServices When Port Still UP (Mar 27)
+**Status:** ✓ IMPLEMENTED (deployed only — not in git repo)
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (SOFT-FAIL-RETRY block, ~line 187)
+
+**Issue:** After `RestartListener.cmd` failed to recover the listener within 60s, the old code unconditionally set `$needFullRestart = $true`, calling `BounceServices` and killing IBGateway. On a live account this requires 2FA and takes the system offline for hours. When IBGateway port is still UP, the only problem is the listener's IB connection — IBGateway itself is fine and will recover on its own.
+
+**Fix:** After the 60s listener recovery poll times out, re-check the IB Gateway port:
+- If port still UP → `$httpOk = $true`, skip BounceServices, log "will keep retrying"
+- If port went DOWN → `$needFullRestart = $true`, escalate to BounceServices
+
+**Impact:** Transient IB server disconnections (e.g. daily IB reset at ~6 AM) no longer kill IBGateway. System recovers without 2FA.
+
+---
+
+### Fix DS3: Watchdog 2FA Retry — Async IBGateway Start (Mar 27)
+**Status:** ✓ IMPLEMENTED (deployed only — not in git repo)
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` (FAIL(2FA) DR-retry block, ~line 101)
+
+**Issue:** Fix DR restarts IBGateway when the user hasn't logged in within 5 minutes. Used `nssm stop IBGateway` (sync) + `nssm start IBGateway` (sync). On a live account, `nssm start` blocks until service reaches RUNNING — which only happens after 2FA login. If user hasn't logged in yet, the watchdog task hangs indefinitely. Confirmed: watchdog showed a 91-minute gap (06:07–07:38) on 2026-03-27 from this hang.
+
+**Fix:** Changed `nssm start IBGateway` to async fire-and-forget via:
+```powershell
+Start-Process -FilePath "C:\Program Files\nssm-2.24\win64\nssm.exe" `
+    -ArgumentList "start", "IBGateway" -NoNewWindow
+```
+Stop remains synchronous (waits for STOPPED). Start is async — watchdog exits immediately; 15-min retry cycle resumes normally.
+
+**Impact:** Watchdog task exits within seconds of initiating the IBGateway restart. No more multi-hour task hangs during 2FA scenarios.
+
+---
+
+### Fix DS4: BounceServices — Async IBGateway Start (Mar 27)
+**Status:** ✓ IMPLEMENTED (deployed only — not in git repo)
+
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (~line 21)
+
+**Issue:** Same root cause as Fix DS3. `nssm start IBGateway` inside BounceServices.cmd blocks until the service reaches RUNNING. On live accounts with 2FA, this never happens until the user logs in — BounceServices hangs indefinitely, blocking the watchdog task that called it.
+
+**Fix:** Changed to PowerShell async fire-and-forget:
+```cmd
+powershell -Command "Start-Process -FilePath 'C:\Program Files\nssm-2.24\win64\nssm.exe' -ArgumentList 'start','IBGateway' -NoNewWindow"
+```
+A `timeout /t 30` follows to give IBGateway time to start before OptionsListener tries to connect.
+
+**Impact:** BounceServices completes within ~90 seconds regardless of 2FA state. OptionsListener starts, listener health check passes, watchdog logs `RESTART OK`.
+
+---
+
+### Fix DS5: Watchdog Task ExecutionTimeLimit = PT30M (Mar 27)
+**Status:** ✓ IMPLEMENTED (Task Scheduler setting)
+
+**Location:** Windows Task Scheduler (`IB_Watchdog_Every15Min` task — General tab → `Configure for: Windows 7/2008 R2` → execution time limit)
+
+**Issue:** Before DS3/DS4, a blocking `nssm start` caused the watchdog task to hang indefinitely. Task Scheduler queued new instances every 15 minutes but none ran while the stuck task blocked execution. Confirmed: watchdog stopped logging from 08:58 to 10:01 on 2026-03-27 (a 63-minute gap).
+
+**Fix:** Set `ExecutionTimeLimit = PT30M` (30 minutes) via Task Scheduler XML. Task Scheduler auto-kills any instance running longer than 30 minutes.
+
+**Impact:** Self-healing guaranteed — even if a future bug causes a hang, the task auto-clears within 30 minutes and the next 15-min cycle fires normally. Combined with DS3/DS4 (async starts), normal runs complete in <5 minutes and are never killed by the limit.
 
 ---
 
