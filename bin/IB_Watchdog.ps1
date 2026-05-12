@@ -67,24 +67,89 @@ $gw = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-O
 $gwPid = if ($gw) { ($gw | Select-Object -First 1).OwningProcess } else { "not-running" }
 if (-not $gw) {
     Write-Log "FAIL: port $IB_GW_PORT not listening (IBGateway DOWN) PID=$gwPid"
+
+    # Fix EE: Detect 0-byte autorestart token from a corrupted IBC daily auto-restart.
+    # When IBC's AutoRestartTime hits an IBKR-side glitch (e.g. server maintenance window),
+    # the token write can produce 0 bytes. IBC then reads that empty file forever, declares
+    # "authentication will not be required", suppresses the 2FA dialog, and silently fails
+    # to log in. The watchdog cannot detect this via the existing 2FA check because the
+    # IBGateway service is Stopped between cycles (Fix DX gate), so the IBC log read is
+    # skipped. Confirmed by Apr 25 2026 incident: 17-day cascade until manual file delete.
+    # Action: if any autorestart file under C:\Jts is exactly 0 bytes and older than 1 min
+    # (to avoid racing against a legitimate in-flight write), delete it and fall through
+    # to the existing 2FA / RESTART-IBG-ONLY logic. The next IBGateway start will see no
+    # autorestart file -> IBC logs "autorestart file not found" -> next watchdog cycle's
+    # 2FA detection fires -> user sees clear FAIL (2FA) log and gets a real 2FA prompt.
+    $corruptAutorestart = Get-ChildItem -Path "C:\Jts" -Filter "autorestart" -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Length -eq 0 -and $_.LastWriteTime -lt (Get-Date).AddMinutes(-1) } |
+                          Select-Object -First 1
+    if ($corruptAutorestart) {
+        try {
+            Remove-Item $corruptAutorestart.FullName -Force -ErrorAction Stop
+            Write-Log "FAIL: deleted corrupt 0-byte autorestart token at $($corruptAutorestart.FullName) (age $([int](((Get-Date) - $corruptAutorestart.LastWriteTime).TotalMinutes))min) -- next IBGateway start will require manual 2FA login"
+            # Write prewarm flag so the existing 3-min force-restart timer (Fix DS3) is active
+            # once 2FA detection picks up the new "autorestart file not found" log entry.
+            Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+        } catch {
+            Write-Log "FAIL: found 0-byte autorestart at $($corruptAutorestart.FullName) but delete failed: $_"
+        }
+    }
+
     # Fix DJ: Check IBC log for 2FA dialog before triggering BounceServices.
     # When IBGateway restarts and shows a 2FA screen, port is DOWN but IBGateway is running.
     # Calling BounceServices kills the login screen; user must restart the whole cascade.
     # Instead: log it and exit (skip BounceServices) -- user authenticates, port comes back.
     $ibcLogDir = "C:\IBC\Logs"
     $twoFaDetected = $false
-    $ibcLog = Get-ChildItem $ibcLogDir -Filter "IBC-*.txt" -ErrorAction SilentlyContinue |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {  # Fix DL: was -20; 5AM log is 66min old at 6:07AM
-        $recent = Get-Content $ibcLog.FullName -ErrorAction SilentlyContinue  # Fix DO: was -Tail 50; "autorestart file not found" is at line ~42 but buried under 150+ JVM property lines that follow it
-        if ($recent -match "2FA dialog|Second Factor Authentication|Exit Session Setting|Restart in progress|autorestart file not found") {
-            $twoFaDetected = $true
+
+    # Fix DX: Gate 2FA detection on IBGateway service state.
+    # "autorestart file not found" is written by IBC at the start of ANY new session,
+    # including successful auto-restarts that do NOT require 2FA. The 90-min window
+    # picks up this text from a recently completed auto-restart, causing false positives
+    # when IBGateway crashes again shortly afterward (as seen Mar 27 at 15:37).
+    # If IBGateway service is Stopped, the process crashed -- no GUI showing, no 2FA screen.
+    # Only check IBC logs when service is Running or StartPending (GUI may be showing).
+    $ibgSvc2Fa = Get-Service -Name "IBGateway" -ErrorAction SilentlyContinue
+    $ibgSvcUp = ($ibgSvc2Fa -and ($ibgSvc2Fa.Status -eq "Running" -or $ibgSvc2Fa.Status -eq "StartPending"))
+    if ($ibgSvcUp) {
+        $ibcLog = Get-ChildItem $ibcLogDir -Filter "IBC-*.txt" -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($ibcLog -and $ibcLog.LastWriteTime -gt (Get-Date).AddMinutes(-90)) {  # Fix DL: was -20; 5AM log is 66min old at 6:07AM
+            $recent = Get-Content $ibcLog.FullName -ErrorAction SilentlyContinue  # Fix DO: was -Tail 50; "autorestart file not found" is at line ~42 but buried under 150+ JVM property lines that follow it
+            if ($recent -match "2FA dialog|Second Factor Authentication|Exit Session Setting|Restart in progress|autorestart file not found") {
+                $twoFaDetected = $true
+            }
         }
     }
     if ($twoFaDetected) {
-        Write-Log "FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually"
-        # Fix DM: flag pre-warm needed; runs automatically on next OK after user authenticates
+        # Fix DS3: if user hasn't logged in within 3 min, force-restart IBGateway for a fresh 2FA prompt.
+        # Check flag age BEFORE writing so the age is meaningful on the second+ run.
+        if (Test-Path $PrewarmFlag) {
+            $flagWriteTime = (Get-Item $PrewarmFlag).LastWriteTime
+            $flagAge = ((Get-Date) - $flagWriteTime).TotalMinutes
+            # Fix EB: If IBC log is newer than the prewarm flag, a new IBGateway session started
+            # after the flag was written (e.g. BounceServices ran, then IBG crashed and restarted).
+            # Reset the flag to NOW so the 3-min countdown starts from this new session -- prevents
+            # killing a fresh 2FA dialog that just appeared because the old flag was already stale.
+            if ($ibcLog -and $ibcLog.LastWriteTime -gt $flagWriteTime) {
+                Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+                Write-Log "FAIL (2FA): new IBC session detected (flag was $([int]$flagAge)min old) -- reset 3-min timer, login needed"
+                exit 0
+            }
+            if ($flagAge -gt 3) {
+                Write-Log "FAIL (2FA): waited $([int]$flagAge)min with no login -- restarting IBGateway to force new 2FA prompt"
+                Start-Process -FilePath "C:\Program Files\nssm-2.24\win64\nssm.exe" `
+                    -ArgumentList "stop","IBGateway" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                Start-Process -FilePath "C:\Program Files\nssm-2.24\win64\nssm.exe" `
+                    -ArgumentList "start","IBGateway" -NoNewWindow  # async: -Wait blocks indefinitely during 2FA
+                Write-Log "FAIL (2FA): IBGateway restarted -- new 2FA prompt should appear"
+                exit 0
+            }
+        }
+        # Flag not old enough (or not yet written) -- write/update it and wait
         Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+        Write-Log "FAIL (2FA): IBGateway waiting for authentication -- skipping BounceServices, login manually (will force restart in 3 min if no login)"
         exit 0
     }
     $needFullRestart = $true
@@ -199,6 +264,35 @@ if (-not $needFullRestart) {
 }
 
 if (-not $needFullRestart -and -not $needTunnelRestart) {
+    # Fix EA: Check IBC log for 2FA re-auth dialog even when port is UP.
+    # IBGateway shows a re-auth 2FA dialog while still accepting API connections (port UP).
+    # Without this check, watchdog logs OK while 2FA is pending and the login was declined.
+    # Use only specific 2FA patterns (exclude "autorestart file not found" and "Restart in progress"
+    # which appear at the start of ANY new IBC session, including successful auto-restarts).
+    $eaIbcLogDir = "C:\IBC\Logs"
+    $eaIbcLog = Get-ChildItem $eaIbcLogDir -Filter "IBC-*.txt" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($eaIbcLog -and $eaIbcLog.LastWriteTime -gt (Get-Date).AddMinutes(-20)) {
+        # Fix EA2: Check if login completed AFTER the last 2FA prompt in the IBC log.
+        # A simple -match finds the old "Second Factor Authentication" text even after the user
+        # authenticated, causing WARN to fire for up to 20 min after a successful login.
+        # Instead, scan line-by-line and compare the last 2FA line index vs last "Login has completed".
+        $eaLines = Get-Content $eaIbcLog.FullName -ErrorAction SilentlyContinue
+        $eaLastTwoFa = -1
+        $eaLastLogin = -1
+        for ($eaI = 0; $eaI -lt $eaLines.Count; $eaI++) {
+            if ($eaLines[$eaI] -match "Second Factor Authentication initiated|2FA dialog|Exit Session Setting") { $eaLastTwoFa = $eaI }
+            if ($eaLines[$eaI] -match "Login has completed") { $eaLastLogin = $eaI }
+        }
+        if ($eaLastTwoFa -ge 0 -and $eaLastTwoFa -gt $eaLastLogin) {
+            # 2FA dialog appeared and no login completed after it -- user still needs to authenticate.
+            # Write prewarm flag so the 3-min force-restart timer starts now.
+            Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+            Write-Log "WARN (2FA): IBGateway port UP but IBC shows re-auth required -- login needed (IBGateway will restart in 3 min after port goes down)"
+            exit 0
+        }
+    }
+
     # Fix DM: if pre-warm flag exists, IBGateway just came back up after a restart or 2FA.
     # Run PrewarmConnections.cmd to register all API clientIds before trading starts.
     if (Test-Path $PrewarmFlag) {
@@ -263,6 +357,33 @@ if ($needTunnelRestart) {
     # ===== FULL RESTART (IB Gateway or Listener down) =====
     # Fix DM: flag pre-warm needed after restart so clientIds are registered when IBGateway comes back
     Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $PrewarmFlag -Encoding ASCII
+
+    # Fix EA: When only IBGateway is down (listener + CloudflareTunnel healthy), restart
+    # IBGateway only. Full BounceServices restarts CloudflareTunnel, disconnecting remote
+    # users who are waiting to complete 2FA (prompt appears, user loses connection, misses it).
+    # After user declines 2FA -> IBGateway exits (Stopped) -> Fix DX sees Stopped -> skips 2FA
+    # detection -> falls here -> BounceServices kills tunnel -> user disconnected -> must start manually.
+    $eaListenerOk = $false
+    try {
+        $eaResp = Invoke-WebRequest -Uri $HealthUrl -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $eaListenerOk = ($eaResp.StatusCode -eq 200)
+    } catch {}
+    $eaTunnelSvc = Get-Service -Name "CloudflareTunnel" -ErrorAction SilentlyContinue
+    $eaTunnelOk  = ($eaTunnelSvc -and $eaTunnelSvc.Status -eq "Running")
+    if ($eaListenerOk -and $eaTunnelOk) {
+        Write-Log "RESTART-IBG-ONLY: listener and CloudflareTunnel healthy -- restarting IBGateway only (no tunnel disruption)"
+        # Stop cleanly first (immediate no-op if already Stopped), then async start.
+        # nssm start blocks indefinitely when IBGateway awaits 2FA -- use fire-and-forget.
+        Start-Process -FilePath "C:\Program Files\nssm-2.24\win64\nssm.exe" `
+            -ArgumentList "stop","IBGateway" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Start-Process -FilePath "C:\Program Files\nssm-2.24\win64\nssm.exe" `
+            -ArgumentList "start","IBGateway" -NoNewWindow
+        Write-Log "RESTART-IBG-ONLY: IBGateway restart initiated -- awaiting 2FA or auto-login"
+        exit 0
+    }
+
+    # OptionsListener or CloudflareTunnel also down -- full BounceServices needed
     Write-Log "RESTART: calling BounceServices.cmd ..."
     $bounceProc = Start-Process -FilePath cmd.exe -ArgumentList '/c', 'C:\OptionsHistory\bin\BounceServices.cmd' `
         -WorkingDirectory 'C:\OptionsHistory\bin' -Wait -PassThru -NoNewWindow

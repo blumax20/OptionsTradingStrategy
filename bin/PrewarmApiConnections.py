@@ -61,12 +61,20 @@ def prewarm(host: str, port: int) -> None:
     for cid in CLIENT_IDS:
         ib = IB()
         try:
-            ib.connect(host, port, clientId=cid, timeout=8)
+            # 20s timeout: clientId=101 is the master client and receives the full
+            # portfolio dump on connect (~400 messages for a 20+ position account).
+            # The default 8s timeout fired even though the connection itself succeeded,
+            # producing a misleading "FAILED:" with empty exception message.
+            ib.connect(host, port, clientId=cid, timeout=20)
             ib.sleep(HOLD_DURATION)
             LOG.info("  clientId=%-4d  OK", cid)
             ok += 1
         except Exception as e:
-            LOG.warning("  clientId=%-4d  FAILED: %s", cid, e)
+            # Some ib_insync exceptions (notably asyncio.TimeoutError) stringify to "",
+            # which produced silent "FAILED:" lines. Include the exception type so the
+            # cause is visible even when the message is empty.
+            msg = str(e) or f"<empty>"
+            LOG.warning("  clientId=%-4d  FAILED: %s: %s", cid, type(e).__name__, msg)
             fail += 1
         finally:
             try:

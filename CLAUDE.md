@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** March 27, 2026 (Fix DX: PushButtonStart detached Start-Process — fix menu 2→2 hang; Fix DX-1 through DX-4: Watchdog 2FA detection hardening — service state gate, RESTART-IBG-ONLY, timer reset on new session, login-completed check)
+**Last Updated:** May 11, 2026 (Fix EE: corrupt autorestart token recovery + AutoRestartTime disabled)
 
 ---
 
@@ -4366,6 +4366,259 @@ if ($eaLastTwoFa -ge 0 -and $eaLastTwoFa -gt $eaLastLogin) {
 ```
 
 **Impact:** WARN clears immediately after successful login. No false WARN for the 20-minute file-age window after authentication.
+
+---
+
+### Fix EA: `nearest_valid_expiration()` — Forward-Only Expiry Matching + "Spread Width Not Found" Log (Apr 1)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` (`nearest_valid_expiration()` ~line 715); `InteractiveBrokersTrader/listener.py` (`_collect_secdef()` ~line 187, diagnostic only)
+
+**Root Cause:** `_collect_secdef()` unions ALL strikes from ALL expirations into a single flat `strikes_all` pool. For WBD:
+- April 17 (0.50-wide strikes): 27.0, 27.5, 28.0, 28.5...
+- April 24 (1.00-wide strikes): 27, 28, 29, 30...
+
+Listener picks April 24 (closest to 30 DTE). `_closest_existing(strikes_all, 27.7)` returns **27.5** (from April 17's pool, 0.2 away) instead of 28.0 (April 24's nearest, 0.3 away). April 24 has no 27.5 strike. The CSV gets `expiry=20260424, atm_strike=27.5`. PlaceAnOrder's `qualifyContracts(WBD, Apr24, 27.5C)` fails → `nearest_valid_expiration()` is called → old code sorts by `abs(days)` → April 17 (7 days before Apr24) beats May 1 (7 days after) → order silently placed for April 17.
+
+**Change 2 — `nearest_valid_expiration()` forward-only:**
+
+```python
+# BEFORE (bidirectional — Apr17 can beat May1):
+exps_dt = [(abs((_to_dt(e) - target).days), e) for e in exps if _to_dt(e)]
+exps_dt.sort()
+return exps_dt[0][1] if exps_dt else exps[0]
+
+# AFTER (Fix EA — forward-only, 60-day cap):
+_today_dt = _dt.now()
+valid = [
+    ((_to_dt(e) - target).days, e)
+    for e in exps if _to_dt(e)
+    and _to_dt(e) >= target                          # not earlier than desired
+    and (_to_dt(e) - _today_dt).days <= 60           # within 60 days from today
+]
+if not valid:
+    if strike % 1.0 == 0.5:
+        logger.warning(
+            "[%s] Fix EA: Spread width not found — strike %.1f (half-dollar) "
+            "not available in any forward expiry within 60 days of %s.",
+            symbol, strike, desired_exp,
+        )
+    return None   # callers already treat None as no_viable_limit_or_conditions
+valid.sort()
+return valid[0][1]
+```
+
+**Change 3 — `_collect_secdef()` DEBUG logging (diagnostic):**
+
+Added one DEBUG log per `p` object inside `for p in params:` loop:
+```python
+logger.debug("[SECDEF] %s: tradingClass=%s expirations_count=%d strikes_count=%d first_exp=%s last_exp=%s", ...)
+```
+Reveals whether IB returns separate `p` objects per expiry/trading-class group (which would enable a future `strikes_by_expiry` root-cause fix) or one flat object. Only visible at `--log-level DEBUG`.
+
+**Expected behavior after fix:**
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| WBD Apr24 (27.5 ATM from pooled strikes) | Switched to Apr17 (shorter DTE, wrong OI) | Returns None → `no_viable_limit_or_conditions`; logs "Spread width not found — strike 27.5" |
+| PFE Apr17 (0.5-wide strikes, ATM=26.5) | Works correctly | Unchanged — `nearest_valid_expiration` only called when initial qualify fails |
+| Whole-dollar ATM that fails to qualify | Nearest expiry (any direction) used | Nearest FORWARD expiry within 60 days; April 17 never replaces April 24 |
+
+**Impact:** WBD-style wrong-expiry placement (shorter DTE substituted) eliminated. The "Spread width not found" warning pinpoints half-dollar strikes with no forward-expiry match. All 4 `nearest_valid_expiration` call sites already return `None` as skip — no caller changes needed.
+
+---
+
+### Fix EB: Listener — Validate ATM Against Chosen Expiry Before OTM Selection (Apr 1)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` (`get_option_data()`, ATM/OTM selection block ~line 981)
+
+**Root Cause:** `_collect_secdef()` returns a flat pooled `strikes_all` from ALL expirations. For WBD, April 17 (weekly) has 0.5-wide strikes (27.5, 28.0, 28.5...) while April 24 (monthly) has only 1.0-wide strikes (28.0, 29.0, 30.0...). `_closest_existing(strikes_all, 27.49)` returns 27.5 (0.2 away, sourced from April 17) instead of 28.0 (0.51 away, the actual nearest April 24 strike). Then `otm_strike = _next_higher_existing(strikes_all, 27.5) = 28.0`. After the `qualify_options` loop corrects atm from 27.5→28.0 (via its own fallback), `otm_strike` was already set to 28.0 — making `atm_strike == otm_strike` (zero-width spread). CSV shows `otm_strike_call = atm_strike`. PlaceAnOrder uses `longK=27.5` (the uncorrected atm from CSV) which fails for Apr24 → `nearest_valid_expiration` → wrong expiry switch (Fix EA).
+
+**Investigation:** `ib.reqSecDefOptParams()` returns 20 identical `p` objects (one per exchange/route) — all with the same flat union of all strikes across all expirations. No per-expiry grouping is possible from this API. Per-strike validation via `qualifyContracts()` is the only way to determine which strikes actually exist for a specific expiry.
+
+**Fix:** After `_closest_existing()` picks the ATM from the pooled set, immediately validate it against the chosen expiry with one `qualifyContracts` call. If it fails, try the next strike above (then below) from the pool:
+
+```python
+atm_strike = _closest_existing(strikes_all, current_price)
+try:
+    _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'C', preferred_tc, multiplier)
+except Exception:
+    for _eb_cand in [_nearest_valid_strike(strikes_all, atm_strike, prefer='above'),
+                     _nearest_valid_strike(strikes_all, atm_strike, prefer='below')]:
+        if _eb_cand is None: continue
+        try:
+            _qualify_with_fallback(ib, symbol, expiry_str, _eb_cand, 'C', preferred_tc, multiplier)
+            atm_strike = _eb_cand  # corrected
+            break
+        except Exception:
+            continue
+otm_strike = _next_higher_existing(strikes_all, atm_strike)
+```
+
+**WBD trace (verified live):**
+1. `_closest_existing(strikes_all, 27.49)` = 27.5
+2. `qualifyContracts(WBD, Apr24, 27.5C)` → FAILS (Error 200 — not a real Apr24 contract)
+3. Next above = 28.0 → `qualifyContracts(WBD, Apr24, 28.0C)` → OK → `atm_strike = 28.0`
+4. `otm_strike = _next_higher_existing(strikes_all, 28.0)` = 28.5
+5. `qualify_options` loop (existing code) corrects OTM 28.5→29.0 (28.5 also fails for Apr24)
+6. CSV result: `atm_strike=28.0, otm_strike_call=29.0` — correct $1-wide spread for April 24
+
+**Impact:**
+- WBD: `atm_strike=27.5` (broken) → `atm_strike=28.0` (correct for Apr24). `otm_strike_call=28.0` (broken) → `otm_strike_call=29.0` (correct $1-wide). `call_debit_theo_1` now populated. PlaceAnOrder places the correct $1-wide spread for April 24 with no expiry substitution.
+- Symbols where ATM from pool is valid for chosen expiry (most stocks): one `qualifyContracts` call succeeds immediately — no correction, no behavioral change.
+- Log: `[WBD] Fix EB: ATM 27.5 not valid for 20260424 — corrected to 28.0` at INFO level.
+
+---
+
+### Fix DD-2: Risk Exit Age Filter — Loose CSV Match + Prefix Exp Matching (Apr 1)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`_process_vertical()` inside `_rth_risk_exits()`, Fix DD block ~line 2879)
+
+**Issue:** SHEL PUT 94/93 (May 2026) was TP-exited at 10:34 AM on 3/31 — the same morning it filled at market open (opened 3/30 5 PM as Inactive+DAY, activated and filled 3/31 at open). IB counted this as a day trade (both BUY fill and SELL fill on 3/31). The `days_old=2` age filter was supposed to block risk exits for positions < 48 hours old, but it failed.
+
+**Root cause:** Fix DD (CSV timestamp lookup) uses `_de_row.get("exp", "") == exp_str` where `exp_str` comes from `long_leg["contract"].lastTradeDateOrContractMonth`. For monthly options, IB's `ib.positions()` sometimes returns the expiry as `"YYYYMM"` (6 chars, year+month only) while the attempts CSV stores `"YYYYMMDD"` (8 chars). The strict `==` match fails → `t0` stays `None` → Fix CA fires (`DTE >= 30 → skip age filter`) → SHEL TP triggers the same morning as fill.
+
+**Fix — three changes in the Fix DD block:**
+
+1. **Prefix exp matching:** Changed `==` to also accept a prefix match on the first 6 characters (`_de_exp[:6] == exp_str[:6]`). Handles `"202605"` vs `"20260501"` mismatch.
+
+2. **Loose fallback search** (symbol+right only, last `days_old` days): Before the strict 21-day scan, does a faster scan of just the last 2 days matching symbol+right only. Catches format mismatches that would cause the strict match to miss a recent open.
+
+3. **Fill-date guard (`_too_new_for_exit`):** Changed the "too new" check from elapsed-hours to fill-date logic. Since Inactive+DAY orders placed after-hours fill on the NEXT trading day, blocks the exit if `next_trading_day(placement_date) >= today`:
+```python
+def _next_trading_day(_d):
+    _nd = _d + timedelta(days=1)
+    while _nd.weekday() >= 5:  # skip Sat/Sun
+        _nd += timedelta(days=1)
+    return _nd
+
+def _too_new_for_exit(_placement_t0, _label):
+    # Block if fill_date >= today (position first fills today or hasn't filled yet)
+    _fill_date = _next_trading_day(_placement_t0.date())
+    return _fill_date >= now.date()
+```
+
+This fixes the Friday→Monday gap: `timedelta(days=2)` (48h) would allow a Monday risk exit for a Friday-placed position (65h elapsed), but the fill-date check correctly blocks it since `next_trading_day(Fri) = Mon == today`.
+
+| Placed | Fills | Risk exit | Result |
+|--------|-------|-----------|--------|
+| Mon 5 PM | Tue morning | Tue 9:45 AM | `fill_date=Tue == today` → blocked ✓ |
+| Fri 5 PM | Mon morning | Mon 9:45 AM | `fill_date=Mon == today` → blocked ✓ |
+| Fri 5 PM | Mon morning | Tue 9:45 AM | `fill_date=Mon < Tue` → allowed ✓ |
+
+**Impact:**
+- SHEL-type (Mon-Thu placement, next-morning risk exit): blocked by fill-date check.
+- Friday placement, Monday risk exit: blocked by fill-date check (was NOT blocked by 48h check — 65h elapsed > 48h).
+- Positions eligible for exit (fill_date < today): fall through to the existing 48h `days_old` check as before.
+- Fix CA (DTE≥30 skip) only fires when BOTH strict and loose lookups return no entry at all.
+
+---
+
+### Fix ED: `_place_combo()` Order Confirmation — Lost Orders + Wrongly Blocked OPENs (Apr 16)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `DailyCycleManagement.py` (`_place_combo()` inside `_try_close_from_positions()`, line ~1472)
+
+**Issue:** MET CALL 75/77.5 and XEL CALL 80/85 close orders were "placed" by the 5 PM reconcile on Apr 15 but never appeared as pending orders in TWS. The attempts CSV showed `close,placed,reconcile_close_signal` followed by `open,skipped,skip_open_reconcile_close_submitted` — the OPEN was blocked because the system believed the close was successfully submitted.
+
+**Root Cause:** `_place_combo()` called `ib.placeOrder(bag, order)` and immediately returned `True` without any `ib.sleep()` or order status verification. The `finally` block at line 1561 disconnected the IB connection before IB processed the order. Evidence: both orders logged `status='PendingSubmit', permId=0` — IB never assigned a permanent order ID.
+
+**Double failure:**
+1. Close order silently lost (IB never confirmed receipt)
+2. `ok=True` returned → symbol added to `_submitted_close_syms` → OPEN blocked with `skip_open_reconcile_close_submitted`
+3. Result: neither close NOR open placed for MET and XEL
+
+**Fix:** After `ib.placeOrder()`, poll for up to 3 seconds (20 × 0.15s) checking order status:
+- `Inactive` + `tif=DAY` → confirmed (normal after-hours state for DAY+outsideRth)
+- `PreSubmitted`/`Submitted` + `permId != 0` → confirmed
+- `Filled` → confirmed
+- `Cancelled`/`ApiCancelled` → rejected, return `False`
+- Timeout with no confirmation → return `False`
+
+When `_place_combo()` returns `False`, `_try_close_from_positions()` returns `(False, None)`. The reconcile then:
+1. Does NOT add the symbol to `_submitted_close_syms`
+2. Falls through to the Fix AA5 force-close fallback (PlaceAnOrder subprocess with proper `_await_working` confirmation)
+3. The OPEN is NOT blocked
+
+**Impact:**
+- Lost orders detected immediately — reconcile falls through to force-close fallback
+- OPENs no longer wrongly blocked when the close was never actually placed
+- Log shows `"direct-close: MET order NOT confirmed after 3s (status=PendingSubmit, permId=0) — treating as failed"` instead of false success
+
+---
+
+### Fix EE: Corrupt Autorestart Token Auto-Recovery in Watchdog (May 11)
+**Status:** ✓ IMPLEMENTED — RECOVERY VERIFIED
+
+**Location:** `C:\OptionsHistory\bin\IB_Watchdog.ps1` lines 69-93 (new 0-byte autorestart detection); `C:\Jts\<token-dir>\autorestart` (file the watchdog now inspects each cycle)
+
+**Issue:** IBGateway was down for 17 days (last `OK` in `watchdog.log` was `2026-04-24 20:07:02`; first `FAIL: port 7496 not listening` was `2026-04-25 06:07:02`). The watchdog fired `RESTART-IBG-ONLY: IBGateway restart initiated -- awaiting 2FA or auto-login` every 15 minutes from Apr 25 through May 11 without recovery. Health reports showed `IBGateway Stopped`, port 7496 not listening, and `[WinError 1225] The remote computer refused the network connection` on all IB API calls. Manually starting IBGateway never produced a 2FA prompt — even from Global Configuration.
+
+**Root Cause:** The IBC autorestart token file at `C:\Jts\pchfaeonaifoklbfefgbnmalimbdhghkghndlepo\autorestart` was **0 bytes**, last modified `Apr 25 06:00:00` — exactly when the cascade began. Confirmed in today's IBC log:
+```
+autorestart file found at C:\Jts\pchfaeonaifoklbfefgbnmalimbdhghkghndlepo\autorestart: authentication will not be required
+IBC: Login dialog WINDOW_OPENED: LoginState is LOGGED_OUT
+```
+
+IBC sees the (empty) file → declares "authentication will not be required" → **suppresses the 2FA dialog** → tries to silently auto-login with an empty token → login never completes → dialog stays at `LOGGED_OUT` indefinitely → IBC times out → IBGateway exits → watchdog restarts it → same outcome.
+
+This is why neither the user nor the watchdog could trigger a 2FA prompt: until the empty file is removed, IBC will never present one.
+
+**What corrupted the file:** `AutoRestartTime=06:00 AM` in `C:\IBC\config.ini` (line 610) fires a daily IBC auto-restart that requests a refreshed autorestart token from IBKR. At 06:00 AM ET on Saturday Apr 25, an IBKR-side glitch caused the token write to produce 0 bytes (IBKR sent customer communication confirming the incident). IBC silently writes a 0-byte file when the server response is missing/empty, and never falls back to the manual 2FA flow as long as that file exists.
+
+**Note on `AutoRestartTime`:** Fix DC (Mar 20) originally proposed disabling `AutoRestartTime` for live accounts. This was incorrect — IBKR mandates a daily IBGateway restart cycle (per the comments in `C:\IBC\config.ini` lines 564-575: *"TWS and Gateway insist on being restarted every day"*). Without `AutoRestartTime`, IBGateway becomes unstable / non-functional after ~24 hours. The correct fix is to **keep** `AutoRestartTime` enabled and have the watchdog auto-recover from corrupt token files when they occur.
+
+**Why the watchdog could not detect or escalate:**
+- [IB_Watchdog.ps1:84-86](C:\OptionsHistory\bin\IB_Watchdog.ps1) (Fix DX gate) skips IBC log inspection when `IBGateway` service status is `Stopped`. Between 15-min cycles, IBC has typically already timed out at the login dialog and exited → service back to `Stopped` → 2FA detection bypassed → `RESTART-IBG-ONLY` fires again. No `FAIL (2FA)` ever logged, no escalation, no alert.
+- The `IBGateway-service.out.log` confirms the rapid stop/start cycles: full of `Terminate batch job (Y/N)?` prompts (one per `nssm stop`) and `The process cannot access the file because it is being used by another process` lines in the err log.
+
+**One-Time Recovery Performed (May 11):**
+
+1. Disabled `IB_Watchdog_Every15Min` (stop fighting recovery).
+2. `nssm stop IBGateway` → confirmed `Stopped`, no orphan `javaw`/`cmd` processes.
+3. **Deleted the 0-byte autorestart file**: `Remove-Item "C:\Jts\pchfaeonaifoklbfefgbnmalimbdhghkghndlepo\autorestart" -Force`.
+4. `nssm start IBGateway` → login window appeared → user authenticated via 2FA push.
+5. Restarted `OptionsListener` service (had been running 17 days with `positions_error: not connected`) → reconnected; `/health` JSON `positions_count: 22`.
+6. Ran `PrewarmConnections.cmd` → 9 of 10 clientIds registered. clientId=101 (master client) hit an 8-second connect timeout because the listener was concurrently reconnecting and the master client also receives the full portfolio dump (~400 messages) on connect. Empty exception string produced a misleading `FAILED:` log line.
+
+   **Follow-up fix to [PrewarmApiConnections.py](C:\OptionsHistory\bin\PrewarmApiConnections.py):**
+   - Raised connect timeout from 8s → 20s (room for master-client portfolio sync during noisy windows).
+   - Improved exception logging to include `type(e).__name__` so future failures show the cause instead of an empty string.
+   - Re-verified: 10 of 10 clientIds OK.
+7. Re-enabled `IB_Watchdog_Every15Min`; manual trigger logged `ONLINE → PREWARM → OK` at `2026-05-11 20:07:49` — first `OK` since `2026-04-24 20:07:02` (17-day cascade ended).
+
+**Watchdog Code Change — the actual recurrence prevention:**
+
+Added 0-byte autorestart detection to `IB_Watchdog.ps1` at the top of `if (-not $gw)` (port-DOWN branch, lines ~69-93). When port 7496 is DOWN, scan `C:\Jts\*\autorestart` for any file with `Length == 0` AND `LastWriteTime < (Now - 1 min)`. If found:
+
+1. Delete the file.
+2. Log `FAIL: deleted corrupt 0-byte autorestart token at <path> (age Xmin) -- next IBGateway start will require manual 2FA login`.
+3. Write the prewarm flag (so Fix DS3's 3-min force-restart timer activates after IBGateway restarts).
+4. Fall through to the existing `RESTART-IBG-ONLY` logic.
+
+Next IBGateway start sees no autorestart file → IBC writes `autorestart file not found` to its log → next 15-min watchdog cycle's 2FA detection picks it up → logs `FAIL (2FA): IBGateway waiting for authentication` (actionable alert in `watchdog.log`). User authenticates → fresh non-empty autorestart file regenerated by IBC → daily cycle resumes normally.
+
+**Safety:**
+- Only fires when file is exactly 0 bytes AND >1 minute old (avoids racing against legitimate in-flight writes).
+- Valid autorestart files (non-zero size) are never touched.
+- If delete fails (permission/lock), the error is logged and the watchdog still proceeds to `RESTART-IBG-ONLY`.
+
+**`AutoRestartTime` is kept enabled:** `C:\IBC\config.ini` line 610 remains `AutoRestartTime=06:00 AM`. IBKR mandates a daily IBGateway restart cycle; disabling this would break IBGateway after ~24 hours. The plan's earlier "blank `AutoRestartTime`" suggestion was rejected by the user as incorrect for that reason.
+
+**Impact:**
+- One-time corruption (Apr 25 IBKR glitch) recovered manually. System back online May 11 20:07.
+- Future occurrences: watchdog detects the 0-byte file on the next 15-min cycle, deletes it, restarts IBGateway, and surfaces `FAIL (2FA)` to the user — no more multi-day silent cascade.
+- No change to normal daily operation when the autorestart file is valid.
+
+**Verification (May 11 20:07–20:08):**
+- `watchdog.log` shows `OK` after 17 days of unbroken `RESTART-IBG-ONLY` entries.
+- Port 7496 listening (PID 25556).
+- `/health`: `positions_error=''`, `positions_count=22`.
+- Services Running: `IBGateway`, `OptionsListener`, `CloudflareTunnel`.
+- `IB_Watchdog_Every15Min` task state: Ready (next scheduled run 2026-05-12 06:07).
+- A new non-zero `autorestart` file will be created at the same `C:\Jts\<token-dir>\` path upon next successful IBGateway authenticated session.
 
 ---
 
