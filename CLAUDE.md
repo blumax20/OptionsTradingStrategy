@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** May 11, 2026 (Fix EE: corrupt autorestart token recovery + AutoRestartTime disabled)
+**Last Updated:** May 24, 2026 (Fix EF: PDT day-trade guard hardening — right-format CSV match + same-day close gate + async Error 201 detection)
 
 ---
 
@@ -4619,6 +4619,103 @@ Next IBGateway start sees no autorestart file → IBC writes `autorestart file n
 - Services Running: `IBGateway`, `OptionsListener`, `CloudflareTunnel`.
 - `IB_Watchdog_Every15Min` task state: Ready (next scheduled run 2026-05-12 06:07).
 - A new non-zero `autorestart` file will be created at the same `C:\Jts\<token-dir>\` path upon next successful IBGateway authenticated session.
+
+---
+
+### Fix EF: PDT Day-Trade Guard Hardening — Right-Format Match + Same-Day Close Gate + Async Error 201 Detection (May 24)
+**Status:** ✓ IMPLEMENTED — three independent fixes in one commit
+
+**Incident:** On 2026-05-22 the system day-traded ROST PUT 225/222.5 (placed Thu 5/21 17:00, filled Fri 5/22 09:30, risk-exit-STOP at 09:47) and UL CALL 57.5/58 (placed Thu 17:00, filled Fri 09:30, risk-exit-STOP at 10:32). The account is permanently PDT-flagged (the one-time amnesty was previously used), and securities equity was $2,678.64 (below the $25,000 PDT floor). IB rejected all subsequent OPEN orders that evening (GLNG, SF) with Error 201: *"Because you fall within the definition of a 'Pattern Day Trader'... required minimum equity is $25,000."* But the attempts CSV logged those rejected opens as `placed,success` because the rejection arrived asynchronously after `_await_working()` had already returned True.
+
+**Three independent failures that combined to produce this outcome:**
+
+#### EF-1: Right-format string mismatch in `_process_vertical` CSV match
+
+**Location:** [`DailyCycleManagement.py:2889`](C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\DailyCycleManagement.py) (`_process_vertical` inside `_rth_risk_exits`)
+
+The fill-date guard (Fix DD/DD-2) was supposed to detect "position would fill today → blocking close" by scanning the prior business day's attempts CSV. The strict match (~line 2950) and loose match (~line 2928) both used:
+
+```python
+and _de_row.get("right", "").upper() == right.upper()
+```
+
+But the **parameter** `right` is passed as `"CALL"` / `"PUT"` (full word, for log-line readability) at the call sites (lines 3199, 3210), while the **attempts CSV** stores right as the single letter `"C"` / `"P"` (written by PlaceAnOrder). So `"P" == "PUT"` → False, both matches silently never matched, `t0` stayed None, code fell through to the DTE-based estimate fallback. ROST and UL both had DTE=27 → `estimated_age = max(0, 30 - 27) = 3` > `days_old=2` → guard did not block.
+
+Bug introduced in commit `990f0c5c` on 2026-03-20 (Fix DD code). Latent for 2 months. Only surfaces when (a) IB execution history is empty (TWS recently restarted — true after the 5/11 recovery), (b) position opened prior business day as Inactive+DAY, (c) DTE in the narrow 25-29 range, (d) same-morning TP/SL fires. ROST and UL satisfied all four simultaneously.
+
+**Fix:** Normalize `right` to single letter once at function entry:
+```python
+right_letter = right.upper()[:1]   # "C" or "P" — matches attempts CSV
+```
+Use `right_letter` at both CSV comparison sites (lines 2928, 2950). Log lines continue to use `right` (full word) for readability — 14 sites unchanged.
+
+#### EF-2: Same-day-close gate in `_submit_close_shared`
+
+**Location:** [`DailyCycleManagement.py:482`](C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\DailyCycleManagement.py) (`_submit_close_shared`); new helper `_would_be_same_day_close()` added immediately before it.
+
+Even with EF-1 fixed, the fill-date guard only existed inside `_rth_risk_exits._process_vertical`. The three other close paths — preclose (`_pre_close_market_conversion` at 3 PM), reconcile (`_reconcile_positions_with_signals_lookback` at 5 PM), and webhook-driven CLOSE batch (`_delegate_close_from_csvs_within` at 5 PM) — all funnel through `_submit_close_shared()` with no fill-date check. Any same-day CLOSE webhook, reconcile flip, or preclose cancel-replace could still trigger a same-day day trade.
+
+**Fix:** Added a single pre-flight gate in `_submit_close_shared` using a new symbol-only helper:
+```python
+def _would_be_same_day_close(self, sym: str) -> tuple[bool, str | None]:
+    """Scan today + last 7 calendar days of attempts CSVs for an open_*,placed
+    entry whose fill_date == today. Returns (True, ts_iso) if blocking."""
+```
+
+The gate runs once per `_submit_close_shared` call before any close logic; if positive, logs `Fix EF: SAME-DAY-CLOSE BLOCKED` and writes `<context>_same_day_close_blocked` to the attempts CSV with status `skipped`. Symbol-only match (matches any open of that symbol with fill_date >= today) — sufficient because the IB day-trade rule is per-symbol, not per-leg-or-strike.
+
+Performance: ~25ms per call (pure local file I/O on ~200-row CSVs). Total per trading day across all three cycles: ~1.5s. Negligible.
+
+#### EF-3: Async Error 201 detection on BAG combo orders in `place_debit_spread`
+
+**Location:** [`PlaceAnOrder.py:350`](C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\PlaceAnOrder.py) (new helper `_check_bag_async_rejection`); 4 call sites inside `place_debit_spread()` at lines 1237, 1304, 1377, 1436 (two primary submissions × two paths × ± riskless retry).
+
+IB's Error 201 (PDT, trading permissions, etc.) arrives ~1-2 seconds asynchronously via `errorEvent` *after* the order has already received PreSubmitted status. `_await_working()` correctly sees PreSubmitted and returns True. The success-recording code then writes `placed,success` to the attempts CSV before the rejection arrives. This is the same bug-class as Fix BS (individual-leg async rejection), but Fix BS was only applied to the individual-leg paths — the BAG combo path used by all OPEN orders (and many CLOSE orders) was never instrumented.
+
+**Fix:** New helper next to `_await_working()`:
+```python
+def _check_bag_async_rejection(ib, trade, sleep_s: float = 2.5) -> tuple[bool, str | None]:
+    """Sleep (ib.sleep pumps event loop), then scan trade.log for known
+    rejection patterns. Returns (was_rejected, message)."""
+    ib.sleep(sleep_s)
+    for le in getattr(trade, "log", []) or []:
+        msg = getattr(le, "message", "") or ""
+        if any(s in msg for s in ("Order rejected", "trading permissions",
+                                  "Pattern Day Trader", "Error 201")):
+            return True, msg
+    return False, None
+```
+
+Each of the 4 BAG-combo `_await_working` sites in `place_debit_spread()` now calls this helper when `_await_working` returned True. On detection:
+- `ok = False`, `why = "bs_rejected_bag_e201"`
+- `reason = f"bs_rejected_bag_e201:{msg[:80]}"`
+- attempts CSV status = `"error"` (instead of the old `"submitted"`)
+- WARNING logged with full IB message (first 200 chars)
+
+Existing Fix BS individual-leg paths (in `force_close_symbol_via_positions`) are unchanged — they already have equivalent inline checks.
+
+#### Combined impact
+
+- **EF-1** alone would have caught ROST and UL — the loose CSV match would have found the prior-evening placement, `_too_new_for_exit` would have returned True (fill_date == today), risk exits would have skipped both. No day trades. No subsequent PDT cascade.
+- **EF-2** extends the same fill-date logic to the other three close paths so a CLOSE webhook arriving same-day-as-open, a reconcile flip, or a preclose cancel-replace cannot create a same-day day trade either. Structurally closes the gap regardless of which close path is involved.
+- **EF-3** makes the attempts CSV accurate when IB asynchronously rejects an order. Future GLNG/SF-style situations report `error,bs_rejected_bag_e201:Pattern Day Trader...` instead of misleading `placed,success`.
+
+#### Files Modified
+
+- `InteractiveBrokersTrader/DailyCycleManagement.py` — EF-1 (~6 lines) + EF-2 helper and gate (~50 lines)
+- `InteractiveBrokersTrader/PlaceAnOrder.py` — EF-3 helper (~22 lines) + 4 call-site instrumentations (~12 lines each, ~48 lines total)
+- `CLAUDE.md` — this entry
+
+#### Verification
+
+1. **Code parse**: both files validated via `python -m ast`.
+2. **Same-day blocking** will appear on the next attempted same-day close as `Fix EF: SAME-DAY-CLOSE BLOCKED` in `ib_cycle.log` and `<context>_same_day_close_blocked` in the attempts CSV. The next opportunity to observe: any future scenario where a position fills at market open and a TP/SL/CLOSE webhook fires the same day.
+3. **Async rejection reporting**: requires another Error 201 to surface (will not happen while equity < $25K because the system itself blocks closes via EF-1/EF-2 before any rejection can occur). Once equity is restored and any other Error 201 condition arises (e.g., new trading-permission issue on a new symbol), the attempts CSV will show `error,bs_rejected_bag_e201:...` and a clear WARNING line in `ib_cycle.log`.
+
+#### What this does NOT do
+- Does not affect the existing $25K equity floor — that's IB's rule and cannot be bypassed in code.
+- Does not protect against day trades initiated manually in TWS (system has no visibility ahead of time).
+- Does not check `DayTradesRemaining` from IB — that gate is moot below $25K (all opens blocked anyway) and unneeded above $25K (PDT accounts above the floor get unlimited day trades).
 
 ---
 

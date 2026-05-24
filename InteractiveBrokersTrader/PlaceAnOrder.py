@@ -348,6 +348,32 @@ def _await_working(trade, timeout=3.0) -> tuple[bool, str]:
     st = (getattr(trade.orderStatus, "status", "") or "")
     return False, (st or "no_status")
 
+
+def _check_bag_async_rejection(ib, trade, sleep_s: float = 2.5) -> tuple[bool, str | None]:
+    """
+    Fix EF: Detect async IB rejection (Error 201) after _await_working() returned True.
+
+    IB can return Submitted/PreSubmitted within ~100ms (which _await_working accepts as
+    success), then asynchronously reject the order ~1-2s later via errorEvent. Without
+    this check, attempts CSV logs 'placed,success' for orders IB actually rejected —
+    confirmed by the 2026-05-22 GLNG/SF Pattern Day Trader rejection that read as
+    'success' in the CSV. Extends the Fix BS pattern (individual-leg orders) to the
+    BAG combo path used by place_debit_spread.
+
+    Returns (was_rejected, message). Caller should set ok=False and reason accordingly
+    when was_rejected is True.
+    """
+    try:
+        ib.sleep(sleep_s)  # ib.sleep pumps the event loop so error messages are received
+    except Exception:
+        pass
+    for le in getattr(trade, "log", []) or []:
+        msg = getattr(le, "message", "") or ""
+        if any(s in msg for s in ("Order rejected", "trading permissions",
+                                  "Pattern Day Trader", "Error 201")):
+            return True, msg
+    return False, None
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("PlaceAnOrder")
@@ -712,9 +738,27 @@ def nearest_valid_expiration(ib: IB, symbol: str, right: str, strike: float, des
         target = _to_dt(desired_exp)
         if not target:
             return exps[0]
-        exps_dt = [(abs((_to_dt(e) - target).days), e) for e in exps if _to_dt(e)]
-        exps_dt.sort()
-        return exps_dt[0][1] if exps_dt else exps[0]
+        # Fix EA: only pick expirations >= desired (forward-only) and within 60 days from today.
+        # Going to a shorter-DTE expiry means wrong pricing, wrong OI. Return None to skip.
+        _today_dt = _dt.now()
+        valid = [
+            ((_to_dt(e) - target).days, e)
+            for e in exps if _to_dt(e)
+            and _to_dt(e) >= target                          # not earlier than desired
+            and (_to_dt(e) - _today_dt).days <= 60           # within 60 days from today
+        ]
+        if not valid:
+            # Fix EA: log "Spread width not found" when a half-dollar strike has no forward expiry.
+            # This is the WBD case: 27.5C exists in Apr17 but not in any forward expiry (Apr24+).
+            if strike % 1.0 == 0.5:
+                logger.warning(
+                    "[%s] Fix EA: Spread width not found — strike %.1f (half-dollar) "
+                    "not available in any forward expiry within 60 days of %s.",
+                    symbol, strike, desired_exp,
+                )
+            return None   # no forward expiry within 60 days → callers skip the order
+        valid.sort()
+        return valid[0][1]
     except Exception:
         return None
 
@@ -925,6 +969,7 @@ def has_working_open_order(ib: IB, symbol: str, exp: str, right: str, longK: flo
     target_ids = {longC.conId, shortC.conId}
     try:
         ib.reqAllOpenOrders(); ib.sleep(1.5)  # Fix DX2: reqOpenOrders only sees current session; reqAllOpenOrders needed for prior-session Inactive+DAY orders (same fix as U1/BB/BC)
+        ib.reqOpenOrders();   ib.sleep(0.5)   # Fix DX3: reclaim prior-session orders so comboLegs are populated (same as Fix CZ in cancel functions)
     except Exception:
         pass
     for tr in ib.trades():
@@ -942,6 +987,15 @@ def has_working_open_order(ib: IB, symbol: str, exp: str, right: str, longK: flo
             legs = getattr(tr.contract, 'comboLegs', []) or []
             ids = {getattr(leg, 'conId', None) for leg in legs}
             if target_ids == ids:
+                return True
+            # Fix DX3: prior-session orders may come back with empty comboLegs even after
+            # reqOpenOrders — treat any working BUY BAG for this symbol as a match (conservative guard).
+            if not ids or ids == {None}:
+                logger.warning(
+                    "[%s] has_working_open_order: BUY BAG found with no comboLegs (prior-session orderId=%s) "
+                    "-- assuming it's a match; skipping placement",
+                    symbol, getattr(tr.order, 'orderId', '?'),
+                )
                 return True
         except Exception:
             continue
@@ -1181,7 +1235,21 @@ def place_debit_spread(
                 f"{long_strike}/{short_strike} exp {expiration} (qty={quantity})"
             )
             ok, why = _await_working(trade, timeout=3.0)
-            reason = "success" if ok else f"not_working:{why}"
+            # Fix EF: detect async IB rejection (Error 201 — PDT, permissions, etc.) that
+            # arrives ~1-2s after PreSubmitted. Without this, attempts CSV would log
+            # 'placed,success' for orders IB actually rejected (e.g. GLNG/SF on 2026-05-22).
+            _ef_msg: str | None = None
+            if ok:
+                _ef_rejected, _ef_msg = _check_bag_async_rejection(ib, trade)
+                if _ef_rejected:
+                    ok = False
+                    why = "bs_rejected_bag_e201"
+                    logger.warning("[%s] Fix EF: BAG %s %s/%s rejected async by IB: %s",
+                                   symbol, action.upper(), long_strike, short_strike,
+                                   (_ef_msg or "")[:200])
+            reason = ("success" if ok else
+                      (f"bs_rejected_bag_e201:{(_ef_msg or '')[:80]}" if why == "bs_rejected_bag_e201"
+                       else f"not_working:{why}"))
             try:
                 if role == "force_close":
                     rec_action = "force_close"
@@ -1198,7 +1266,7 @@ def place_debit_spread(
                 record_attempt(
                     symbol,
                     rec_action,
-                    ("placed" if ok else "submitted"),
+                    ("placed" if ok else ("error" if why == "bs_rejected_bag_e201" else "submitted")),  # Fix EF
                     reason,
                     exp=str(expiration),
                     right=right.upper(),
@@ -1234,10 +1302,22 @@ def place_debit_spread(
                     )
                     try:
                         ok2, why2 = _await_working(trade2, timeout=3.0)
+                        # Fix EF: also check riskless retry for async Error 201 rejection
+                        _ef_msg2: str | None = None
+                        if ok2:
+                            _ef_rej2, _ef_msg2 = _check_bag_async_rejection(ib, trade2)
+                            if _ef_rej2:
+                                ok2 = False
+                                why2 = "bs_rejected_bag_e201"
+                                logger.warning("[%s] Fix EF: riskless retry BAG %s %s/%s rejected async: %s",
+                                               symbol, action.upper(), long_strike, short_strike,
+                                               (_ef_msg2 or "")[:200])
                         reason2 = (
                             "riskless_retry_ok"
                             if ok2
-                            else f"riskless_retry_not_working:{why2}"
+                            else (f"riskless_retry_bs_rejected_bag_e201:{(_ef_msg2 or '')[:80]}"
+                                  if why2 == "bs_rejected_bag_e201"
+                                  else f"riskless_retry_not_working:{why2}")
                         )
                         if role == "force_close":
                             rec_action2 = "force_close"
@@ -1254,7 +1334,7 @@ def place_debit_spread(
                         record_attempt(
                             symbol,
                             rec_action2,
-                            ("placed" if ok2 else "submitted"),
+                            ("placed" if ok2 else ("error" if why2 == "bs_rejected_bag_e201" else "submitted")),  # Fix EF
                             reason2,
                             exp=str(expiration),
                             right=right.upper(),
@@ -1295,7 +1375,19 @@ def place_debit_spread(
                 f"(qty={quantity})"
             )
             ok, why = _await_working(trade, timeout=3.0)
-            reason = "success" if ok else f"not_working:{why}"
+            # Fix EF: detect async IB rejection (Error 201 — PDT, permissions, etc.)
+            _ef_msg: str | None = None
+            if ok:
+                _ef_rejected, _ef_msg = _check_bag_async_rejection(ib, trade)
+                if _ef_rejected:
+                    ok = False
+                    why = "bs_rejected_bag_e201"
+                    logger.warning("[%s] Fix EF: BAG %s %s/%s rejected async by IB: %s",
+                                   symbol, action.upper(), long_strike, short_strike,
+                                   (_ef_msg or "")[:200])
+            reason = ("success" if ok else
+                      (f"bs_rejected_bag_e201:{(_ef_msg or '')[:80]}" if why == "bs_rejected_bag_e201"
+                       else f"not_working:{why}"))
             try:
                 if role == "force_close":
                     rec_action = "force_close"
@@ -1312,7 +1404,7 @@ def place_debit_spread(
                 record_attempt(
                     symbol,
                     rec_action,
-                    ("placed" if ok else "submitted"),
+                    ("placed" if ok else ("error" if why == "bs_rejected_bag_e201" else "submitted")),  # Fix EF
                     reason,
                     exp=str(expiration),
                     right=right.upper(),
@@ -1342,10 +1434,22 @@ def place_debit_spread(
                     )
                     try:
                         ok2, why2 = _await_working(trade2, timeout=3.0)
+                        # Fix EF: also check riskless retry for async Error 201 rejection
+                        _ef_msg2: str | None = None
+                        if ok2:
+                            _ef_rej2, _ef_msg2 = _check_bag_async_rejection(ib, trade2)
+                            if _ef_rej2:
+                                ok2 = False
+                                why2 = "bs_rejected_bag_e201"
+                                logger.warning("[%s] Fix EF: LMT riskless retry BAG %s %s/%s rejected async: %s",
+                                               symbol, action.upper(), long_strike, short_strike,
+                                               (_ef_msg2 or "")[:200])
                         reason2 = (
                             "riskless_retry_ok"
                             if ok2
-                            else f"riskless_retry_not_working:{why2}"
+                            else (f"riskless_retry_bs_rejected_bag_e201:{(_ef_msg2 or '')[:80]}"
+                                  if why2 == "bs_rejected_bag_e201"
+                                  else f"riskless_retry_not_working:{why2}")
                         )
                         if role == "force_close":
                             rec_action2 = "force_close"
@@ -1362,7 +1466,7 @@ def place_debit_spread(
                         record_attempt(
                             symbol,
                             rec_action2,
-                            ("placed" if ok2 else "submitted"),
+                            ("placed" if ok2 else ("error" if why2 == "bs_rejected_bag_e201" else "submitted")),  # Fix EF
                             reason2,
                             exp=str(expiration),
                             right=right.upper(),

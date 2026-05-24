@@ -479,12 +479,84 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
+    def _would_be_same_day_close(self, sym: str) -> tuple[bool, str | None]:
+        """
+        Fix EF: Return (True, ts_iso) if a close for `sym` today would constitute an IB day trade —
+        i.e. the symbol has an open_call/open_put/open entry in a recent attempts CSV whose
+        fill date (next trading day after placement) is today.
+
+        Scans today + last 7 calendar days of attempts CSVs (covers normal weekends + long
+        weekends with holidays). Symbol-only match: any leg/side opened today blocks the close.
+
+        Returns (False, None) if no match — i.e. close is not a day trade and is safe to submit.
+        """
+        today = self._now_ny().date()
+        def _next_trading_day(d):
+            nd = d + timedelta(days=1)
+            while nd.weekday() >= 5:  # skip Sat(5)/Sun(6)
+                nd += timedelta(days=1)
+            return nd
+        sym_u = (sym or "").upper()
+        for back in range(0, 8):
+            day = (self._now_ny() - timedelta(days=back)).strftime("%y_%m_%d")
+            path = fr"C:\OptionsHistory\{day}\attempts_{day}.csv"
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", newline="") as f:
+                    for row in csv.DictReader(f):
+                        if row.get("symbol", "").upper() != sym_u:
+                            continue
+                        action = (row.get("action") or "").lower()
+                        if not action.startswith("open"):
+                            continue
+                        if row.get("status", "") != "placed":
+                            continue
+                        try:
+                            ts = datetime.fromisoformat(row["ts"])
+                            fill_date = _next_trading_day(ts.date())
+                            if fill_date >= today:
+                                return True, row["ts"]
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        return False, None
+
     def _submit_close_shared(self, sym: str, csv_exists_today: bool, lookback_days: int, context: str) -> None:
         """
         Shared submission path used by both pre-close (≈15:00) and after-hours reconcile.
         Delegates to PlaceAnOrder first; if no working close order exists afterwards, it records that fact.
         DCM itself does not place option orders directly.
         """
+        # Fix EF: Pre-flight same-day-close gate. If the symbol was opened (or will fill) today,
+        # closing it today would constitute an IB day trade. With the account PDT-flagged and
+        # equity below $25k, any day trade triggers the cascade we hit on 2026-05-22 (ROST/UL).
+        # The check is symbol-only (any leg/side opened today blocks the close) — symbol is the
+        # only identifier _submit_close_shared has. Scans recent attempts CSVs (local file I/O,
+        # ~25ms per call).
+        try:
+            _same_day, _open_ts = self._would_be_same_day_close(sym)
+        except Exception as _ef_err:
+            LOG.warning("[%s] Fix EF: same-day-close check failed (%s); proceeding without gate", sym, _ef_err)
+            _same_day, _open_ts = False, None
+        if _same_day:
+            LOG.warning(
+                "[%s] Fix EF: SAME-DAY-CLOSE BLOCKED (context=%s) — open at %s would make this a day trade",
+                sym, context, _open_ts,
+            )
+            try:
+                self._attempt(
+                    symbol=sym,
+                    action="close",
+                    status="skipped",
+                    reason=f"{context}_same_day_close_blocked",
+                    source=f"dcm-{context}",
+                )
+            except Exception:
+                pass
+            return
+
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
         try:
@@ -1471,8 +1543,38 @@ class DailyCycleManagementMixin:
 
                     tr = ib.placeOrder(bag, order)
                     LOG.info("direct-close: %s %s vertical %s/%s -> %s %s", up, right, low, high, action, order_desc)
-                    _bv_limit_used = theo_limit  # Fix BV: capture limit for return
-                    return True
+
+                    # Fix ED: Wait for IB to confirm the order before returning True.
+                    # Without this sleep+check, ib.disconnect() fires before IB processes
+                    # the order — permId stays 0, order is silently lost, and downstream
+                    # logic (skip_open_reconcile_close_submitted) blocks the OPEN for nothing.
+                    _ed_confirmed = False
+                    _ed_working = {"PreSubmitted", "Submitted", "PendingSubmit"}
+                    for _ed_i in range(20):  # 20 x 0.15s = 3 seconds max
+                        ib.sleep(0.15)
+                        _ed_st = getattr(tr.orderStatus, "status", "") or ""
+                        _ed_perm = getattr(tr.orderStatus, "permId", 0)
+                        if _ed_st == "Inactive" and order.tif == "DAY":
+                            _ed_confirmed = True  # DAY+outsideRth goes Inactive after hours
+                            break
+                        if _ed_st in _ed_working and _ed_perm != 0:
+                            _ed_confirmed = True
+                            break
+                        if _ed_st == "Filled":
+                            _ed_confirmed = True
+                            break
+                        if _ed_st in ("Cancelled", "ApiCancelled"):
+                            LOG.warning("direct-close: %s order was rejected/cancelled (status=%s)", up, _ed_st)
+                            break
+                    if _ed_confirmed:
+                        _bv_limit_used = theo_limit  # Fix BV: capture limit for return
+                        LOG.info("direct-close: %s order confirmed (status=%s, permId=%s)",
+                                 up, _ed_st, _ed_perm)
+                        return True
+                    else:
+                        LOG.warning("direct-close: %s order NOT confirmed after 3s (status=%s, permId=%s) — treating as failed",
+                                    up, _ed_st, _ed_perm)
+                        return False
                 except Exception as e:
                     LOG.warning("direct-close: combo place failed for %s %s %s/%s: %s", up, right, low, high, e)
                     return False
@@ -2859,6 +2961,12 @@ class DailyCycleManagementMixin:
             def _process_vertical(strike_low: float, long_leg: dict, strike_high: float, short_leg: dict, right: str):
                 nonlocal submitted, checked
                 checked += 1
+                # Fix EF: normalize for attempts-CSV comparisons. Callers pass "CALL"/"PUT"
+                # (used in log lines below for readability), but the attempts CSV stores
+                # right as single-letter "C"/"P". Without this, the strict and loose CSV
+                # matches in Fix DD/DD-2 silently never match — caused ROST/UL same-day
+                # day-trade incident on 2026-05-22 that triggered PDT cascade.
+                right_letter = right.upper()[:1]
 
                 # --- Age check: try execution history first, fall back to DTE estimate ---
                 _, long_t0 = _avg_open_price(long_leg["conId"])
@@ -2878,7 +2986,14 @@ class DailyCycleManagementMixin:
                     exp_str = getattr(long_leg.get("contract"), "lastTradeDateOrContractMonth", "") or ""
                     try:
                         import csv as _csv_de
-                        for _de_d in range(0, 21):
+                        # Fix DD-2: also do a loose symbol+right-only search in last days_old days
+                        # to catch same-day-fill day-trade risk. IB sometimes returns exp as
+                        # "YYYYMM" (year+month only) from ib.positions() while the CSV stores
+                        # "YYYYMMDD" — the strict exp match would fail, t0 stays None, Fix CA
+                        # bypasses the age filter, and a same-morning TP triggers on a position
+                        # that only filled at market open (BUY fill + SELL fill = IB day trade).
+                        _de_loose_t0: datetime | None = None
+                        for _de_d in range(0, days_old + 1):  # last 2 days for loose search
                             _de_day = (now - timedelta(days=_de_d)).strftime("%y_%m_%d")
                             _de_path = fr"C:\OptionsHistory\{_de_day}\attempts_{_de_day}.csv"
                             if not os.path.exists(_de_path):
@@ -2888,8 +3003,30 @@ class DailyCycleManagementMixin:
                                     if (_de_row.get("symbol", "").upper() == sym.upper()
                                             and _de_row.get("action", "").lower().startswith("open_")
                                             and _de_row.get("status", "") == "placed"
-                                            and _de_row.get("right", "").upper() == right.upper()
-                                            and _de_row.get("exp", "") == exp_str
+                                            and _de_row.get("right", "").upper() == right_letter):  # Fix EF: was right.upper() ("CALL"/"PUT") vs CSV "C"/"P" — never matched
+                                        try:
+                                            _de_t0 = datetime.fromisoformat(_de_row["ts"])
+                                            if _de_loose_t0 is None or _de_t0 < _de_loose_t0:
+                                                _de_loose_t0 = _de_t0
+                                        except Exception:
+                                            pass
+                        for _de_d in range(0, 21):
+                            _de_day = (now - timedelta(days=_de_d)).strftime("%y_%m_%d")
+                            _de_path = fr"C:\OptionsHistory\{_de_day}\attempts_{_de_day}.csv"
+                            if not os.path.exists(_de_path):
+                                continue
+                            with open(_de_path, "r", newline="") as _de_f:
+                                for _de_row in _csv_de.DictReader(_de_f):
+                                    # Fix DD-2: match exp as prefix (handles "YYYYMM" vs "YYYYMMDD" mismatch)
+                                    _de_exp = _de_row.get("exp", "")
+                                    _de_exp_match = (_de_exp == exp_str or
+                                                     (len(_de_exp) >= 6 and len(exp_str) >= 6 and
+                                                      _de_exp[:6] == exp_str[:6]))
+                                    if (_de_row.get("symbol", "").upper() == sym.upper()
+                                            and _de_row.get("action", "").lower().startswith("open_")
+                                            and _de_row.get("status", "") == "placed"
+                                            and _de_row.get("right", "").upper() == right_letter  # Fix EF: was right.upper() ("CALL"/"PUT") vs CSV "C"/"P" — never matched
+                                            and _de_exp_match
                                             and abs(float(_de_row.get("longK") or 0) - long_leg["strike"]) < 0.01
                                             and abs(float(_de_row.get("shortK") or 0) - short_leg["strike"]) < 0.01):
                                         try:
@@ -2900,10 +3037,50 @@ class DailyCycleManagementMixin:
                                             pass
                             if t0 is not None:
                                 break  # found in this day's CSV; stop scanning
+                        def _next_trading_day(_d):
+                            """Return the next weekday (Mon-Fri) after date _d."""
+                            _nd = _d + timedelta(days=1)
+                            while _nd.weekday() >= 5:  # skip Sat(5)/Sun(6)
+                                _nd += timedelta(days=1)
+                            return _nd
+
+                        def _too_new_for_exit(_placement_t0, _label):
+                            """
+                            Block risk exit if the position's first FILL would be today.
+                            Inactive+DAY orders placed after-hours fill on the next trading day.
+                            If next_trading_day(placement_date) == today → fill and close both
+                            happen today → IB day trade. Block regardless of elapsed hours.
+                            (e.g. Friday 5PM placement → Monday fill → Monday close = day trade)
+                            """
+                            _pd = _placement_t0.date()
+                            _fill_date = _next_trading_day(_pd)
+                            _today = now.date()
+                            _hours = (now - _placement_t0).total_seconds() / 3600
+                            if _fill_date >= _today:
+                                LOG.info("Risk exits: %s %s %.0f/%.0f skipped — too new "
+                                         "(%.1fh old, fill_date=%s == today; %s)",
+                                         sym, right, strike_low, strike_high,
+                                         _hours, _fill_date, _label)
+                                return True
+                            return False
+
+                        # Fix DD-2: if strict match found nothing but loose match found a recent
+                        # open for this symbol+right within days_old days, treat as too new.
+                        if t0 is None and _de_loose_t0 is not None:
+                            _de_loose_hours = (now - _de_loose_t0).total_seconds() / 3600
+                            if _too_new_for_exit(_de_loose_t0, "loose CSV match"):
+                                return
+                            if (now - _de_loose_t0) < timedelta(days=days_old):
+                                LOG.info("Risk exits: %s %s %.0f/%.0f skipped — too new "
+                                         "(%.1fh < %dd from loose CSV match; exp format mismatch likely)",
+                                         sym, right, strike_low, strike_high, _de_loose_hours, days_old)
+                                return
                         if t0 is not None:
                             _de_hours = (now - t0).total_seconds() / 3600
                             LOG.info("Risk exits: %s %s %.0f/%.0f age from attempts CSV: %s (%.1fh old)",
                                      sym, right, strike_low, strike_high, t0.isoformat(), _de_hours)
+                            if _too_new_for_exit(t0, "strict CSV match"):
+                                return
                             if (now - t0) < timedelta(days=days_old):
                                 LOG.info("Risk exits: %s %s %.0f/%.0f skipped — too new "
                                          "(%.1fh < %dd from attempts CSV)",
@@ -3241,8 +3418,8 @@ class DailyCycleManagementMixin:
                     continue
                 leg1_ok = leg1_known and oi_values[0] >= MIN_OI_FOR_RTH
                 leg2_ok = leg2_known and oi_values[1] >= MIN_OI_FOR_RTH
-                if leg1_ok or leg2_ok:
-                    # at least one leg has confirmed-good OI — keep order
+                if leg1_ok and leg2_ok:
+                    # Fix EE: both legs must have confirmed-good OI to keep order
                     continue
                 # No leg confirmed good; at least one known-low or unknown (both unknown excluded above).
                 # Fix CZ: skip manual TWS orders (clientId=0) — API cannot cancel them.
@@ -3502,16 +3679,15 @@ class DailyCycleManagementMixin:
                     atm, oth = (min(k1, k2), max(k1, k2))
 
                 oi_atm, oi_oth, src = _find_csv_oi(sym, right, exp, atm, oth)
-                # Fix BR: skip only when ALL OI data is missing. When one leg is confirmed
-                # below threshold and none are confirmed above, cancel the order.
-                # e.g. oi_atm=22, oi_oth=None → cancel (22<100, nothing confirmed good).
+                # Fix EE: cancel if ANY known leg is below threshold.
+                # Only keep when BOTH legs are confirmed ≥ threshold.
                 if oi_atm is None and oi_oth is None:
                     # no CSV OI at all — do not cancel
                     continue
                 _leg1_ok_csv = oi_atm is not None and oi_atm >= threshold
                 _leg2_ok_csv = oi_oth is not None and oi_oth >= threshold
-                if _leg1_ok_csv or _leg2_ok_csv:
-                    # at least one leg has confirmed-good OI — keep order
+                if _leg1_ok_csv and _leg2_ok_csv:
+                    # Fix EE: both legs must have confirmed-good OI to keep order
                     continue
 
                 # No leg confirmed good; at least one known-low (or unknown with both excluded above).
@@ -3723,10 +3899,6 @@ class DailyCycleManagementMixin:
                 # 21-day call place a duplicate. Fix AJ1 removed this redundancy on Sundays; this extends to
                 # all days since the 21-day sweep is always a superset of the 7-day sweep.
                 self._after_hours_batch_placement()
-                try:
-                    self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
-                except Exception as e:
-                    LOG.warning("Diagnostic open-from-signal (after-hours) failed: %s", e)
             else:
                 LOG.info("Not yet in after-hours placement window at %s; skipping placement.", now)
             return
@@ -3874,6 +4046,9 @@ if __name__ == "__main__":
         _ch_argv = set(sys.argv[1:])
 
         if "--preclose" in _ch_argv:
+            if not r._is_trading_day():
+                LOG.info("--preclose: skipping — not a trading day (Fix EF)")
+                sys.exit(0)
             LOG.info("--preclose: running _pre_close_market_conversion() directly (no time guard)")
             r._pre_close_market_conversion()
             sys.exit(0)
@@ -3902,6 +4077,12 @@ if __name__ == "__main__":
             except Exception as _co_live_err:
                 LOG.warning("Risk exits retry: live OI cleanup failed (%s); proceeding", _co_live_err)
             r._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
+            sys.exit(0)
+
+        if "--place-opens" in _ch_argv:
+            LOG.info("--place-opens: placing OPEN orders from recent CSVs (today & yesterday, DTE>=20)")
+            r._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=2)
+            LOG.info("DailyCycleManagement runner completed.")
             sys.exit(0)
 
         # No specific flag: run the full time-aware daily cycle (PlaceOpen.cmd / scheduled tasks)
