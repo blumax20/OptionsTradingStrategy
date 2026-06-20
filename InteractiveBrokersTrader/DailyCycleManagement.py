@@ -4054,6 +4054,13 @@ if __name__ == "__main__":
             sys.exit(0)
 
         if "--place-skipped-opens" in _ch_argv:
+            # Fix EH: skip on weekends/holidays (Juneteenth 2026-06-19 case). Matches the
+            # existing Fix CM weekend guard in daily_trading_cycle() and the --preclose
+            # guard above. Without this, the 10:00 AM scheduled task fires on holidays
+            # and may launch LiquidityFilter subprocesses + IB connections needlessly.
+            if not r._is_trading_day():
+                LOG.info("--place-skipped-opens: skipping — not a trading day (Fix EH)")
+                sys.exit(0)
             LOG.info("--place-skipped-opens: retrying skipped OPEN orders from previous evening (Fix CP)")
             # Strike population and enrichment already done by 9:45 AM task (Fix CP-A via --risk-exits-only).
             # Removed Fix CP-B enrichment calls here to avoid spawning 4 LiquidityFilter subprocesses
@@ -4062,6 +4069,14 @@ if __name__ == "__main__":
             sys.exit(0)
 
         if "--risk-exits-only" in _ch_argv:
+            # Fix EH: skip on weekends/holidays. Without this, the 10:30 AM scheduled
+            # task ran on Sat 2026-06-20 and cancelled PBR via low_oi_both_legs based
+            # on stale CSV data (Friday Juneteenth → no listener CSV → OI lookup
+            # returned 0/0 < threshold 100 → spurious cancel of an Inactive+DAY order
+            # that would have filled at Monday open).
+            if not r._is_trading_day():
+                LOG.info("--risk-exits-only: skipping — not a trading day (Fix EH)")
+                sys.exit(0)
             LOG.info("--risk-exits-only: running risk exits retry (Fix Y6)")
             try:
                 r._enrich_today_and_prev_trading_day(only_rth=True)

@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** May 24, 2026 (Fix EF: PDT day-trade guard hardening — right-format CSV match + same-day close gate + async Error 201 detection)
+**Last Updated:** June 20, 2026 (Fix EH: trading-day guard on `--place-skipped-opens` and `--risk-exits-only`)
 
 ---
 
@@ -4716,6 +4716,56 @@ Existing Fix BS individual-leg paths (in `force_close_symbol_via_positions`) are
 - Does not affect the existing $25K equity floor — that's IB's rule and cannot be bypassed in code.
 - Does not protect against day trades initiated manually in TWS (system has no visibility ahead of time).
 - Does not check `DayTradesRemaining` from IB — that gate is moot below $25K (all opens blocked anyway) and unneeded above $25K (PDT accounts above the floor get unlimited day trades).
+
+---
+
+### Fix EH: Trading-Day Guard on `--place-skipped-opens` and `--risk-exits-only` (Jun 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (`__main__` CLI dispatch, ~lines 4056 and 4064)
+
+**Incident:** On Sat 2026-06-20 at 10:30 AM, `IB_RiskExits_Retry_1030` fired and cancelled PBR's JUL2026 17/18C spread with `cancel_open,placed,low_oi_both_legs,OI=0/0<thr(100)`. The cancel was wrong: PBR's actual OI on Thursday 6/18 was 2511/2108 (well above threshold). The `OI=0/0` reading came from the CSV walkback hitting an empty/missing row, because Friday 6/19 was Juneteenth (markets closed → listener didn't write a `combined_listener_spreads.csv`). The cancelled order was Inactive+DAY from Friday 5 PM evening — it would have activated and potentially filled at Monday's open.
+
+**Root cause:** Three of the four CLI dispatch paths in `__main__` (`--preclose`, `--place-skipped-opens`, `--risk-exits-only`) had inconsistent weekend/holiday gating:
+
+| CLI flag | Trading-day guard before Fix EH? |
+|----------|----------------------------------|
+| `daily_trading_cycle()` (no flags) | ✓ via Fix CM |
+| `--preclose` | ✓ via Fix CM extension |
+| `--place-skipped-opens` | ✗ |
+| `--risk-exits-only` | ✗ |
+
+`_is_trading_day()` correctly identifies both weekends AND US market holidays (including Juneteenth), but the two unguarded paths reached `_enrich_today_and_prev_trading_day`, `_cancel_low_oi_working_orders_from_csv`, `_rth_liquidity_cleanup`, and `_rth_risk_exits` unconditionally.
+
+**Fix:** Added the standard `_is_trading_day()` check at the top of both unguarded CLI handlers:
+```python
+if "--place-skipped-opens" in _ch_argv:
+    if not r._is_trading_day():
+        LOG.info("--place-skipped-opens: skipping — not a trading day (Fix EH)")
+        sys.exit(0)
+    ...
+
+if "--risk-exits-only" in _ch_argv:
+    if not r._is_trading_day():
+        LOG.info("--risk-exits-only: skipping — not a trading day (Fix EH)")
+        sys.exit(0)
+    ...
+```
+
+Identical pattern to the `--preclose` guard. Each path now exits immediately on weekends and US holidays without launching LiquidityFilter subprocesses or opening IB connections.
+
+**What this does NOT do:**
+- Does not add a market-data-freshness guard to `_cancel_low_oi_working_orders_from_csv` itself. When the cancel function runs and reads OI=0/0 from CSV, that may be a real signal (legitimately zero open interest) or stale data. The user chose to keep the existing behavior — a CSV-reported OI of 0 still triggers a cancel, since OI can genuinely be zero on illiquid strikes. The trade-off: avoiding the much rarer false-cancel due to missing listener CSV on a holiday is now handled at the higher level by not running the cancel job at all on non-trading days.
+- Does not address why Friday 2026-06-19 had no listener CSV (Juneteenth → markets closed → no signals → expected behavior).
+
+**Impact:**
+- Sat 6/20 PBR-type cancellations on weekends/holidays are eliminated.
+- The 10:00 AM `IB_PlaceSkippedOpens_1000` and 10:30 AM `IB_RiskExits_Retry_1030` scheduled tasks now exit cleanly on non-trading days with a single `Fix EH` log line, matching the existing 9:45 AM Fix CM pattern.
+- Inactive+DAY orders placed Friday evening that would activate Monday morning are no longer at risk of weekend cancellation by these tasks.
+
+**Verification:**
+- Next Saturday/Sunday/holiday morning: `ib_cycle.log` should show `Fix EH: skipping — not a trading day` for both 10:00 and 10:30 tasks instead of the full enrichment + cancel cycle.
+- Weekday behavior unchanged: tasks fire normally Mon-Fri.
 
 ---
 
