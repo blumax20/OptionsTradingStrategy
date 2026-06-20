@@ -12,7 +12,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_PORT = 7497
 #   Live trading  : $IB_PORT = 7496
-$IB_PORT = 7496
+$IB_PORT = 7497
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
@@ -29,6 +29,22 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 "==== IB HEALTH CHECK $($Now) ===="        | Tee-Object -FilePath $Report
 "public host: $PublicHost"                 | Tee-Object -FilePath $Report -Append
 " "                                        | Tee-Object -FilePath $Report -Append
+
+# --- Fix EI: SYSTEM STATE banner ---
+# Surfaces the system_stopped.txt sentinel flag at the top of every health report
+# so it's obvious when reviewing the daily output that the system is intentionally
+# stopped (watchdog and scheduled tasks honor the flag and skip their work).
+$StoppedFlag = "C:\OptionsHistory\logs\system_stopped.txt"
+if (Test-Path $StoppedFlag) {
+  $stoppedItem = Get-Item $StoppedFlag -ErrorAction SilentlyContinue
+  $stoppedSince = if ($stoppedItem) { $stoppedItem.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "unknown" }
+  $stoppedAge   = if ($stoppedItem) { [int]((Get-Date) - $stoppedItem.LastWriteTime).TotalMinutes } else { 0 }
+  "**********************************************************************" | Tee-Object -FilePath $Report -Append
+  "*  SYSTEM STOPPED via PushButton (since $stoppedSince, $stoppedAge min ago)  *" | Tee-Object -FilePath $Report -Append
+  "*  Watchdog and scheduled tasks are SKIPPING -- run PushButton menu 2 to resume.  *" | Tee-Object -FilePath $Report -Append
+  "**********************************************************************" | Tee-Object -FilePath $Report -Append
+  " " | Tee-Object -FilePath $Report -Append
+}
 
 
 function Get-TaskPrimaryFile([string]$action) {

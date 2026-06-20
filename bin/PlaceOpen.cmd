@@ -6,6 +6,12 @@ set "LOG=C:\OptionsHistory\logs\ib_cycle.log"
 if not exist "C:\OptionsHistory\logs" mkdir "C:\OptionsHistory\logs"
 >>"%LOG%" echo ==== [Place_Open %DATE% %TIME%] ====
 
+REM --- Fix EI: skip if system stopped via PushButton ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [PlaceOpen] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  endlocal ^& exit /b 0
+)
+
 REM --- Step 0: run DCM first (time-aware: at 17:00 it enforces closes + from-signal) ---
 >>"%LOG%" echo [PlaceOpen] calling DailyCycleManagement.py (time-aware after-hours pipeline)...
 cd /d "C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader"

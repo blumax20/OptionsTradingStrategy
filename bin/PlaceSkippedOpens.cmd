@@ -6,6 +6,12 @@ set "LOG=C:\OptionsHistory\logs\ib_cycle.log"
 if not exist "C:\OptionsHistory\logs" mkdir "C:\OptionsHistory\logs"
 >>"%LOG%" echo ==== [PlaceSkippedOpens %DATE% %TIME%] ====
 
+REM --- Fix EI: skip if system stopped via PushButton ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [PlaceSkippedOpens] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  endlocal ^& exit /b 0
+)
+
 REM Retry OPEN orders skipped last evening (no_viable_limit_or_conditions) at 10:00 AM
 REM after the 9:45 AM CSV enrichment has populated live prices (Fix CP)
 >>"%LOG%" echo [PlaceSkippedOpens] calling DailyCycleManagement.py --place-skipped-opens ...

@@ -11,6 +11,24 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# --- Fix EI: Write the sentinel FIRST, before stopping anything ---
+# If we wait until after services are stopped, there is a race window where the
+# watchdog (15-min cycle) or a scheduled .cmd task can see services down and call
+# BounceServices.cmd, restoring everything before the flag is written. By writing
+# the flag first, those guards skip their work for the entire duration of the stop.
+$StoppedFlag = "C:\OptionsHistory\logs\system_stopped.txt"
+try {
+  if (-not (Test-Path "C:\OptionsHistory\logs")) {
+    New-Item -ItemType Directory -Force -Path "C:\OptionsHistory\logs" | Out-Null
+  }
+  $stopTs = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "stopped_at=$stopTs" | Set-Content -Path $StoppedFlag -Encoding ASCII -Force
+  Write-Host "[STOP] Sentinel flag written FIRST: $StoppedFlag (watchdog and scheduled tasks will skip during shutdown)"
+} catch {
+  Write-Warning "Failed to write sentinel flag $StoppedFlag : $($_.Exception.Message)"
+  Write-Warning "Watchdog may attempt to restart services during this stop!"
+}
+
 $Root    = "C:\Users\Administrator\code\OptionsTradingStrategy"
 $Runtime = Join-Path $Root "runtime"
 $Names   = @("listener","DailyCycleManagement","PlaceAnOrder")
@@ -211,6 +229,15 @@ if ($CloudflareSvc -and $CloudflareSvc.Status -eq 'Running') {
   Stop-ServiceSafe -Name $CloudflareSvc.Name -Display "Cloudflare Tunnel"
 } else {
   Write-Host "Cloudflare Tunnel service already Stopped or not found — ok."
+}
+
+# Fix EI: Sentinel flag was written at the TOP of this script (before stopping anything)
+# to prevent a race with the watchdog. If you re-test, the flag is already in place
+# and watchdog/scheduled-task guards have already been active for the full stop duration.
+if (Test-Path $StoppedFlag) {
+  Write-Host "[OK] Sentinel flag confirmed in place: $StoppedFlag -- system will stay stopped until PushButtonStart runs."
+} else {
+  Write-Warning "[WARN] Sentinel flag NOT in place at end of stop -- watchdog may restart things."
 }
 
 Write-Host "🧹 All requested components stopped (if they were running)."

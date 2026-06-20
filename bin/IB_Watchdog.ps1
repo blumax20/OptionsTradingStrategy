@@ -41,13 +41,14 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_GW_PORT = 7497
 #   Live trading  : $IB_GW_PORT = 7496
-$IB_GW_PORT = 7496
+$IB_GW_PORT = 7497
 
 $LogDir = "C:\OptionsHistory\logs"
 $Log    = Join-Path $LogDir "watchdog.log"
 $CooldownFile  = Join-Path $LogDir "watchdog_last_restart.txt"
 $PrewarmFlag   = Join-Path $LogDir "watchdog_prewarm_needed.txt"  # Fix DM
 $PrewarmCmd    = "C:\OptionsHistory\bin\PrewarmConnections.cmd"   # Fix DM
+$StoppedFlag   = Join-Path $LogDir "system_stopped.txt"           # Fix EI
 $CooldownMinutes = 10
 $HealthUrl = "http://127.0.0.1:5001/health"
 
@@ -56,6 +57,16 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Forc
 function Write-Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$ts] $msg" | Out-File -Append -FilePath $Log -Encoding ASCII
+}
+
+# ===== Fix EI: Sentinel flag — system intentionally stopped via PushButton =====
+# When PushButtonStop.ps1 creates this flag, the user has chosen to stop the system.
+# Watchdog should NOT restart any services until PushButtonStart.ps1 deletes the flag.
+# Note: Health.ps1 still runs (read-only diagnostics); the flag age is surfaced there.
+if (Test-Path $StoppedFlag) {
+    $stoppedAge = [int]((Get-Date) - (Get-Item $StoppedFlag).LastWriteTime).TotalMinutes
+    Write-Log "STOPPED: system_stopped.txt present (age=${stoppedAge}min) -- skipping all restart logic until PushButtonStart clears the flag"
+    exit 0
 }
 
 $needFullRestart   = $false

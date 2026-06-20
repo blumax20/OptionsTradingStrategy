@@ -15,6 +15,12 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 call :ts
 >>"%LOG%" echo ==== [RestartListener %TS%] ====
 
+rem --- Fix EI: skip if system stopped via PushButton ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [RestartListener] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  exit /b 0
+)
+
 rem ----- verify service exists -----
 sc query "%SVC%" >nul 2>&1
 if errorlevel 1 (

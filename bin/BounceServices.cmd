@@ -5,6 +5,12 @@ set "LOG=C:\OptionsHistory\logs\ib_cycle.log"
 if not exist "C:\OptionsHistory\logs" mkdir "C:\OptionsHistory\logs"
 >>"%LOG%" echo ==== [BounceServices %DATE% %TIME%] ====
 
+REM --- Fix EI: skip if system stopped via PushButton (defense in depth — watchdog also checks) ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [BounceServices] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  endlocal ^& exit /b 0
+)
+
 "C:\Program Files\nssm-2.24\win64\nssm.exe" stop "IBGateway" >>"%LOG%" 2>&1
 timeout /t 5 >nul
 powershell -Command "7497,7496 | ForEach-Object { $p=$_; Get-NetTCPConnection -LocalPort $p -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { try { Stop-Process -Id $_ -Force } catch {} } }" >>"%LOG%" 2>&1

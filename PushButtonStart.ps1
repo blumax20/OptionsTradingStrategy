@@ -17,6 +17,21 @@ $ErrorActionPreference = "Stop"
 $script:ExitCode = 0
 try {
     # (everything that already exists in your script goes here)
+
+# --- Fix EI: Clear system-stopped sentinel flag FIRST ---
+# PushButtonStop creates C:\OptionsHistory\logs\system_stopped.txt; the watchdog and
+# all scheduled-task .cmd launchers skip their work while it exists. Delete it before
+# any service start so they resume normally on the next cycle.
+$StoppedFlag = "C:\OptionsHistory\logs\system_stopped.txt"
+if (Test-Path $StoppedFlag) {
+    try {
+        Remove-Item $StoppedFlag -Force -ErrorAction Stop
+        Write-Host "[START] Cleared sentinel flag $StoppedFlag -- watchdog and scheduled tasks will resume."
+    } catch {
+        Write-Warning "Failed to clear sentinel flag $StoppedFlag : $($_.Exception.Message)"
+    }
+}
+
 # --- Paths ---
 $Root = "C:\Users\Administrator\code\OptionsTradingStrategy"
 $Py   = Join-Path $Root ".venv\Scripts\python.exe"

@@ -6,6 +6,12 @@ set "LOG=C:\OptionsHistory\logs\ib_cycle.log"
 if not exist "C:\OptionsHistory\logs" mkdir "C:\OptionsHistory\logs"
 >>"%LOG%" echo ==== [OptionsListener START %DATE% %TIME%] ====
 
+rem --- Fix EI: skip if system stopped via PushButton ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [StartListener] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  endlocal ^& exit /b 0
+)
+
 rem Fast-path: if service RUNNING and :5001 is LISTENING, bail out
 sc query OptionsListener | find "RUNNING" >nul
 if %ERRORLEVEL% EQU 0 (

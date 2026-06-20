@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** June 20, 2026 (Fix EH: trading-day guard on `--place-skipped-opens` and `--risk-exits-only`)
+**Last Updated:** June 20, 2026 (Fix EI: `system_stopped.txt` sentinel — PushButton Stop now actually keeps the system stopped)
 
 ---
 
@@ -4766,6 +4766,70 @@ Identical pattern to the `--preclose` guard. Each path now exits immediately on 
 **Verification:**
 - Next Saturday/Sunday/holiday morning: `ib_cycle.log` should show `Fix EH: skipping — not a trading day` for both 10:00 and 10:30 tasks instead of the full enrichment + cancel cycle.
 - Weekday behavior unchanged: tasks fire normally Mon-Fri.
+
+---
+
+### Fix EI: `system_stopped.txt` Sentinel — PushButton Stop Actually Stops the System (Jun 20)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\logs\system_stopped.txt` (the sentinel itself); `PushButtonStop.ps1` (creates it); `PushButtonStart.ps1` (deletes it); `C:\OptionsHistory\bin\IB_Watchdog.ps1` (honors it); 7 .cmd launchers in `C:\OptionsHistory\bin\` (honor it); `Health.ps1` (surfaces it).
+
+**Issue:** Invoking PushButtonMenu option 3 (Stop trading system) successfully stopped IBGateway, OptionsListener, CloudflareTunnel, and Python processes — but within 15 minutes everything came back up. Two restart paths defeated the stop:
+
+1. **`IB_Watchdog_Every15Min`** ran every 15 min (6:07 AM–8:07 PM). It saw IBGateway port 7497 down and `/health` failing, so it called `BounceServices.cmd` which restarted all three services.
+2. **Weekday scheduled tasks** ran trading code regardless of intentional stop state:
+   - `IB_PreMarket_StartListener` 6:00 AM
+   - `IB_Open_PlaceMissing_0945` 9:45 AM
+   - `IB_PlaceSkippedOpens_1000` 10:00 AM
+   - `IB_RiskExits_Retry_1030` 10:30 AM
+   - `IB_ForceClose_MarketOrders_1500` 3:00 PM
+   - `IB_PreClose_RestartListener_1530` 3:30 PM
+   - `IB_AfterHours_PlaceFromWebhook_1700` 5:00 PM
+
+**Fix:** Single-flag sentinel pattern using the existing watchdog flag-file convention (cf. `watchdog_prewarm_needed.txt` from Fix DM).
+
+**Sentinel file:** `C:\OptionsHistory\logs\system_stopped.txt`
+- Contents: `stopped_at=YYYY-MM-DD HH:MM:SS` (single line, ASCII, auditable).
+- **Created** by `PushButtonStop.ps1` as the **first** action — *before* stopping any service. Critical: if the flag were written at the end (the original design, tested Jun 20 and found racy), there is a ~10-second window where the watchdog can see services down, call `BounceServices.cmd`, and restore everything before the flag exists. Writing the flag first means the watchdog and all guards skip their work for the entire duration of the stop.
+- **Deleted** by `PushButtonStart.ps1` as the **first** action before any service start — safe `Remove-Item -Force -ErrorAction SilentlyContinue` so missing flag is a no-op.
+
+**Honored by:**
+1. `IB_Watchdog.ps1` — checks at top right after the `Write-Log` function definition. If present: log `STOPPED: system_stopped.txt present (age=Xmin) -- skipping all restart logic` and `exit 0` before any port/health checks. Runs cleanly without restart attempts on every 15-min cycle while stopped.
+2. All 7 `.cmd` launchers — single 4-line guard near the top of each:
+   ```cmd
+   if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+     >>"%LOG%" echo [<ScriptName>] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+     endlocal ^& exit /b 0
+   )
+   ```
+   Applied to: `PlaceOpen.cmd`, `PlaceSkippedOpens.cmd`, `RiskExitsRetry.cmd`, `ForceMktClose.cmd`, `RestartListener.cmd`, `StartListener.cmd`, `BounceServices.cmd` (the last as defense in depth in case anything other than the watchdog invokes it).
+
+**Honored as informational only (intentional):**
+- `Health.ps1` continues to run on its own schedule (8:30 AM, 12:00 PM, 5:15 PM). Read-only diagnostics — you should still be able to see the system state. Added a prominent banner at the top of the report when the flag exists:
+  ```
+  **********************************************************************
+  *  SYSTEM STOPPED via PushButton (since 2026-06-20 09:00:00, 14 min ago)  *
+  *  Watchdog and scheduled tasks are SKIPPING -- run PushButton menu 2 to resume.  *
+  **********************************************************************
+  ```
+
+**Lifecycle: persistent until Start (no auto-expiry).** The flag stays in place indefinitely until you explicitly invoke menu option 2 (Start). No time-based cleanup; watchdog logs every 15 min so the duration is visible in `watchdog.log`, and the Health banner shows it on every daily report.
+
+**Safety:**
+- Race condition between Stop and an in-flight scheduled task: the current task completes; the next invocation 15 min later (or the next morning) sees the flag and skips.
+- Health.ps1's own scheduled task `IB_DailyHealth_0830` / `IB_Midday_Health_1200` / `IB_EndOfDay_Health_1715` are deliberately NOT guarded — they're read-only and surface the stopped state.
+
+**What this does NOT do:**
+- Does not affect the IB account itself — no orders cancelled, no positions touched.
+- Does not affect 2FA / IBGateway authentication. Restart after Start still goes through the normal login flow.
+- Does not auto-expire. If you forget to invoke Start, the system stays stopped indefinitely. Health reports surface this every cycle.
+
+**Verification:**
+1. Invoke menu option 3 (Stop). Verify `C:\OptionsHistory\logs\system_stopped.txt` exists with current timestamp; all three services Stopped.
+2. Wait one watchdog cycle (≤15 min). `watchdog.log` should show `STOPPED: system_stopped.txt present (age=Xmin) -- skipping all restart logic`. No `RESTART`/`BOUNCE`/`OK` entries follow. Services still Stopped.
+3. Wait until a scheduled trading task fires. `ib_cycle.log` shows `SKIPPED: system_stopped.txt present -- system stopped via PushButton`. No DCM.py runtime activity.
+4. Invoke menu option 2 (Start). Verify sentinel deleted as first action; services start; next watchdog cycle logs `OK`.
+5. Run Health.ps1 while stopped: report shows the SYSTEM STOPPED banner with the stop timestamp and age.
 
 ---
 

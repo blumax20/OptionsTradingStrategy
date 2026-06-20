@@ -184,6 +184,14 @@ def _collect_secdef(ib: IB, symbol: str, con_id: int, max_retries: int = 3) -> t
         multipliers: list[str] = []
 
         for p in params:
+            # Fix EA diagnostic: log p structure to understand IB's per-expiry strike grouping
+            logger.debug("[SECDEF] %s: tradingClass=%s expirations_count=%d strikes_count=%d first_exp=%s last_exp=%s",
+                         symbol,
+                         getattr(p, 'tradingClass', '?'),
+                         len(getattr(p, 'expirations', None) or []),
+                         len(getattr(p, 'strikes', None) or []),
+                         (getattr(p, 'expirations', None) or ['?'])[0],
+                         (getattr(p, 'expirations', None) or ['?'])[-1])
             if getattr(p, 'expirations', None):
                 expirations.extend(p.expirations)
             if getattr(p, 'strikes', None):
@@ -971,6 +979,32 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             otm_strike = atm_strike + 1  # placeholder for width; real quote-based widths below may adjust
         else:
             atm_strike = _closest_existing(strikes_all, current_price)
+            # Fix EB: validate ATM against the chosen expiry before picking OTM.
+            # The pooled strikes_all includes strikes from near-term expirations that
+            # don't exist in the chosen expiry (e.g. WBD 27.5C exists for Apr17 weekly
+            # but NOT for Apr24 monthly). If the pooled ATM fails to qualify, snap to
+            # the next valid strike so otm_strike is set correctly from the corrected ATM.
+            try:
+                _qualify_with_fallback(ib, symbol, expiry_str, atm_strike, 'C', preferred_tc, multiplier)
+            except Exception:
+                _eb_above = _nearest_valid_strike(strikes_all, atm_strike, prefer="above")
+                _eb_below = _nearest_valid_strike(strikes_all, atm_strike, prefer="below")
+                _eb_corrected = False
+                for _eb_cand in [_eb_above, _eb_below]:
+                    if _eb_cand is None:
+                        continue
+                    try:
+                        _qualify_with_fallback(ib, symbol, expiry_str, _eb_cand, 'C', preferred_tc, multiplier)
+                        logger.info("[%s] Fix EB: ATM %.1f not valid for %s — corrected to %.1f",
+                                    symbol, atm_strike, expiry_str, _eb_cand)
+                        atm_strike = _eb_cand
+                        _eb_corrected = True
+                        break
+                    except Exception:
+                        continue
+                if not _eb_corrected:
+                    logger.warning("[%s] Fix EB: ATM %.1f not valid for %s and no nearby strike qualifies",
+                                   symbol, atm_strike, expiry_str)
             otm_strike = _next_higher_existing(strikes_all, atm_strike)
 
         # Qualify and request option mkt data for both call legs (ATM long, OTM short)

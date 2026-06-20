@@ -6,6 +6,12 @@ set "LOG=C:\OptionsHistory\logs\ib_cycle.log"
 if not exist "C:\OptionsHistory\logs" mkdir "C:\OptionsHistory\logs"
 >>"%LOG%" echo ==== [RiskExitsRetry %DATE% %TIME%] ====
 
+REM --- Fix EI: skip if system stopped via PushButton ---
+if exist "C:\OptionsHistory\logs\system_stopped.txt" (
+  >>"%LOG%" echo [RiskExitsRetry] SKIPPED: system_stopped.txt present -- system stopped via PushButton
+  endlocal ^& exit /b 0
+)
+
 REM Run 10:30 AM risk exits retry (second attempt after 9:35 AM open)
 >>"%LOG%" echo [RiskExitsRetry] calling DailyCycleManagement.py --risk-exits-only ...
 cd /d "C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader"

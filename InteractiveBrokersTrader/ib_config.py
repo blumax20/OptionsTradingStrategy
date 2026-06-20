@@ -10,4 +10,4 @@
 #   C:\IBC\config.ini                      (TradingMode, ApiPort, OverrideTwsApiPort)
 # Then restarts IBGateway so IBC auto-logs in to the new account.
 IB_HOST: str = "127.0.0.1"
-IB_PORT: int = 7496  # Paper trading (change to 7496 for live)
+IB_PORT: int = 7497  # Paper trading (change to 7496 for live)
