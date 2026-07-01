@@ -1040,7 +1040,10 @@ class DailyCycleManagementMixin:
             # Fix AB7: Filter pick list to only symbols with held option positions.
             # Without this, all ~60 CLOSE signals from 21 days get processed through
             # 3 stages even when only ~4 have actual positions.
+            # Fix EJ-b: Also collect held STK symbols in the same scan so we can
+            # flatten assigned-stock residuals BEFORE the OPT filter drops them.
             held_option_syms: set[str] = set()
+            held_stock_syms: set[str] = set()
             try:
                 from ib_insync import IB as _IB_pos
                 _ib_pos = _IB_pos()
@@ -1052,6 +1055,12 @@ class DailyCycleManagementMixin:
                             sym = (getattr(c, "symbol", "") or "").upper()
                             if sym:
                                 held_option_syms.add(sym)
+                        elif c and getattr(c, "secType", "") == "STK":
+                            # Fix EJ-b: STK residual capture (only if non-zero qty)
+                            sym = (getattr(c, "symbol", "") or "").upper()
+                            qty = float(getattr(p, "position", 0.0) or 0.0)
+                            if sym and abs(qty) > 0:
+                                held_stock_syms.add(sym)
                 finally:
                     try:
                         _ib_pos.disconnect()
@@ -1059,6 +1068,31 @@ class DailyCycleManagementMixin:
                         pass
             except Exception as e:
                 LOG.warning("Close-delegate: position scan failed (%s); proceeding unfiltered.", e)
+
+            # Fix EJ-b: STK-flatten pass BEFORE the OPT filter drops STK-only symbols.
+            # When an option leg is assigned/exercised, the OPT position goes to 0 and 100
+            # shares of STK remain as residual. Fix AB7's OPT-only filter (below) drops
+            # those symbols from `pick`, so the existing flatten-stock-on-CLOSE code at
+            # lines ~716 and ~1181 never fires. Handle them here first.
+            # Gate: symbol has a held STK position AND its latest signal (per
+            # `_latest_signal_is_close`) is CLOSE — matches the existing flatten semantic.
+            for _stk_sym in list(pick):
+                if _stk_sym not in held_stock_syms:
+                    continue
+                try:
+                    if not self._latest_signal_is_close(_stk_sym, days):
+                        continue
+                    if self._flatten_stock_if_present(_stk_sym):
+                        try:
+                            self._attempt(symbol=_stk_sym, action="close_stock", status="submitted",
+                                          reason=f"stk_flatten_no_opt_within_{days}d",
+                                          source="dcm-close")
+                        except Exception:
+                            pass
+                        LOG.info("Fix EJ-b: flattened %s STK residual (CLOSE signal in %dd window, no matching OPT held)",
+                                 _stk_sym, days)
+                except Exception as _ej_err:
+                    LOG.warning("Fix EJ-b: STK-flatten for %s failed: %s", _stk_sym, _ej_err)
 
             if held_option_syms:
                 before = len(pick)
@@ -3825,6 +3859,19 @@ class DailyCycleManagementMixin:
                 self._diagnostic_open_from_signal(method="join", min_limit=0.05, bump_to_min=True)
             except Exception as e:
                 LOG.warning("Diagnostic open-from-signal step skipped due to error: %s", e)
+
+        # Fix EJ-a: Sunday weekly maintenance runs even though Fix CM otherwise skips
+        # non-trading days. Restores the 21-day CSV CLOSE sweep at line ~2290 (inside
+        # _after_hours_batch_placement) that has been unreachable since Fix CM (Mar 15).
+        # Only runs on Sunday during/after the after-hours placement window.
+        # is_after_hours_placement is day-agnostic (checks time only), so we gate on Sunday here.
+        if now.weekday() == 6 and self.is_after_hours_placement(now):
+            LOG.info("Fix EJ-a: Sunday weekly maintenance window (%s); running after-hours batch to restore 21-day CLOSE sweep.", now)
+            try:
+                self._after_hours_batch_placement()
+            except Exception as e:
+                LOG.warning("Fix EJ-a: Sunday weekly maintenance failed: %s", e)
+            return
 
         # Cycle A: Pre-close sweep (convert lingering CLOSE limits to market)
         if self.is_pre_close_window(now):

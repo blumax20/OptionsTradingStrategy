@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** June 20, 2026 (Fix EI: `system_stopped.txt` sentinel — PushButton Stop now actually keeps the system stopped)
+**Last Updated:** June 30, 2026 (Fix EJ: restore Sunday weekly CLOSE sweep + STK-flatten pass for assignment residuals)
 
 ---
 
@@ -4830,6 +4830,83 @@ Identical pattern to the `--preclose` guard. Each path now exits immediately on 
 3. Wait until a scheduled trading task fires. `ib_cycle.log` shows `SKIPPED: system_stopped.txt present -- system stopped via PushButton`. No DCM.py runtime activity.
 4. Invoke menu option 2 (Start). Verify sentinel deleted as first action; services start; next watchdog cycle logs `OK`.
 5. Run Health.ps1 while stopped: report shows the SYSTEM STOPPED banner with the stop timestamp and age.
+
+---
+
+### Fix EJ: Restore Sunday Weekly CLOSE Sweep + STK-Flatten Pass for Assignment Residuals (Jun 30)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — `daily_trading_cycle()` at ~line 3830 (EJ-a); `_delegate_close_from_csvs_within()` at ~line 1043-1095 (EJ-b).
+
+**Incident:** User has 100-share STK positions in PBR, NI, FE — assignment/exercise residuals from prior debit spreads. Explicit CLOSE signals arrived in the listener CSV: PBR 2026-06-17, FE 2026-06-24, NI 2026-06-26 (all `signal_type=CLOSE`, `strategy_position=0`). None of the three were flattened. No `close_stock` entries appear in June attempts CSVs.
+
+**Root causes — two stacked bugs:**
+
+#### EJ-1: Fix CM (Mar 15) made the Sunday weekly CLOSE sweep unreachable
+
+The Sunday-only 21-day CLOSE sweep lives at line ~2290 inside `_after_hours_batch_placement()`:
+```python
+if ny_today.weekday() == 6:  # Sunday
+    self._delegate_close_from_csvs_within(days=21)
+```
+This is only reached from the `is_after_market_close` branch of `daily_trading_cycle()`. But Fix CM (Mar 15) changed `is_after_market_close()` to return `False` on any non-trading day (weekends and US holidays). `_is_trading_day(Sunday)` = False → branch never runs on Sunday. Falls through to the `else` branch which also has a Fix CM guard and returns immediately.
+
+Confirmed in `ib_cycle.log` at `2026-06-28 17:00:01`:
+```
+DailyCycleManagement runner starting (analysis enabled; normal session logic)...
+Fix CM: weekend/holiday — skipping reconcile lookback at 2026-06-28 17:00:01
+DailyCycleManagement runner completed.
+```
+
+The Sunday sweep code has been unreachable dead code since March 15 (~3.5 months as of Jun 30).
+
+#### EJ-2: Fix AB7's OPT-only filter drops STK-only symbols from `pick`
+
+Even if the sweep ran, `_delegate_close_from_csvs_within` filters `pick` to symbols with held OPT positions (Fix AB7, lines 1043-1069). Once assignment/exercise clears the OPT position to 0, the symbol drops from `held_option_syms` and is filtered out of `pick`. The two existing flatten-stock call sites at lines ~716 and ~1181 both live inside the pick-processing loop, so neither fires for STK-only residuals.
+
+The same OPT-only filter pattern exists in `_reconcile_positions_with_signals_lookback` at line 2472 (`if getattr(c, 'secType', '') != 'OPT': continue`), so the weekday reconcile path can't reach an STK-only symbol either.
+
+**Fix — two changes in one commit:**
+
+**EJ-a** (`daily_trading_cycle`, ~line 3830): Sunday-specific bypass of Fix CM. Runs `_after_hours_batch_placement()` on Sundays during the after-hours window, restoring access to line 2290's 21-day sweep:
+```python
+if now.weekday() == 6 and self.is_after_hours_placement(now):
+    LOG.info("Fix EJ-a: Sunday weekly maintenance window (%s); running after-hours batch to restore 21-day CLOSE sweep.", now)
+    try:
+        self._after_hours_batch_placement()
+    except Exception as e:
+        LOG.warning("Fix EJ-a: Sunday weekly maintenance failed: %s", e)
+    return
+```
+Placed before all other branches. Weekday flow unchanged.
+
+**EJ-b** (`_delegate_close_from_csvs_within`, ~line 1043-1095): Extend the position scan to also collect STK symbols with non-zero qty (`held_stock_syms`). After the scan, iterate `pick` and flatten any STK residual whose `_latest_signal_is_close(sym, days)` is True — BEFORE the Fix AB7 OPT filter drops it. Reuses `_flatten_stock_if_present()` at line 1924 unchanged.
+
+Gate design (confirmed with user Jun 30): uses the existing `_latest_signal_is_close` semantic. If the latest signal for the symbol in the 21-day window is CLOSE, flatten. If a later OPEN signal supersedes the CLOSE, no flatten (symbol is still in a "re-open" phase per the strategy). This means Fix EJ does NOT retroactively clear residuals whose CLOSE has already been superseded by a later OPEN — the user manually flattened PBR/NI/FE in TWS.
+
+**Attempts CSV row when EJ-b fires:**
+```
+<ts>,SYM,close_stock,submitted,stk_flatten_no_opt_within_21d,,,,,,,,,,,,dcm-close,<uid>
+```
+
+**Log line when EJ-b fires:**
+```
+Fix EJ-b: flattened SYM STK residual (CLOSE signal in 21d window, no matching OPT held)
+flatten-stock: submitted SYM SELL x100 via MKT (weekly/reconcile path)
+```
+
+**What Fix EJ catches going forward:**
+- Assignment residuals cleared inside the narrow window between a CLOSE signal and any subsequent OPEN signal for the same symbol.
+- Sunday sweep runs weekly (had been silently dead for 3.5 months).
+
+**What Fix EJ does NOT catch:**
+- Assignment residuals whose CLOSE signal is already followed by an OPEN signal in the 21-day window (per user preference — preserves existing `_latest_signal_is_close` semantic). User manually flattens in TWS in that case.
+- STK positions that were never associated with a CLOSE signal (e.g., manually acquired holdings, though the user confirmed all STK residuals for traded symbols come from assignment).
+
+**Verification:**
+- Next Sunday: `ib_cycle.log` shows `Fix EJ-a: Sunday weekly maintenance window; running after-hours batch to restore 21-day CLOSE sweep.` followed by the standard `Close-delegate:` filtering log. Previously would have shown `Fix CM: weekend/holiday — skipping reconcile lookback` and nothing else.
+- Any future assignment where the strategy sends CLOSE and does NOT re-open before the next 5 PM cycle: expect `close_stock,submitted,stk_flatten_no_opt_within_21d` in attempts CSV.
+- Weekday behavior unchanged (EJ-a Sunday-only, EJ-b runs only when `_delegate_close_from_csvs_within` runs which is Sunday-only per line 2290).
 
 ---
 
