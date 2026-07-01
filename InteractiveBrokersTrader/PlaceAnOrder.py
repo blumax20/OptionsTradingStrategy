@@ -85,6 +85,10 @@ def _tag_after_hours_limit(order):
       - outsideRth=True is set for all after-hours orders so IB accepts them.
     """
     try:
+        # Fix EK-b: --rth-only overrides the after-hours logic; caller wants DAY-only
+        # regardless of clock (used by 10:30 low-OI retry so orders don't survive overnight).
+        if _RTH_ONLY:
+            return
         try:
             now_ny = datetime.now(ZoneInfo("America/New_York"))
         except Exception:
@@ -412,6 +416,11 @@ ATTEMPT_FIELDS = [
 # Fix Z5: Module-level close reason, set from --close-reason CLI arg
 _CLOSE_REASON: str | None = None
 
+# Fix EK-b: Module-level RTH-only flag, set from --rth-only CLI arg.
+# When True, BAG orders skip outsideRth=True so IB cancels them at 16:00 if unfilled
+# (prevents Inactive+DAY carry-over into next trading day for 10:30 low-OI retries).
+_RTH_ONLY: bool = False
+
 def record_attempt(symbol: str, action: str, status: str, reason: str, **fields):
     """
     Accumulate a row for this run and also emit a HEALTH_EVT line.
@@ -523,6 +532,8 @@ def parse_args():
                    help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
     p.add_argument("--allow-prev-day-opens", action="store_true", default=False,
                    help="Fix CQ: use --date CSV date instead of today for the same-day OPEN signal filter (10 AM skipped-opens retry only).")
+    p.add_argument("--rth-only", action="store_true", default=False,
+                   help="Fix EK-b: skip outsideRth=True on BAG orders so the order is DAY-only during RTH (IB cancels at 16:00 if unfilled).")
     p.add_argument("--live-timeout", type=float, default=3.0,
                    help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
     p.add_argument("--close-reason", type=str, default=None,
@@ -1199,7 +1210,8 @@ def place_debit_spread(
                     order.tif = "DAY"
                 except Exception:
                     pass
-                order.outsideRth = True  # Fix AB5: accept order outside RTH
+                if not _RTH_ONLY:  # Fix EK-b: skip outsideRth for --rth-only DAY-only orders
+                    order.outsideRth = True  # Fix AB5: accept order outside RTH
                 trade = ib.placeOrder(combo, order)
                 actual_order_type = "MKT"
                 actual_limit = None
@@ -1223,7 +1235,8 @@ def place_debit_spread(
                         order.tif = "DAY"
                     except Exception:
                         pass
-                    order.outsideRth = True  # Fix AB5: accept order outside RTH
+                    if not _RTH_ONLY:  # Fix EK-b: skip outsideRth for --rth-only DAY-only orders
+                        order.outsideRth = True  # Fix AB5: accept order outside RTH
                     trade = ib.placeOrder(combo, order)
                     actual_order_type = "MKT"
                     actual_limit = None
@@ -3166,10 +3179,13 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     return submitted
 
 def run_from_csv():
-    global _CLOSE_REASON
+    global _CLOSE_REASON, _RTH_ONLY
     args = parse_args()
     # Fix Z5: Set module-level close reason so all record_attempt calls include it
     _CLOSE_REASON = getattr(args, "close_reason", None)
+    # Fix EK-b: propagate --rth-only to module-level flag consumed by _tag_after_hours_limit
+    # and by the MKT paths in place_debit_spread that would otherwise set outsideRth=True.
+    _RTH_ONLY = bool(getattr(args, "rth_only", False))
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     # Quiet console noise if requested

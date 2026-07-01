@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** June 30, 2026 (Fix EJ: restore Sunday weekly CLOSE sweep + STK-flatten pass for assignment residuals)
+**Last Updated:** June 30, 2026 (Fix EK: OI values in cancel attempts CSV + 10:30 retry for cancels where one leg is liquid)
 
 ---
 
@@ -4907,6 +4907,100 @@ flatten-stock: submitted SYM SELL x100 via MKT (weekly/reconcile path)
 - Next Sunday: `ib_cycle.log` shows `Fix EJ-a: Sunday weekly maintenance window; running after-hours batch to restore 21-day CLOSE sweep.` followed by the standard `Close-delegate:` filtering log. Previously would have shown `Fix CM: weekend/holiday — skipping reconcile lookback` and nothing else.
 - Any future assignment where the strategy sends CLOSE and does NOT re-open before the next 5 PM cycle: expect `close_stock,submitted,stk_flatten_no_opt_within_21d` in attempts CSV.
 - Weekday behavior unchanged (EJ-a Sunday-only, EJ-b runs only when `_delegate_close_from_csvs_within` runs which is Sunday-only per line 2290).
+
+---
+
+### Fix EK: OI Values in Cancel Attempts CSV + 10:30 Retry for Cancels Where One Leg Is Liquid (Jun 30)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — `_cancel_low_oi_working_orders_from_csv` reason at line ~3753 (EK-a); `_rth_liquidity_cleanup` reason at line ~3497 (EK-a); new method `_retry_low_oi_cancels_from_today` after `_retry_skipped_opens_from_prev_day`; `--risk-exits-only` CLI handler at line ~4133 (EK-b wiring). `InteractiveBrokersTrader/PlaceAnOrder.py` — new `--rth-only` CLI arg, `_RTH_ONLY` module-level flag consumed by `_tag_after_hours_limit()` and by the two MKT `outsideRth=True` sites inside `place_debit_spread()`.
+
+**Incident:** On 2026-06-30 at 09:47, six OPEN orders were cancelled by `_cancel_low_oi_working_orders_from_csv` with `reason=low_oi_both_legs`, plus LYV at 10:32. Looking at the enriched CSV for each:
+
+| Symbol / Strikes (CALL debit) | oi_atm | oi_oth | Verdict |
+|---|---:|---:|---|
+| SHEL 77/78 | 9 | 0 | correctly cancelled (both truly low) |
+| OPLN 40/45 | 2 | 1 | correctly cancelled |
+| NLY 23.0/23.5 | 487 | 72 | cancelled — ATM was highly liquid |
+| NI 50/55 | 505 | 26 | cancelled — ATM was highly liquid |
+| IONS 80/82.5 | 10398 | 39 | cancelled — ATM had 10K OI |
+| LYV 185/190 | 0 | 480 | cancelled — ATM=0 is almost certainly a fetch race |
+
+Two problems: (1) the attempts CSV reason field just says `low_oi_both_legs` with no numbers — auditing requires cross-referencing `ib_cycle.log` for the matching `CSV OI cancel [...]: cancelled SYM ... OI=A/B<thr(100)` line; (2) Fix EE ("cancel if any known leg < threshold") is intentionally aggressive at market open when data reliability is poor, but is too strict for narrow CALL debit spreads where the ATM has thousands of OI and only the +$2.50/$5 OTM strike is thin.
+
+**Fix — two independent changes in one commit:**
+
+**EK-a (attempts CSV visibility):** encode OI values in the `reason` field for both cancel paths. No schema change; the `reason` column already carries composite info elsewhere (e.g., `bs_rejected_bag_e201:Pattern Day Trader...`).
+
+CSV-based cancel (DCM.py ~line 3753):
+```python
+reason=f"low_oi_both_legs:atm={oi_atm},oth={oi_oth}"  # was "low_oi_both_legs"
+```
+
+Live-OI cleanup (DCM.py ~line 3497): align `oi_values` (indexed by `strikes[0]`, `strikes[1]`) with the atm/oth PUT/CALL semantic already computed above at lines 3486-3487, then include in reason:
+```python
+_oi_atm_live = oi_values[1] if _r == "P" else oi_values[0]
+_oi_oth_live = oi_values[0] if _r == "P" else oi_values[1]
+reason=f"low_oi_live:atm={_oi_atm_live},oth={_oi_oth_live}"
+```
+
+Prefix-match on `low_oi_both_legs`/`low_oi_live` remains grep-safe for historical comparisons.
+
+**EK-b (10:30 retry for cancels where at least one leg is now liquid):** new method `_retry_low_oi_cancels_from_today(threshold=MIN_OI_FOR_RTH)` invoked from the `--risk-exits-only` CLI handler AFTER `_cancel_low_oi_working_orders_from_csv` and `_rth_liquidity_cleanup`. Ordering is critical: running the retry FIRST would let the second cancel pass immediately re-cancel the replacement per Fix EE (any leg < threshold → cancel).
+
+Behaviour:
+1. Read today's `attempts_YY_MM_DD.csv`. Collect unique `(symbol, exp, right, atm, oth)` tuples from rows where `action=="cancel_open"`, `status=="placed"`, `reason.startswith("low_oi_both_legs")` — matches both bare and EK-a forms.
+2. Skip symbols already showing a `retry_open,submitted` row today (idempotency guard for re-runs within the same day).
+3. Re-read OI from the 10:30 re-enriched `combined_listener_spreads.csv` using a right-aware alias lookup that mirrors Fix BA (`oi_atm`, `open_interest_atm_call/put`, ...) with PUT proxy fallbacks. Loads up to 2 CSV files (today's if present, plus the prev trading day) to survive holiday windows.
+4. **Policy**: retry if AT LEAST ONE leg has `oi >= threshold` in the re-read. Skip if both are still below threshold or still unknown.
+5. Duplicate guards via a single IB connection (clientId=101, matches Fix BG): skip symbols with any held OPT position, skip symbols with an existing working BUY BAG order.
+6. For eligible symbols, invoke PlaceAnOrder using yesterday's CSV as pricing source (same pattern as `_retry_skipped_opens_from_prev_day` / Fix CP) but with `--rth-only`:
+   ```python
+   self._run_place_an_order([
+       "--mode", "from-signal", "--date", _prev_folder,
+       "--symbols", ",".join(_retry_syms),
+       "--min-limit", "0.05", "--bump-to-min",
+       "--use-live-open", "mid",
+       "--allow-prev-day-opens", "--oi-check", "off",
+       "--rth-only", "--quiet",
+   ])
+   ```
+7. Write a `retry_open,submitted,reason="ek_retry:atm=X,oth=Y",...` row per retried symbol to today's attempts CSV so the retry is auditable in the same file.
+
+**PlaceAnOrder `--rth-only` semantics:**
+- New CLI flag (default False) → sets module-level `_RTH_ONLY` in `run_from_csv()`.
+- `_tag_after_hours_limit()` returns immediately when `_RTH_ONLY` is True — skips setting `outsideRth=True` regardless of clock.
+- The two MKT paths in `place_debit_spread()` at lines ~1213 and ~1237 gate `order.outsideRth = True` behind `if not _RTH_ONLY:`.
+- Result: with `--rth-only`, all BAG orders (LMT or MKT) end up `tif=DAY, outsideRth=False` → IB cancels at 16:00 if unfilled — no Inactive+DAY overnight carry-over → no tomorrow-re-cancel oscillation.
+- Every other PlaceAnOrder caller retains existing after-hours-friendly behavior (flag defaults to False).
+
+**Ordering visualisation:**
+```
+09:45 AM  IB_Open_PlaceMissing_0945 → run_rth_open_cleanup
+          ├─ enrichment
+          ├─ _cancel_low_oi_working_orders_from_csv (Fix EE strict; cancels NLY, NI, IONS, LYV, SHEL, OPLN)
+          └─ _rth_liquidity_cleanup
+
+10:30 AM  IB_RiskExits_Retry_1030 → --risk-exits-only
+          ├─ enrichment (Fix AD)
+          ├─ _cancel_low_oi_working_orders_from_csv (Fix CO — catches any new low-OI orders)
+          ├─ _rth_liquidity_cleanup                   (Fix CO — live OI)
+          ├─ _retry_low_oi_cancels_from_today         (Fix EK-b — re-places NLY/NI/IONS/LYV, skips SHEL/OPLN)
+          └─ _rth_risk_exits
+```
+
+**What this does NOT do:**
+- Does not change Fix EE's aggressive "cancel if any leg < threshold" rule at 9:45. That gate is intentional given poor market-data reliability at open.
+- Does not alter the attempts CSV schema. OI is encoded in the existing `reason` string.
+- Does not attempt cross-clientId cancellation of the retry order. If unfilled, IB cancels it automatically at 16:00 via the `tif=DAY, outsideRth=False` combination.
+- Does not extract `_find_csv_oi` to a module-level helper — the retry method inlines an equivalent lookup so both methods can evolve independently.
+
+**Verification:**
+1. Next low-OI cancel row shows `reason="low_oi_both_legs:atm=487,oth=72"` in the attempts CSV (instead of the bare form).
+2. After 10:30 tomorrow, `ib_cycle.log` shows a summary like `Fix EK-b: retrying 4/6 symbol(s) as DAY-only orders from YY_MM_DD: [NLY, NI, IONS, LYV]` followed by matching `open_call,placed,success` entries in the attempts CSV.
+3. SHEL (9/0) and OPLN (2/1) remain in the skip list with `no leg above threshold`.
+4. Retry orders that don't fill by 16:00 show `status=Cancelled` in IB (verified via portal or Health.ps1 close section) — no Inactive+DAY carry-over.
+5. Re-running `--risk-exits-only` twice within 15 min: the second run sees existing `retry_open,submitted` rows and skips duplicates.
 
 ---
 

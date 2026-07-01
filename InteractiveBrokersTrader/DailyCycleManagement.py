@@ -3485,12 +3485,15 @@ class DailyCycleManagementMixin:
                 _r = (right or "").upper()
                 _atm = str(strikes[1] if _r == "P" else strikes[0])
                 _oth = str(strikes[0] if _r == "P" else strikes[1])
+                # Fix EK-a: align oi_values (indexed by strikes[0], strikes[1]) with atm/oth semantic
+                _oi_atm_live = oi_values[1] if _r == "P" else oi_values[0]
+                _oi_oth_live = oi_values[0] if _r == "P" else oi_values[1]
                 try:
                     _AttemptLogger.write(
                         symbol=sym,
                         action="cancel_open",
                         status="placed",
-                        reason="low_oi_live",
+                        reason=f"low_oi_live:atm={_oi_atm_live},oth={_oi_oth_live}",  # Fix EK-a
                         exp=exp,
                         right=_r,
                         atm=_atm,
@@ -3750,7 +3753,7 @@ class DailyCycleManagementMixin:
                         symbol=sym,
                         action="cancel_open",
                         status="placed",
-                        reason="low_oi_both_legs",
+                        reason=f"low_oi_both_legs:atm={oi_atm},oth={oi_oth}",  # Fix EK-a: encode OI values
                         exp=exp,
                         right=right,
                         atm=str(atm),
@@ -3821,6 +3824,262 @@ class DailyCycleManagementMixin:
             "--use-live-open", "mid",
             "--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
             "--oi-check", "rth",       # Fix DW: 9:45 AM enrichment now writes open_interest_atm/otm_call via extended Fix AO
+            "--quiet",
+        ])
+
+    def _retry_low_oi_cancels_from_today(self, threshold: int = MIN_OI_FOR_RTH) -> None:
+        """Fix EK-b: At 10:30 AM, re-place OPEN orders that were cancelled today for
+        low_oi_both_legs when AT LEAST ONE leg is now above threshold in the re-enriched
+        CSV. Orders are placed as DAY-only (--rth-only) so IB cancels at 16:00 if
+        unfilled — no overnight carry-over, no tomorrow re-cancel oscillation.
+
+        MUST run AFTER _cancel_low_oi_working_orders_from_csv and _rth_liquidity_cleanup
+        in the 10:30 flow, otherwise the strict cancel pass would immediately re-cancel
+        the just-placed retry order (Fix EE: any leg < threshold → cancel).
+        """
+        import csv as _csv_ek
+        from datetime import timedelta as _td_ek
+
+        # Read today's attempts CSV
+        _today_folder = self._now_ny().strftime('%y_%m_%d')
+        _attempts_path = fr"C:\OptionsHistory\{_today_folder}\attempts_{_today_folder}.csv"
+        if not os.path.exists(_attempts_path):
+            LOG.info("Fix EK-b: today's attempts CSV not found (%s); nothing to retry.", _attempts_path)
+            return
+        try:
+            with open(_attempts_path, newline="", encoding="utf-8") as _fh:
+                _att_rows = list(_csv_ek.DictReader(_fh))
+        except Exception as _e:
+            LOG.warning("Fix EK-b: failed to read %s: %s", _attempts_path, _e)
+            return
+
+        # Collect unique (symbol, exp, right, atm, oth) tuples of today's low-OI cancels
+        # Matches both bare "low_oi_both_legs" and Fix EK-a form "low_oi_both_legs:atm=..."
+        _cancels: list[tuple[str, str, str, float, float]] = []
+        _seen: set[tuple[str, str, str, float, float]] = set()
+        for _r in _att_rows:
+            if (_r.get("action") == "cancel_open"
+                    and _r.get("status") == "placed"
+                    and (_r.get("reason") or "").startswith("low_oi_both_legs")):
+                _sym = (_r.get("symbol") or "").strip().upper()
+                _exp = (_r.get("exp") or "").strip()
+                _right = (_r.get("right") or "").strip().upper()[:1]
+                try:
+                    _atm = float(_r.get("atm") or 0.0)
+                    _oth = float(_r.get("oth") or 0.0)
+                except Exception:
+                    continue
+                _key = (_sym, _exp, _right, _atm, _oth)
+                if _sym and _exp and _right and _key not in _seen:
+                    _seen.add(_key)
+                    _cancels.append(_key)
+
+        if not _cancels:
+            LOG.info("Fix EK-b: no low_oi_both_legs cancels today; nothing to retry.")
+            return
+
+        # Skip symbols that already have a retry_open,submitted row in today's attempts CSV
+        # (idempotency guard — if _retry_low_oi_cancels_from_today has already run today)
+        _already_retried: set[str] = set()
+        for _r in _att_rows:
+            if _r.get("action") == "retry_open" and _r.get("status") == "submitted":
+                _already_retried.add((_r.get("symbol") or "").strip().upper())
+
+        # Load re-enriched CSV rows (today + prev trading day)
+        _csv_rows: list[dict] = []
+        _ref = self._now_ny().date()
+        _found = 0
+        for _back in range(0, 15):
+            _d = _ref - _td_ek(days=_back)
+            if _d.weekday() >= 5:
+                continue
+            _fp = fr"C:\OptionsHistory\{_d.strftime('%y_%m_%d')}\combined_listener_spreads.csv"
+            if os.path.exists(_fp):
+                try:
+                    with open(_fp, newline="", encoding="utf-8") as _fh:
+                        for _r_csv in _csv_ek.DictReader(_fh):
+                            _csv_rows.append(_r_csv)
+                except Exception as _e:
+                    LOG.warning("Fix EK-b: failed to read %s: %s", _fp, _e)
+                _found += 1
+                if _found >= 2:
+                    break
+        if not _csv_rows:
+            LOG.info("Fix EK-b: no combined CSV rows available; nothing to retry.")
+            return
+
+        # Determine prev trading day folder for --date arg to PlaceAnOrder
+        _prev_folder: str | None = None
+        for _back in range(1, 10):
+            _d = _ref - _td_ek(days=_back)
+            if _d.weekday() >= 5:
+                continue
+            _cand = _d.strftime('%y_%m_%d')
+            _fp = fr"C:\OptionsHistory\{_cand}\combined_listener_spreads.csv"
+            if os.path.exists(_fp):
+                _prev_folder = _cand
+                break
+        if not _prev_folder:
+            LOG.info("Fix EK-b: no prev-day CSV folder found; cannot retry.")
+            return
+
+        # Right-aware OI lookup (mirrors Fix BA aliases in _find_csv_oi)
+        def _coerce(v):
+            try:
+                if v is None:
+                    return None
+                s = str(v).strip()
+                if not s:
+                    return None
+                return float(s)
+            except Exception:
+                return None
+
+        def _lookup_oi(sym: str, right: str, exp: str, k_atm: float, k_oth: float):
+            sym_u = sym.upper()
+            r_u = right.upper()
+            if r_u == 'C':
+                keys_atm = ("oi_atm", "atm_oi", "oi_call_atm", "open_interest_atm_call", "open_interest_atm", "oi1")
+                keys_oth = ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2")
+                keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike")
+                keys_oth_strike = ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike")
+            else:
+                keys_atm = ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1")
+                keys_oth = ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2")
+                keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "high_strike", "upper_strike")
+                keys_oth_strike = ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike")
+
+            def _g(row, keys):
+                for k in keys:
+                    if k in row:
+                        return row[k]
+                return None
+
+            def _same(a, b):
+                try:
+                    return abs(float(a) - float(b)) < 1e-9
+                except Exception:
+                    return False
+
+            for row in _csv_rows:
+                rsym = (_g(row, ("symbol",)) or "").strip().upper()
+                if rsym != sym_u:
+                    continue
+                rexp = (_g(row, ("expiration", "exp", "lastTradeDateOrContractMonth")) or "").strip()
+                if rexp and exp and rexp != exp:
+                    continue
+                ra = _g(row, keys_atm_strike)
+                ro = _g(row, keys_oth_strike)
+                if ra is None or ro is None:
+                    continue
+                if not (_same(ra, k_atm) and _same(ro, k_oth)):
+                    continue
+                oi_a = _coerce(_g(row, keys_atm))
+                oi_o = _coerce(_g(row, keys_oth))
+                if oi_a is None and oi_o is None:
+                    continue  # keep searching older rows
+                return (int(oi_a) if oi_a is not None else None,
+                        int(oi_o) if oi_o is not None else None)
+            return (None, None)
+
+        # Duplicate guard: fetch held OPT symbols + working BUY BAG symbols from IB
+        try:
+            from ib_insync import IB
+        except Exception:
+            LOG.warning("Fix EK-b: ib_insync unavailable; cannot check for duplicates.")
+            return
+        _held_syms: set[str] = set()
+        _open_buy_bag_syms: set[str] = set()
+        _ib_ek = IB()
+        try:
+            _ib_ek.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
+        except Exception as e:
+            LOG.warning("Fix EK-b: could not connect to IB for duplicate check: %s", e)
+            return
+        try:
+            for p in _ib_ek.positions():
+                c = getattr(p, "contract", None)
+                if c and getattr(c, "secType", "") == "OPT":
+                    _held_syms.add((c.symbol or "").upper())
+            _ib_ek.reqAllOpenOrders()
+            _ib_ek.sleep(1.5)
+            _ib_ek.reqOpenOrders()
+            _ib_ek.sleep(0.5)
+            for tr in _ib_ek.openTrades() or []:
+                c = getattr(tr, "contract", None)
+                o = getattr(tr, "order", None)
+                s = getattr(tr, "orderStatus", None)
+                if (c and o and s
+                        and getattr(c, "secType", "") == "BAG"
+                        and (getattr(o, "action", "") or "").upper() == "BUY"
+                        and (s.status or "").lower() in ("presubmitted", "submitted", "inactive")):
+                    _open_buy_bag_syms.add((getattr(c, "symbol", "") or "").upper())
+        except Exception as e:
+            LOG.warning("Fix EK-b: duplicate check failed: %s", e)
+        finally:
+            try:
+                _ib_ek.disconnect()
+            except Exception:
+                pass
+
+        # Evaluate each cancel against re-read OI and build retry list
+        _retry_syms: list[str] = []
+        _skips: list[str] = []
+        for (_sym, _exp, _right, _atm, _oth) in _cancels:
+            if _sym in _already_retried:
+                LOG.info("Fix EK-b: %s already retried today; skip", _sym)
+                _skips.append(f"{_sym}(already_retried)")
+                continue
+            oi_a, oi_o = _lookup_oi(_sym, _right, _exp, _atm, _oth)
+            _atm_ok = (oi_a is not None and oi_a >= threshold)
+            _oth_ok = (oi_o is not None and oi_o >= threshold)
+            if not (_atm_ok or _oth_ok):
+                LOG.info("Fix EK-b: %s %s/%s %s — 10:30 OI atm/oth=%s/%s; no leg above threshold; skip",
+                         _sym, _atm, _oth, _right, oi_a, oi_o)
+                _skips.append(f"{_sym}(both<{threshold})")
+                continue
+            if _sym in _held_syms:
+                LOG.info("Fix EK-b: %s already has held OPT position; skip", _sym)
+                _skips.append(f"{_sym}(held)")
+                continue
+            if _sym in _open_buy_bag_syms:
+                LOG.info("Fix EK-b: %s already has working BUY BAG; skip", _sym)
+                _skips.append(f"{_sym}(working)")
+                continue
+            LOG.info("Fix EK-b: %s %s/%s %s — 10:30 OI atm/oth=%s/%s; retry (one leg >= %d)",
+                     _sym, _atm, _oth, _right, oi_a, oi_o, threshold)
+            _retry_syms.append(_sym)
+            try:
+                _AttemptLogger.write(
+                    symbol=_sym,
+                    action="retry_open",
+                    status="submitted",
+                    reason=f"ek_retry:atm={oi_a},oth={oi_o}",
+                    exp=_exp,
+                    right=_right,
+                    atm=str(_atm),
+                    oth=str(_oth),
+                )
+            except Exception as _e:
+                LOG.warning("Fix EK-b: attempts CSV write failed for %s: %s", _sym, _e)
+
+        if not _retry_syms:
+            LOG.info("Fix EK-b: no symbols eligible for retry (skipped: %s)",
+                     ", ".join(_skips) if _skips else "none")
+            return
+
+        LOG.info("Fix EK-b: retrying %d/%d symbol(s) as DAY-only orders from %s: %s",
+                 len(_retry_syms), len(_cancels), _prev_folder, _retry_syms)
+        self._run_place_an_order([
+            "--mode", "from-signal",
+            "--date", _prev_folder,
+            "--symbols", ",".join(_retry_syms),
+            "--min-limit", "0.05",
+            "--bump-to-min",
+            "--use-live-open", "mid",
+            "--allow-prev-day-opens",  # Fix CQ: use prev-day CSV date for same-day filter
+            "--oi-check", "off",       # OI already validated above via _lookup_oi
+            "--rth-only",              # Fix EK-b: DAY-only, IB cancels at 16:00 if unfilled
             "--quiet",
         ])
 
@@ -4138,6 +4397,14 @@ if __name__ == "__main__":
                 r._rth_liquidity_cleanup()
             except Exception as _co_live_err:
                 LOG.warning("Risk exits retry: live OI cleanup failed (%s); proceeding", _co_live_err)
+            # Fix EK-b: retry today's low_oi_both_legs cancels if at least one leg is now
+            # above threshold. Must run AFTER both cancel passes above so the retry order
+            # isn't immediately re-cancelled by Fix EE strict rule. Places as DAY-only
+            # (--rth-only) so IB cancels at 16:00 if unfilled — no overnight carry-over.
+            try:
+                r._retry_low_oi_cancels_from_today(threshold=MIN_OI_FOR_RTH)
+            except Exception as _ek_retry_err:
+                LOG.warning("Fix EK-b: retry-low-oi-cancels failed (%s); proceeding", _ek_retry_err)
             r._rth_risk_exits(days_old=2, loss_frac=0.5, gain_frac=0.5)
             sys.exit(0)
 
