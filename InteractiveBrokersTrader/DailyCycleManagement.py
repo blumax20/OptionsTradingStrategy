@@ -29,6 +29,45 @@ WEEKLY_MAINTENANCE_DAY = 6             # Sunday
 # Minimum OI required for at least one leg to keep an order during RTH
 MIN_OI_FOR_RTH = 100
 
+# Fix EL: NYSE full-day closures. Verified against nyse.com/markets/hours-calendars.
+# Update annually as new years are announced (typically each fall for the following year).
+# Does NOT include early-close days (1 PM close) -- Fix EL only addresses full closures;
+# preclose at 15:00 will still fire after the actual 13:00 close on early-close days.
+_NYSE_HOLIDAYS: frozenset = frozenset({
+    # 2026
+    date(2026, 1, 1),    # New Year's Day (Thu)
+    date(2026, 1, 19),   # MLK Jr Day (Mon)
+    date(2026, 2, 16),   # Presidents' Day (Mon)
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 5, 25),   # Memorial Day (Mon)
+    date(2026, 6, 19),   # Juneteenth (Fri)
+    date(2026, 7, 3),    # Independence Day observed (Jul 4 = Sat)
+    date(2026, 9, 7),    # Labor Day (Mon)
+    date(2026, 11, 26),  # Thanksgiving (Thu)
+    date(2026, 12, 25),  # Christmas (Fri)
+    # 2027
+    date(2027, 1, 1),    # New Year's Day (Fri)
+    date(2027, 1, 18),   # MLK Jr Day
+    date(2027, 2, 15),   # Presidents' Day
+    date(2027, 3, 26),   # Good Friday
+    date(2027, 5, 31),   # Memorial Day
+    date(2027, 6, 18),   # Juneteenth observed (Jun 19 = Sat)
+    date(2027, 7, 5),    # Independence Day observed (Jul 4 = Sun)
+    date(2027, 9, 6),    # Labor Day
+    date(2027, 11, 25),  # Thanksgiving
+    date(2027, 12, 24),  # Christmas observed (Dec 25 = Sat)
+    # 2028
+    date(2028, 1, 17),   # MLK Jr Day (Jan 1 falls on Sat -- no observance per NYSE rules)
+    date(2028, 2, 21),   # Presidents' Day
+    date(2028, 4, 14),   # Good Friday
+    date(2028, 5, 29),   # Memorial Day
+    date(2028, 6, 19),   # Juneteenth (Mon)
+    date(2028, 7, 4),    # Independence Day (Tue)
+    date(2028, 9, 4),    # Labor Day
+    date(2028, 11, 23),  # Thanksgiving
+    date(2028, 12, 25),  # Christmas (Mon)
+})
+
 def _attempts_csv_path() -> str:
     """
     Generate the attempts CSV path under the current date's OptionsHistory folder.
@@ -2176,10 +2215,20 @@ class DailyCycleManagementMixin:
         return datetime.now(NY)
 
     def _is_trading_day(self, when: datetime | None = None) -> bool:
-        """Very simple weekday check. Consider plugging in an exchange/holiday calendar."""
+        """Fix EL: weekday AND NYSE full-day holiday check.
+        Does NOT handle early-close days (1 PM close) -- those still return True
+        and the 15:00 preclose can fire after the actual close. Track separately
+        if it becomes an issue. _NYSE_HOLIDAYS is defined at module level and
+        must be updated annually as NYSE announces the following year's calendar.
+        """
         dt = when or self._now_ny()
-        # Monday(0) .. Friday(5) -> trading days; Sunday(6) is not
-        return dt.weekday() < 5
+        # Monday(0) .. Friday(4) -> weekday; Sat(5)/Sun(6) not trading
+        if dt.weekday() >= 5:
+            return False
+        # NYSE full-day closures (Fix EL)
+        if dt.date() in _NYSE_HOLIDAYS:
+            return False
+        return True
 
     def is_market_open(self, when: datetime | None = None) -> bool:
         dt = when or self._now_ny()

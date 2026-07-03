@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** June 30, 2026 (Fix EK: OI values in cancel attempts CSV + 10:30 retry for cancels where one leg is liquid)
+**Last Updated:** July 3, 2026 (Fix EL: NYSE full-day holiday calendar in _is_trading_day())
 
 ---
 
@@ -5001,6 +5001,58 @@ Behaviour:
 3. SHEL (9/0) and OPLN (2/1) remain in the skip list with `no leg above threshold`.
 4. Retry orders that don't fill by 16:00 show `status=Cancelled` in IB (verified via portal or Health.ps1 close section) — no Inactive+DAY carry-over.
 5. Re-running `--risk-exits-only` twice within 15 min: the second run sees existing `retry_open,submitted` rows and skips duplicates.
+
+---
+
+### Fix EL: NYSE Full-Day Holiday Calendar in `_is_trading_day()` (Jul 3)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — new `_NYSE_HOLIDAYS` frozenset module constant near line 32; updated `_is_trading_day()` at line ~2178.
+
+**Incident:** Today (Fri Jul 3, 2026) NYSE observed Independence Day since Jul 4 falls on Saturday. Every scheduled task fired anyway. At 09:47 AM `_cancel_low_oi_working_orders_from_csv` cancelled 5 legitimate Inactive+DAY OPEN orders:
+
+| Symbol | Strikes | Reason |
+|---|---|---|
+| FWONK | C 95/100 | `low_oi_both_legs:atm=0,oth=0` |
+| AMX | C 26/27 | `low_oi_both_legs:atm=0,oth=0` |
+| RDY | C 15/17.5 | `low_oi_both_legs:atm=0,oth=0` |
+| AXP | C 355/360 | `low_oi_both_legs:atm=0,oth=0` |
+| FNB | C 20/22.5 | `low_oi_both_legs:atm=0,oth=0` |
+
+All showed `atm=0,oth=0` because markets were closed → the 9:45 AM LiquidityFilter enrichment couldn't fetch live OI → CSV read as 0/0 → Fix EE strict gate ("any leg < threshold → cancel") fired. These were valid overnight orders that would have activated Monday at open.
+
+**Root cause:** [`_is_trading_day()`](InteractiveBrokersTrader/DailyCycleManagement.py) was weekday-only:
+```python
+def _is_trading_day(self, when=None) -> bool:
+    """Very simple weekday check. Consider plugging in an exchange/holiday calendar."""
+    return dt.weekday() < 5
+```
+
+The docstring flagged the defect. Nine call sites depend on this function, including the eight guards Fix CM/EH added for weekend/holiday protection. All eight guards were silently defective for US market holidays because the underlying check was weekday-only.
+
+**Fix:** Added `_NYSE_HOLIDAYS: frozenset[date]` module constant containing all NYSE full-day closures for 2026, 2027, 2028 (30 dates total, verified against nyse.com/markets/hours-calendars). `_is_trading_day()` now returns False when `dt.date() in _NYSE_HOLIDAYS`.
+
+Dates included:
+- **2026**: 1/1, 1/19, 2/16, 4/3, 5/25, 6/19, 7/3 (Jul 4 observed), 9/7, 11/26, 12/25
+- **2027**: 1/1, 1/18, 2/15, 3/26, 5/31, 6/18 (Jun 19 observed), 7/5 (Jul 4 observed), 9/6, 11/25, 12/24 (Dec 25 observed)
+- **2028**: 1/17 (Jan 1 = Sat, no observance per NYSE), 2/21, 4/14, 5/29, 6/19, 7/4, 9/4, 11/23, 12/25
+
+Set membership check is O(1); adds ~1 μs per `_is_trading_day` call.
+
+**What this does NOT do:**
+- Does NOT handle NYSE early-close days (day after Thanksgiving, Christmas Eve when it falls on a weekday, day before Independence Day when applicable). On these ~4–6 days/year, market closes at 1 PM; the 15:00 preclose still fires after market close. Left as separate future fix; noted in `_is_trading_day` docstring.
+- Does NOT auto-generate holidays. Requires manual annual update when NYSE publishes the following year's calendar (typically each fall). Currently covers through end of 2028.
+- Does NOT change `is_after_hours_placement()` — that function is intentionally day-agnostic so Fix EJ-a Sunday weekly maintenance still runs.
+- Does NOT add a new dependency. Considered `holidays` and `pandas_market_calendars` packages; chose hardcoded set for zero-dependency simplicity and explicit auditable dates.
+
+**Verification:**
+1. `python -c "from datetime import datetime; from InteractiveBrokersTrader.DailyCycleManagement import DailyCycleManagement as D; print(D()._is_trading_day(datetime(2026,7,3,10,0)))"` returns `False` (Jul 3 = today's incident date).
+2. Same call with `datetime(2026,7,6,10,0)` (Monday) returns `True` — normal weekday unaffected.
+3. Any of the 30 holiday dates returns `False`.
+4. Live smoke test today: `python DailyCycleManagement.py --risk-exits-only` logs `--risk-exits-only: skipping — not a trading day (Fix EH)` and exits 0 — no IB connection, no cancels, no OPEN retries.
+5. Any Sunday continues to work for Fix EJ-a (weekend check `dt.weekday() >= 5` fires first, holiday check never reached).
+
+**Maintenance note:** Every autumn NYSE announces the following year's holiday calendar. Append the ~10 new dates to `_NYSE_HOLIDAYS`. When forward coverage drops below 2 years, extend proactively. No automation — small annual manual task.
 
 ---
 
