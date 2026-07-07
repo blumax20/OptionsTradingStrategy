@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 3, 2026 (Fix EL: NYSE full-day holiday calendar in _is_trading_day())
+**Last Updated:** July 7, 2026 (Fix EM: holiday-aware _prev_trading_day_folder + LiquidityFilter refuses to persist oi=0 corruption)
 
 ---
 
@@ -5053,6 +5053,63 @@ Set membership check is O(1); adds ~1 μs per `_is_trading_day` call.
 5. Any Sunday continues to work for Fix EJ-a (weekend check `dt.weekday() >= 5` fires first, holiday check never reached).
 
 **Maintenance note:** Every autumn NYSE announces the following year's holiday calendar. Append the ~10 new dates to `_NYSE_HOLIDAYS`. When forward coverage drops below 2 years, extend proactively. No automation — small annual manual task.
+
+---
+
+### Fix EM: Holiday-Aware `_prev_trading_day_folder()` + LiquidityFilter Refuses to Persist oi=0 Corruption (Jul 7)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — `_prev_trading_day_folder()` at line ~1815 (EM-1). `InteractiveBrokersTrader/LiquidityFilter.py` — `_ib_fetcher_factory._fetch` at line ~454 (EM-2 fetcher); `enrich_combined_csv` write gates at lines ~549, 568, 576, 591 (EM-2 enrichment); `_need()` at line ~511 (EM-3).
+
+**Incident:** On Mon 2026-07-06 at 09:45 AM, 5 legitimate Inactive+DAY OPEN orders (RDY, FWONK, FNB, AXP, AMX) were cancelled with `low_oi_both_legs:atm=0,oth=0`. Fix EK-b's 10:30 retry ran but skipped all 5 (`no leg above threshold`). All 5 had valid `open_interest_atm_call/otm_call` values in Thursday's listener CSV (46/26, 79/313, 75/60, 14/1072, 2/50) — only the LiquidityFilter-enrichment columns `oi_atm/oi_oth` were corrupted with 0/0.
+
+**Two-defect root cause:**
+
+**Defect 1 (EM-1 primary):** `_prev_trading_day_folder()` (DCM.py:1815) skipped only Sat/Sun, not NYSE holidays. Fix EL made `_is_trading_day()` holiday-aware but did not propagate to this sibling helper.
+
+On Mon 7/6, `_prev_trading_day_folder()` returned `26_07_03` (Friday, Independence Day observed — no CSV in that folder because Fix EL correctly prevented Friday enrichment/listener). So `_enrich_today_and_prev_trading_day` at 09:45 AM launched LiquidityFilter for `26_07_06` (empty, no CSV yet) and `26_07_03` (empty, holiday) — **and never touched Thursday's actual CSV**. Confirmed in ib_cycle.log:
+```
+09:45:02  Launching LiquidityFilter for 26_07_06 (only_rth)
+09:45:03  Launching LiquidityFilter for 26_07_03 (only_rth)
+                                                             <-- 26_07_02 NEVER launched
+09:45:07  CSV OI cancel [today]: cancelled RDY ... OI=0/0<thr(100)
+```
+File mtime confirms: `26_07_02\combined_listener_spreads.csv` last modified 2026-07-03 10:33 AM (Friday's stale write; no update Monday).
+
+**Defect 2 (contributing, addressed by EM-2/EM-3):** On Fri 7/3 09:47 AM (pre-Fix-EL), `run_rth_open_cleanup` ran during a closed market and Thursday's CSV was enriched. `_ib_fetcher_factory._fetch` returned `oi=0` (IB's "no data" sentinel), enrichment wrote `oi_atm=0, oi_oth=0` to 5 rows. Then `_need("0")` returned False on subsequent runs — corruption stuck permanently.
+
+**Menu 8→1 explanation:** correctly processed Monday's 5 PM fresh signals (20+ new symbols). Per Fix DS, when today's CSV has signals, older folders are dropped. RDY/FWONK/FNB/AXP/AMX weren't in Monday's signals so weren't attempted. This is design intent, not a bug.
+
+**Fix EM — three changes:**
+
+**EM-1 (primary):** `_prev_trading_day_folder()` reuses `self._is_trading_day()`:
+```python
+d = dt - timedelta(days=1)
+while not self._is_trading_day(d):
+    d -= timedelta(days=1)
+```
+On Mon 7/6 → returns `26_07_02` (Thursday). Enrichment now touches Thursday's CSV.
+
+**EM-2 (defense in depth):** `_ib_fetcher_factory._fetch` rejects `val <= 0` for OI and IV; enrichment/backfill sites also guarded with `and oi > 0` / `and iv > 0`. Prevents any code path from persisting a 0 that came from an IB stall/closed market.
+
+**EM-3 (self-heal):** `_need()` treats 0 as "no data" → refetch:
+```python
+return fv != fv or fv == 0
+```
+Existing corrupt 0s in Thursday's CSV will be refetched on Tuesday (or the first market-open enrichment run) and overwritten with valid non-zero data — or left blank if fetch still fails (EM-2). Corruption self-heals.
+
+**What this does NOT do:**
+- Does NOT retroactively re-place Monday's 5 cancelled orders. Those are gone; wait for the strategy's next signal or place manually.
+- Does NOT change Fix DS menu 8→1 behaviour. That's design intent.
+- Does NOT investigate the exact code path in ib_insync/IB that produces `0` on stall. EM-2 catches all paths (any `val <= 0` → treat as no data).
+- Does NOT audit other `datetime.weekday()` patterns for holiday-awareness gaps. Callers of `_prev_trading_day_folder()` verified: `_enrich_today_and_prev_trading_day` and `_retry_skipped_opens_from_prev_day` — both benefit.
+
+**Verification:**
+1. Unit: `python -c "from InteractiveBrokersTrader.DailyCycleManagement import DailyCycleManagement as D; from datetime import datetime; print(D()._prev_trading_day_folder(datetime(2026,7,6)))"` returns `'26_07_02'` (Thursday, skipping Fri 7/3 holiday + Sat/Sun).
+2. Unit: `python -c "from InteractiveBrokersTrader.DailyCycleManagement import DailyCycleManagement as D; from datetime import datetime; print(D()._prev_trading_day_folder(datetime(2026,6,22)))"` returns `'26_06_18'` (Thursday after Juneteenth Fri 6/19).
+3. Live smoke (Tue 7/7 during RTH): `python DailyCycleManagement.py --risk-exits-only` — ib_cycle.log should show `Launching LiquidityFilter for 26_07_02` (Thursday now correctly identified). Check `C:\OptionsHistory\26_07_02\combined_listener_spreads.csv`: `oi_atm` values for AXP/AMX/FNB/FWONK/RDY refreshed to non-zero, or blank if fetch fails — never 0.
+4. Regression: normal weekday `_prev_trading_day_folder(Wed)` returns Tue (unchanged); after normal weekend `_prev_trading_day_folder(Mon)` returns Fri (unchanged).
+5. Regression: high-OI symbol (e.g. `oi=487`) enriches normally, not filtered by `> 0` gate.
 
 ---
 

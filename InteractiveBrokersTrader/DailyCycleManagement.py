@@ -1814,14 +1814,18 @@ class DailyCycleManagementMixin:
 
     def _prev_trading_day_folder(self, ref_dt: datetime | None = None) -> str:
         """
-        Return YY_MM_DD string for the previous *trading* day (skips Sat/Sun).
-        If ref_dt is Monday, this returns the prior Friday.
+        Return YY_MM_DD string for the previous *trading* day (skips Sat/Sun AND
+        NYSE full-day holidays via Fix EL's _NYSE_HOLIDAYS). Fix EM-1: reuses
+        self._is_trading_day() so this helper stays in sync with the rest of
+        the codebase's holiday awareness. If ref_dt is Monday after a normal
+        Friday, this returns the prior Friday; if the Friday was a holiday
+        (e.g. 2026-07-03 Independence Day observed), returns Thursday instead.
         """
-        dt = (ref_dt or self._now_ny()).date()
+        dt = (ref_dt or self._now_ny())
         from datetime import timedelta
         d = dt - timedelta(days=1)
-        # Skip weekend days
-        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        # Skip weekends AND NYSE full-day holidays via _is_trading_day (Fix EM-1)
+        while not self._is_trading_day(d):
             d -= timedelta(days=1)
         return d.strftime("%y_%m_%d")
 

@@ -455,14 +455,16 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
             _primary = "callOpenInterest" if str(right).upper() == "C" else "putOpenInterest"
             for attr in (_primary, "optionOpenInterest", "openInterest", "optOpenInterest"):
                 val = getattr(t, attr, None)
-                if isinstance(val, (int, float)) and not (val != val):  # not NaN
+                # Fix EM-2: reject 0/negative — IB uses 0 as "no data" sentinel on stall/closed market
+                if isinstance(val, (int, float)) and not (val != val) and val > 0:
                     oi = int(val)
                     break
             iv = None
             greeks = getattr(t, "modelGreeks", None)
             if greeks and hasattr(greeks, "impliedVol"):
                 iv_val = greeks.impliedVol
-                if isinstance(iv_val, (int, float)) and not (iv_val != iv_val):
+                # Fix EM-2: reject 0/negative IV — IV of 0 is unphysical
+                if isinstance(iv_val, (int, float)) and not (iv_val != iv_val) and iv_val > 0:
                     iv = float(iv_val)
             # Clean up subscription
             try: ib.cancelMktData(opt)
@@ -513,7 +515,9 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
         if isinstance(v, str) and v.strip() == "": return True
         try:
             fv = float(v)
-            return fv != fv  # NaN
+            # Fix EM-3: NaN or 0 = "no data" -> refetch. Prevents stuck-0 corruption
+            # from freezing enrichment (0 is IB's "no data" sentinel for OI/IV).
+            return fv != fv or fv == 0
         except Exception:
             return False
 
@@ -546,7 +550,8 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
         # ATM leg fill
         if _need(row.get("oi_atm")) or _need(row.get("iv_atm")):
             oi1, iv1 = fetch(symbol, right, expiry, k1)
-            if oi1 is not None:
+            # Fix EM-2: skip write when fetch returns 0 (defense in depth with fetcher guard)
+            if oi1 is not None and oi1 > 0:
                 row["oi_atm"] = int(oi1)
                 updates += 1
                 # Fix AO Part 2: also backfill open_interest_atm_put — the column _oi_ok() reads
@@ -561,14 +566,15 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
                     if _col_call_atm in cols and _need(row.get(_col_call_atm)):
                         row[_col_call_atm] = int(oi1)
                         updates += 1
-            if iv1 is not None:
+            if iv1 is not None and iv1 > 0:  # Fix EM-2
                 row["iv_atm"] = float(iv1)
                 updates += 1
 
         # OTH leg fill (only if we have a valid OTM strike)
         if k2 is not None and (_need(row.get("oi_oth")) or _need(row.get("iv_oth"))):
             oi2, iv2 = fetch(symbol, right, expiry, k2)
-            if oi2 is not None:
+            # Fix EM-2: skip write when fetch returns 0
+            if oi2 is not None and oi2 > 0:
                 row["oi_oth"] = int(oi2)
                 updates += 1
                 # Fix AO Part 2: also backfill open_interest_otm_put — the column _oi_ok() reads
@@ -583,7 +589,7 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
                     if _col_call_oth in cols and _need(row.get(_col_call_oth)):
                         row[_col_call_oth] = int(oi2)
                         updates += 1
-            if iv2 is not None:
+            if iv2 is not None and iv2 > 0:  # Fix EM-2
                 row["iv_oth"] = float(iv2)
                 updates += 1
 
