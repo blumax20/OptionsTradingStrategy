@@ -353,10 +353,11 @@ while ($true) {
             Write-Host "  2) Pre-close sweep (~3:00 pm ET) - delegate CLOSE and convert stubborn limits to MKT; flattens STK on CLOSE"
             Write-Host "  3) Reconcile held positions vs latest signals (21d) - outside RTH"
             Write-Host "  4) After-hours batch (OPENs plus CLOSE delegates 7d/21d)"
-            Write-Host "  5) Enforce CLOSES from last N days (fallback) → enter N"
+            Write-Host "  5) Enforce CLOSES from last N days (fallback) - enter N"
             Write-Host "  6) OI cleanup + risk exits retry (Fix CN/CO) -- cancel low-OI orders, then run risk exits"
             Write-Host "  7) Place skipped OPEN orders from prior day (10 AM retry -- Fix CP/CQ)"
-            $flow = Read-Host "Select [1-7]"
+            Write-Host "  8) FORCE-EXECUTE pending BAG orders with JOIN pricing (RTH only -- Fix EN)"
+            $flow = Read-Host "Select [1-8]"
 
             $argList = @("`"$DCMSrc`"")
             $skipGenericLaunch = $false
@@ -367,7 +368,7 @@ while ($true) {
                 '1' { $argList += "--place-opens" }
                 '2' { $argList += "--preclose" }
                 '3' { $argList += "--reconcile" }
-                '4' { $argList += "--after-hours" }
+                '4' { $argList += @("--after-hours", "--stk-recovery") }
                 '5' {
                     $n = Read-Host "Enter lookback days (e.g., 7)"
                     if ([string]::IsNullOrWhiteSpace($n)) { $n = "7" }
@@ -383,6 +384,22 @@ while ($true) {
                     Write-Host "Running PlaceSkippedOpens.cmd ..." -ForegroundColor Cyan
                     & cmd.exe /c "C:\OptionsHistory\bin\PlaceSkippedOpens.cmd"
                     Pause-Enter
+                }
+                '8' {
+                    # Fix EN: Force-execute pending BAG orders with join pricing.
+                    # Prompts for side selector before dispatching to DCM.
+                    Write-Host ""
+                    Write-Host "Force-execute scope:"
+                    Write-Host "  1) Only pending BUY orders (opens)"
+                    Write-Host "  2) Only pending SELL orders (closes)"
+                    Write-Host "  3) Both (default)"
+                    $sideChoice = Read-Host "Select [1-3, default 3]"
+                    switch ($sideChoice) {
+                        '1' { $sideArg = 'buy' }
+                        '2' { $sideArg = 'sell' }
+                        Default { $sideArg = 'both' }
+                    }
+                    $argList += @("--force-execute-pending", $sideArg)
                 }
                 Default {
                     Write-Host "Invalid selection." -ForegroundColor Yellow

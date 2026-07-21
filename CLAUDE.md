@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 7, 2026 (Fix EM: holiday-aware _prev_trading_day_folder + LiquidityFilter refuses to persist oi=0 corruption)
+**Last Updated:** July 21, 2026 (Fix EO: Signal-driven weekday STK-residual flatten + menu 8-4 recovery; supersedes EJ-b STK path)
 
 ---
 
@@ -5110,6 +5110,110 @@ Existing corrupt 0s in Thursday's CSV will be refetched on Tuesday (or the first
 3. Live smoke (Tue 7/7 during RTH): `python DailyCycleManagement.py --risk-exits-only` — ib_cycle.log should show `Launching LiquidityFilter for 26_07_02` (Thursday now correctly identified). Check `C:\OptionsHistory\26_07_02\combined_listener_spreads.csv`: `oi_atm` values for AXP/AMX/FNB/FWONK/RDY refreshed to non-zero, or blank if fetch fails — never 0.
 4. Regression: normal weekday `_prev_trading_day_folder(Wed)` returns Tue (unchanged); after normal weekend `_prev_trading_day_folder(Mon)` returns Fri (unchanged).
 5. Regression: high-OI symbol (e.g. `oi=487`) enriches normally, not filtered by `> 0` gate.
+
+---
+
+### Fix EN: Menu 8-8 Force-Execute Pending BAG Orders with Join Pricing (Jul 9)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` (new `_force_execute_pending_join()` method after `_retry_low_oi_cancels_from_today` ~line 4139; new `--force-execute-pending` CLI handler in `__main__` dispatch ~line 4488). `PushButtonMenu.ps1` (menu label + `Read-Host [1-8]` update + new case `'8'` block with side-selector prompt ~line 386).
+
+**Motivation:** In IBKR paper trading, BAG combo orders (BUY opens and SELL closes) placed with passive limits (`mid` scheme) frequently sit unfilled for hours. Live IB fills these via market-maker price improvement; paper does not simulate this. Prior recovery paths (3 PM preclose Fix BN-2 join; 10:30 AM Fix EK-b retry with mid) only handle specific windows; there was no user-triggered on-demand path to cancel-and-replace all passive pending orders with aggressive join limits.
+
+**Design:**
+- Menu 8-8 prompts for a scope: `1) buy only`, `2) sell only`, `3) both (default)`. Propagated to DCM as `--force-execute-pending {buy|sell|both}`.
+- `_force_execute_pending_join(side)`:
+  1. Guards: aborts on non-trading day (Fix EL calendar) and outside RTH 9:30-16:00 ET (join needs live quotes).
+  2. Connects to IB with clientId=101 (matches PlaceAnOrder's placing clientId; required by IB per Fix BG/BO2 for cross-clientId cancel authority).
+  3. Enumerates pending BAG orders with status in (PreSubmitted, Submitted, Inactive). Filters by side: side=`buy` skips SELL BAGs entirely; side=`sell` skips BUY BAGs entirely.
+  4. Cancels all in-scope orders; polls up to 10s tracking only the target permIds (avoids waiting on unrelated BAG orders).
+  5. Writes `force_execute_pending,submitted,menu_8_8_{buy|sell}_join` rows per symbol to the attempts CSV.
+  6. Re-places via two `_run_place_an_order()` subprocesses:
+     - **BUYs**: `--mode from-signal --date {prev_folder} --use-live-open join --allow-prev-day-opens --oi-check off --rth-only` (Fix EK-b pattern; uses prev trading day CSV as signal source).
+     - **SELLs**: `--mode force-close --use-live-close join --fallback-individual-legs --client-id 101 --rth-only`.
+- `--rth-only` (Fix EK-b flag) prevents overnight Inactive+DAY carry-over of aggressive limits — IB cancels at 16:00 if unfilled.
+
+**PushButtonMenu.ps1 case `'8'`:**
+```powershell
+'8' {
+    Write-Host "Force-execute scope:"
+    Write-Host "  1) Only pending BUY orders (opens)"
+    Write-Host "  2) Only pending SELL orders (closes)"
+    Write-Host "  3) Both (default)"
+    $sideChoice = Read-Host "Select [1-3, default 3]"
+    switch ($sideChoice) {
+        '1' { $sideArg = 'buy' }
+        '2' { $sideArg = 'sell' }
+        Default { $sideArg = 'both' }
+    }
+    $argList += @("--force-execute-pending", $sideArg)
+}
+```
+
+**CLI dispatch (DCM `__main__` ~line 4488):**
+Uses ordered `sys.argv[1:]` (not the `_ch_argv` set) so the value following the flag can be read. Validates side against {buy, sell, both}; defaults invalid values to `both` with a warning.
+
+**What this does NOT do:**
+- Does NOT place MKT orders. All replacements are LMT at join price.
+- Does NOT affect scheduled tasks. Menu-only entry point.
+- Does NOT bypass RTH. Explicit time guard.
+- Does NOT touch non-BAG orders (individual leg orders from Fix AH1/AH2 worthless-close paths are left alone).
+- Does NOT re-signal via listener. Uses previous-day CSV; symbols without a signal there are skipped by PlaceAnOrder.
+
+**Verification:**
+1. RTH smoke, scope=Both: pending BUY and SELL exist -> log shows `--force-execute-pending(both): cancelling N order(s) - BUY=[...] SELL=[...]`; attempts CSV shows `force_execute_pending,submitted,menu_8_8_buy_join`/`_sell_join` rows; TWS shows new orders at join prices; fills within seconds live / 1-2 min paper.
+2. RTH smoke, scope=buy: SELL BAGs remain active in TWS untouched; only BUYs cancelled and re-placed.
+3. RTH smoke, scope=sell: symmetric — BUY BAGs untouched.
+4. After-hours (17:00): logs `outside RTH ... Aborting.`; no cancels.
+5. Weekend/holiday: logs `not a trading day; aborting.`; no cancels.
+6. No matching orders: logs `no matching pending BAG orders; nothing to do.`; clean exit.
+7. Cancel-poll timeout (>10s, rare): logs `N order(s) still active after 10s cancel poll; proceeding anyway`; PlaceAnOrder guard may then skip the symbol.
+
+---
+
+### Fix EO: Signal-Driven Weekday STK-Residual Flatten + Menu 8-4 Recovery (Jul 21)
+**Status:** IMPLEMENTED — supersedes Fix EJ-b's STK-flatten path
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — new `_close_syms_in_csv()`, `_flatten_stk_from_todays_csv()`, `_flatten_stk_from_latest_csv()`, `_flatten_stk_for_matching_close_syms()` methods after `_flatten_stock_if_present()` (~line 2053); `_flatten_stock_if_present()` gained `reason`/`source` params; `_after_hours_batch_placement(manual_recovery=False)` STK-flatten prelude (~line 2350); EJ-b STK block removed from `_delegate_close_from_csvs_within()` (~line 1111); new `--stk-recovery` argparse flag; **`--after-hours` interceptor in the FIRST `__main__` block (~line 4769)** — see dispatch note below. `PushButtonMenu.ps1` — menu 8-4 now passes `--after-hours --stk-recovery`.
+
+**`_flatten_stock_if_present()` hardening (four stacked fixes, all critical — the STK order path had never actually placed an order before EO because EJ-b never fired, so these latent bugs surfaced one-by-one as each prior fix let execution reach the next):**
+1. **Drop-on-disconnect (Fix AB4 pattern):** placed the MKT order then immediately hit `finally: ib.disconnect()` with no `ib.sleep()` — socket closed before IB acknowledged, order dropped despite attempts logger recording "submitted" (Jul 21: NI SELL x100 logged submitted, never in TWS). Fix: capture `trade`, `ib.sleep(1.5)`, read `trade.orderStatus.status`, only mark `submitted`/write attempts row when status is not Cancelled/ApiCancelled/Inactive.
+2. **Direct-route Error 10311 (Fix AB6c pattern):** STK contract from `ib.positions()` carries `exchange='NYSE'` → IB direct-routes → API Precautionary Settings reject with Error 10311 → order Cancelled. Fix: force `c.exchange = "SMART"` before `placeOrder` (matches every other order path in the codebase).
+3. **Oversell guard (double-submit prevention):** a pending SELL does NOT reduce `ib.positions()` qty, so a repeat menu 8-4 run (or a scheduled run after a manual one) placed a **second** full-size SELL → both fill → account goes short. Fix: before the position loop, `ib.reqAllOpenOrders()` + `ib.sleep(1.5)` and skip (`return False`) if a working STK order (PreSubmitted/Submitted/PendingSubmit/ApiPending) already exists for the symbol. Covers all four callers (which shared the latent risk).
+4. Order type stays MKT DAY (queues PreSubmitted pre-market, fills at 09:30 open; immediate during RTH). Worker scan `_flatten_stk_for_matching_close_syms` uses pre-warmed clientId **885** (was 895 — not in the Fix DG prewarm set → live-account approval-dialog risk).
+
+**Dispatch fix (critical — Fix CH dead-code trap):** DCM has two `if __name__ == "__main__":` blocks. The first (live) intercepts specific flags then falls through to `daily_trading_cycle()` + `sys.exit()`; the second (argparse, holding `if args.after_hours:`) is dead code. Menu 8-4's `--after-hours` was never dispatched — it fell through to `daily_trading_cycle()`, which pre-market/pre-close runs the reconcile lookback instead of the after-hours batch (confirmed Jul 21: menu 8-4 at 07:49 AM logged "running reconcile lookback", no STK order). Fix: added `if "--after-hours" in _ch_argv:` interceptor in the FIRST block → `r._after_hours_batch_placement(manual_recovery=("--stk-recovery" in _ch_argv))`. Menu 8-4 is now a true manual "5 PM trigger" (opens + close sweeps + STK flatten) regardless of clock. The scheduled 5 PM path (`daily_trading_cycle()` after-hours branch) was always correct and unaffected. Menu 8-4 is the only `--after-hours` caller.
+
+**Incident:** User holds 100-share STK residuals (from option assignment/exercise) for PBR, FE, NI. CLOSE signals arrived — PBR Mon Jul 13, FE Tue Jul 14, NI Mon Jul 20 — none of the shares sold.
+
+**Two structural gaps in Fix EJ (Jun 30):**
+
+**Gap 1 (primary — explains NI): No weekday code path fires STK-flatten.** The 5 PM after-hours cycle runs two paths: `_reconcile_positions_with_signals_lookback()` filters out STK (`secType != 'OPT': continue` at ~line 2472), and `_after_hours_batch_placement()`'s 21-day sweep that reaches EJ-b's STK block is gated `if ny_today.weekday() == 6:` (Sunday only). The two other `_flatten_stock_if_present` call sites live inside the OPT-symbol pick loop. So no weekday path ever flattens an STK-only residual. NI's Mon CLOSE placed nothing Mon evening → no order to fill Tue.
+
+**Gap 2 (compounds for PBR/FE): "Latest signal is CLOSE" gate.** Even on the Sunday sweep, EJ-b's `pick` filter (~line 1063, "newest CSV row wins") dropped PBR (Jul 13 CLOSE → Jul 14 CALL_OPEN) and FE (Jul 14 CLOSE → Jul 15 CALL_OPEN) because their latest signal became CALL_OPEN. `attempts_26_07_19.csv` confirms zero PBR/FE entries on Sun Jul 19. That gate is correct for OPT close routing but wrong for assignment residuals, which live outside the option strategy's OPEN/CLOSE lifecycle.
+
+**Fix — signal-driven, per-signal (semantics agreed with user):**
+
+- **Scheduled 5 PM cycle (weekday + Sunday):** `_after_hours_batch_placement()` runs `_flatten_stk_from_todays_csv()` as a prelude (before OPT logic). Reads TODAY's `combined_listener_spreads.csv`, collects CLOSE symbols, intersects with held STK positions, MKT-SELLs each. Strict — missed signals do not retroactively fire.
+- **Menu 8-4 manual recovery:** passes `--stk-recovery` → additionally runs `_flatten_stk_from_latest_csv(max_days=3)`, which walks back up to 3 calendar days and uses the MOST RECENT CSV containing any CLOSE row. Acts as a manual "5 PM trigger" for a signal that missed its same-day cycle.
+- **Order type:** MKT via existing `_flatten_stock_if_present()`. RTH → immediate fill; after-hours → Inactive+DAY, fills next open.
+- **ClientId:** flatten scan uses clientId=895 (distinct from 881 used by `_flatten_stock_if_present`'s own connection); the two connect sequentially, not concurrently.
+- **Attempts CSV:** `close_stock,submitted,stk_flatten_from_todays_close_signal` (scheduled) or `stk_flatten_from_latest_csv_recovery` (menu 8-4), `source=dcm-stk-flatten`. Written inside `_flatten_stock_if_present` via the new `reason`/`source` params — no double-write.
+
+**EJ-b removal:** the `held_stock_syms` scan and the `for _stk_sym in list(pick)` loop (old lines 1111-1134) removed from `_delegate_close_from_csvs_within()`. The Sunday OPT sweep (from-signal Stage 1, live-mid 1.5, CSV Stage 2, AB7 OPT filter) is untouched. Sunday STK cleanup now runs via `_flatten_stk_from_todays_csv()` on the EJ-a path (typically a no-op Sundays — no Sunday listener CSV; the CLOSE was already handled by its own weekday 5 PM cycle).
+
+**What this does NOT do:**
+- Does NOT auto-flatten PBR/FE (both >3 days old, outside recovery window) — user sells manually in TWS.
+- Does NOT close STK before 4 PM on the signal day unless the user runs menu 8-4 during RTH; the scheduled task fires at 5 PM (Inactive+DAY MKT SELL → fills next open).
+- Does NOT change OPT close routing semantics (`_latest_signal_is_close` for OPT still stands).
+- Does NOT touch STK for symbols with no CLOSE signal in the relevant CSV (safe for any hypothetical manually-acquired STK).
+
+**Verification:**
+1. Today, menu 8-4 during RTH → `_flatten_stk_from_latest_csv` finds `26_07_20` CSV → NI CLOSE → MKT SELL 100 NI → fills in seconds. PBR/FE untouched (>3 days). Log: `Fix EO stk-flatten (latest-csv 26_07_20): flattening STK residuals: ['NI']`; attempts CSV: `close_stock,submitted,stk_flatten_from_latest_csv_recovery,source=dcm-stk-flatten`.
+2. Scheduled 5 PM cycle: if today's CSV has a CLOSE for a held STK symbol, flatten; else `no matching held STK residuals`.
+3. Idempotency: next cycle after a flatten → position already 0 → `_flatten_stock_if_present` skips (qty=0), no attempts row.
+4. New assignment regression: Thu assignment + Thu CLOSE → Thu 5 PM flattens; a later Fri CALL_OPEN does not un-do it (already sold Thu).
+5. Weekend/holiday: `daily_trading_cycle()` Fix EL/CM guards prevent Sat/holiday fire; Sunday fires but today's-CSV pass no-ops.
 
 ---
 

@@ -1079,10 +1079,8 @@ class DailyCycleManagementMixin:
             # Fix AB7: Filter pick list to only symbols with held option positions.
             # Without this, all ~60 CLOSE signals from 21 days get processed through
             # 3 stages even when only ~4 have actual positions.
-            # Fix EJ-b: Also collect held STK symbols in the same scan so we can
-            # flatten assigned-stock residuals BEFORE the OPT filter drops them.
+            # (Fix EO: STK-residual handling moved out of this path — see note below.)
             held_option_syms: set[str] = set()
-            held_stock_syms: set[str] = set()
             try:
                 from ib_insync import IB as _IB_pos
                 _ib_pos = _IB_pos()
@@ -1094,12 +1092,6 @@ class DailyCycleManagementMixin:
                             sym = (getattr(c, "symbol", "") or "").upper()
                             if sym:
                                 held_option_syms.add(sym)
-                        elif c and getattr(c, "secType", "") == "STK":
-                            # Fix EJ-b: STK residual capture (only if non-zero qty)
-                            sym = (getattr(c, "symbol", "") or "").upper()
-                            qty = float(getattr(p, "position", 0.0) or 0.0)
-                            if sym and abs(qty) > 0:
-                                held_stock_syms.add(sym)
                 finally:
                     try:
                         _ib_pos.disconnect()
@@ -1108,30 +1100,12 @@ class DailyCycleManagementMixin:
             except Exception as e:
                 LOG.warning("Close-delegate: position scan failed (%s); proceeding unfiltered.", e)
 
-            # Fix EJ-b: STK-flatten pass BEFORE the OPT filter drops STK-only symbols.
-            # When an option leg is assigned/exercised, the OPT position goes to 0 and 100
-            # shares of STK remain as residual. Fix AB7's OPT-only filter (below) drops
-            # those symbols from `pick`, so the existing flatten-stock-on-CLOSE code at
-            # lines ~716 and ~1181 never fires. Handle them here first.
-            # Gate: symbol has a held STK position AND its latest signal (per
-            # `_latest_signal_is_close`) is CLOSE — matches the existing flatten semantic.
-            for _stk_sym in list(pick):
-                if _stk_sym not in held_stock_syms:
-                    continue
-                try:
-                    if not self._latest_signal_is_close(_stk_sym, days):
-                        continue
-                    if self._flatten_stock_if_present(_stk_sym):
-                        try:
-                            self._attempt(symbol=_stk_sym, action="close_stock", status="submitted",
-                                          reason=f"stk_flatten_no_opt_within_{days}d",
-                                          source="dcm-close")
-                        except Exception:
-                            pass
-                        LOG.info("Fix EJ-b: flattened %s STK residual (CLOSE signal in %dd window, no matching OPT held)",
-                                 _stk_sym, days)
-                except Exception as _ej_err:
-                    LOG.warning("Fix EJ-b: STK-flatten for %s failed: %s", _stk_sym, _ej_err)
+            # Fix EO: STK-residual flatten moved out of this Sunday-only path into
+            # `_flatten_stk_from_todays_csv()` (scheduled 5 PM, weekday + Sunday) and
+            # `_flatten_stk_from_latest_csv()` (menu 8-4 recovery), both called from
+            # `_after_hours_batch_placement()`. The old EJ-b block here used a
+            # "latest signal is CLOSE" gate that dropped assignment residuals once the
+            # option re-opened on the same underlying (PBR/FE). Superseded.
 
             if held_option_syms:
                 before = len(pick)
@@ -1998,10 +1972,15 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-    def _flatten_stock_if_present(self, sym: str) -> bool:
+    def _flatten_stock_if_present(self, sym: str, reason: str = "reconcile_close_signal",
+                                  source: str = "dcm-reconcile") -> bool:
         """
         If there is an open STOCK (STK) position for `sym`, flatten it with a MARKET order.
         Returns True if a stock order was submitted.
+
+        Args:
+            reason: attempts CSV reason (Fix EO callers pass a specific tag)
+            source: attempts CSV source column
         """
         try:
             from ib_insync import IB, Contract, MarketOrder
@@ -2019,6 +1998,31 @@ class DailyCycleManagementMixin:
         submitted = False
         up = (sym or "").upper()
         try:
+            # Fix EO followup #4a: prevent double-submit / oversell. A pending SELL does NOT
+            # reduce ib.positions() qty, so a second run (repeat menu 8-4, or scheduled run
+            # after a manual one) would place another full-size SELL → both fill → account
+            # goes short. Skip if a working STK order for this symbol already exists.
+            try:
+                ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+                ib.sleep(1.5)          # Fix AP: cross-clientId propagation
+                for _t in ib.openTrades() or []:
+                    _c = getattr(_t, "contract", None)
+                    _s = getattr(_t, "orderStatus", None)
+                    if not (_c and _s):
+                        continue
+                    if getattr(_c, "secType", "") != "STK":
+                        continue
+                    if (getattr(_c, "symbol", "") or "").upper() != up:
+                        continue
+                    if (getattr(_s, "status", "") or "").lower() in (
+                            "presubmitted", "submitted", "pendingsubmit", "apipending"):
+                        LOG.info("flatten-stock: %s already has a working STK order (status=%s) — "
+                                 "skipping to avoid oversell", up, _s.status)
+                        return False
+            except Exception as _wg_e:
+                LOG.warning("flatten-stock: working-order check failed for %s (%s); proceeding cautiously",
+                            up, _wg_e)
+
             for p in ib.positions() or []:
                 c = getattr(p, "contract", None)
                 if getattr(c, "secType", "") != "STK":
@@ -2032,15 +2036,31 @@ class DailyCycleManagementMixin:
                     action = "SELL" if qty > 0 else "BUY"
                     ord_qty = int(abs(qty))
                     order = MarketOrder(action, ord_qty)
-                    ib.placeOrder(c, order)
-                    submitted = True
-                    LOG.info("flatten-stock: submitted %s %s x%d via MKT (weekly/reconcile path)", up, action, ord_qty)
-                    try:
-                        _AttemptLogger.write(symbol=up, action="close_stock", status="submitted",
-                                             reason="reconcile_close_signal",
-                                             exp="", right="STK", source="dcm-reconcile")
-                    except Exception:
-                        pass
+                    order.tif = "DAY"  # MKT DAY queues pre-market and fills at the open
+                    # Fix EO followup #3: position contract carries exchange='NYSE' (its primary
+                    # exchange) → IB direct-routes → Error 10311 → order Cancelled. Force SMART
+                    # routing (same as every other order path, e.g. Fix AB6c).
+                    if getattr(c, "exchange", "") != "SMART":
+                        c.exchange = "SMART"
+                    trade = ib.placeOrder(c, order)
+                    # Fix EO followup: let IB acknowledge before the finally-disconnect drops
+                    # the order (same drop-on-disconnect bug as Fix AB4/AB5/BW). Without this
+                    # sleep the order never registers with IB despite the log saying "submitted".
+                    ib.sleep(1.5)
+                    st = (getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+                    if st.lower() in ("cancelled", "apicancelled", "inactive"):
+                        LOG.warning("flatten-stock: %s %s x%d NOT accepted (status=%s) — order not resting",
+                                    up, action, ord_qty, st)
+                    else:
+                        submitted = True
+                        LOG.info("flatten-stock: submitted %s %s x%d via MKT (%s) status=%s",
+                                 up, action, ord_qty, source, st)
+                        try:
+                            _AttemptLogger.write(symbol=up, action="close_stock", status="submitted",
+                                                 reason=reason,
+                                                 exp="", right="STK", source=source)
+                        except Exception:
+                            pass
                 except Exception as e:
                     LOG.warning("flatten-stock: failed to place stock close for %s: %s", up, e)
             return submitted
@@ -2049,6 +2069,157 @@ class DailyCycleManagementMixin:
                 ib.disconnect()
             except Exception:
                 pass
+
+    # ---------- Fix EO: signal-driven STK residual flatten ----------
+
+    def _close_syms_in_csv(self, csv_path: str) -> set[str]:
+        """
+        Fix EO helper: read one combined_listener_spreads.csv and return the unique
+        set of upper-case symbols where signal_type == 'CLOSE'. Returns empty set if
+        file missing / unreadable.
+        """
+        out: set[str] = set()
+        if not csv_path or not os.path.exists(csv_path):
+            return out
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as fh:
+                rdr = csv.DictReader(fh)
+                for r in rdr:
+                    sig = (r.get("signal_type") or "").strip().upper()
+                    if sig != "CLOSE":
+                        continue
+                    sym = (r.get("symbol") or "").strip().upper()
+                    if sym:
+                        out.add(sym)
+        except Exception as e:
+            LOG.warning("Fix EO: failed to read CLOSE syms from %s: %s", csv_path, e)
+        return out
+
+    def _flatten_stk_from_todays_csv(self) -> int:
+        """
+        Fix EO: strict same-day STK-flatten. Reads TODAY's listener CSV, finds all
+        CLOSE symbols, and for each held STK residual matching, submits MKT SELL.
+
+        Called from the scheduled 5 PM cycle (weekday + Sunday) via
+        `_after_hours_batch_placement()`. Missed signals do NOT retroactively fire
+        from this path; use `_flatten_stk_from_latest_csv()` for menu 8-4 recovery.
+
+        Returns the count of STK symbols flattened.
+        """
+        try:
+            today_folder = self._now_ny().strftime("%y_%m_%d")
+        except Exception:
+            today_folder = datetime.now(NY).strftime("%y_%m_%d")
+        csv_path = fr"C:\OptionsHistory\{today_folder}\combined_listener_spreads.csv"
+
+        close_syms = self._close_syms_in_csv(csv_path)
+        if not close_syms:
+            LOG.info("Fix EO stk-flatten (today %s): no CSV or no CLOSE signals; skipping.", today_folder)
+            return 0
+
+        return self._flatten_stk_for_matching_close_syms(
+            close_syms, reason="stk_flatten_from_todays_close_signal",
+            log_prefix=f"Fix EO stk-flatten (today {today_folder})",
+        )
+
+    def _flatten_stk_from_latest_csv(self, max_days: int = 3) -> int:
+        """
+        Fix EO: manual recovery path (menu 8-4). Walks back up to `max_days` calendar
+        days from today and picks the MOST RECENT combined_listener_spreads.csv that
+        contains at least one CLOSE row. Uses only that single CSV for the flatten.
+
+        Called only when menu 8-4 passes --stk-recovery. Not fired from the scheduled
+        5 PM cycle.
+
+        Returns the count of STK symbols flattened.
+        """
+        # Walk today, today-1, today-2, ... up to max_days back (calendar days;
+        # non-trading days simply have no CSV and are skipped).
+        chosen_folder: str | None = None
+        chosen_syms: set[str] = set()
+        try:
+            now = self._now_ny()
+        except Exception:
+            now = datetime.now(NY)
+        for d in range(0, max(1, max_days)):
+            folder = (now - timedelta(days=d)).strftime("%y_%m_%d")
+            csv_path = fr"C:\OptionsHistory\{folder}\combined_listener_spreads.csv"
+            syms = self._close_syms_in_csv(csv_path)
+            if syms:
+                chosen_folder = folder
+                chosen_syms = syms
+                break
+
+        if not chosen_folder:
+            LOG.info("Fix EO stk-flatten (latest-csv recovery, %d-day walk): no CSV with CLOSE signals found.", max_days)
+            return 0
+
+        LOG.info("Fix EO stk-flatten (latest-csv recovery): using %s (%d CLOSE syms).",
+                 chosen_folder, len(chosen_syms))
+        return self._flatten_stk_for_matching_close_syms(
+            chosen_syms, reason="stk_flatten_from_latest_csv_recovery",
+            log_prefix=f"Fix EO stk-flatten (latest-csv {chosen_folder})",
+        )
+
+    def _flatten_stk_for_matching_close_syms(self, close_syms: set[str], reason: str,
+                                             log_prefix: str) -> int:
+        """
+        Fix EO shared worker: scan `ib.positions()` for STK holdings, intersect with
+        `close_syms`, and flatten each match via `_flatten_stock_if_present(reason=...)`.
+        """
+        if not close_syms:
+            return 0
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("%s: ib_insync unavailable: %s", log_prefix, e)
+            return 0
+
+        held_stk_syms: set[str] = set()
+        ib = IB()
+        try:
+            # Fix EO followup #4b: clientId 885 (pre-warmed per Fix DG; used elsewhere for
+            # position scans). 895 was NOT pre-warmed → live-account approval dialog risk.
+            # Runs sequentially with _flatten_stock_if_present (clientId 881), no collision.
+            ib.connect(IB_HOST, IB_PORT, clientId=885, timeout=6)
+        except Exception as e:
+            LOG.warning("%s: IB connect failed: %s", log_prefix, e)
+            return 0
+        try:
+            for p in ib.positions() or []:
+                c = getattr(p, "contract", None)
+                if not c or getattr(c, "secType", "") != "STK":
+                    continue
+                sym = (getattr(c, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                qty = float(getattr(p, "position", 0.0) or 0.0)
+                if abs(qty) > 0:
+                    held_stk_syms.add(sym)
+        except Exception as e:
+            LOG.warning("%s: position scan failed: %s", log_prefix, e)
+            return 0
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        to_flatten = sorted(held_stk_syms & close_syms)
+        if not to_flatten:
+            LOG.info("%s: %d CLOSE sym(s); no matching held STK residuals.",
+                     log_prefix, len(close_syms))
+            return 0
+
+        LOG.info("%s: flattening STK residuals: %s", log_prefix, to_flatten)
+        flattened = 0
+        for sym in to_flatten:
+            try:
+                if self._flatten_stock_if_present(sym, reason=reason, source="dcm-stk-flatten"):
+                    flattened += 1
+            except Exception as e:
+                LOG.warning("%s: flatten failed for %s: %s", log_prefix, sym, e)
+        return flattened
 
     def _run_place_an_order(self, argv: list[str], timeout: int = 900) -> None:
         """
@@ -2347,13 +2518,30 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("Attempts summary failed: %s", e)
 
-    def _after_hours_batch_placement(self) -> None:
+    def _after_hours_batch_placement(self, manual_recovery: bool = False) -> None:
         """
         After-hours orchestration that *only* delegates to PlaceAnOrder.py.
         Policy: DCM never talks to the broker for opens; it filters signals and calls PlaceAnOrder.
         - Use last 2 CSVs; only OPENs with DTE >= 20.
         - Weekly CSV-based CLOSE sweeps only on Sundays, using a 21-day window.
+
+        Args:
+            manual_recovery: when True (menu 8-4 via --stk-recovery), also run the
+                latest-CSV STK-flatten recovery pass. The scheduled 5 PM cycle passes
+                False so it only flattens from TODAY's CSV signals.
         """
+        # Fix EO: signal-driven STK-residual flatten. Runs BEFORE OPT logic so the
+        # MKT SELLs don't race with OPT-close paths. Assignment/exercise leaves 100
+        # STK shares behind after the OPT leg clears; the OPT-only close paths never
+        # see them. Today's-CSV pass fires on every after-hours cycle; latest-CSV
+        # recovery only when menu 8-4 explicitly requests it.
+        try:
+            self._flatten_stk_from_todays_csv()
+            if manual_recovery:
+                self._flatten_stk_from_latest_csv(max_days=3)
+        except Exception as e:
+            LOG.warning("Fix EO: STK-flatten pass failed (continuing): %s", e)
+
         ran_host = False
         if hasattr(self, "place_end_of_day_signals"):
             LOG.info("After-hours batch placement (host hook) starting...")
@@ -4136,6 +4324,161 @@ class DailyCycleManagementMixin:
             "--quiet",
         ])
 
+    def _force_execute_pending_join(self, side: str = "both") -> None:
+        """Menu 8-8 (Fix EN): Cancel pending BAG orders and re-place with join pricing
+        for immediate fill. RTH-only (needs live quotes).
+
+        Args:
+            side: "buy" (opens only), "sell" (closes only), or "both".
+        """
+        from datetime import time as _dt_time
+        side_l = (side or "both").lower().strip()
+        if side_l not in ("buy", "sell", "both"):
+            LOG.warning("--force-execute-pending: unknown side=%r; defaulting to 'both'", side)
+            side_l = "both"
+        want_buy = side_l in ("buy", "both")
+        want_sell = side_l in ("sell", "both")
+
+        now = self._now_ny()
+        if not self._is_trading_day(now):
+            LOG.warning("--force-execute-pending(%s): not a trading day; aborting.", side_l)
+            return
+        t = now.time()
+        if not (_dt_time(9, 30) <= t < _dt_time(16, 0)):
+            LOG.warning("--force-execute-pending(%s): outside RTH (%s); join pricing "
+                        "requires live bid/ask. Aborting.", side_l, t.strftime("%H:%M"))
+            return
+
+        # Phase 1: enumerate pending BAG orders (filtered by side)
+        from ib_insync import IB
+        ib = IB()
+        try:
+            ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
+        except Exception as e:
+            LOG.warning("--force-execute-pending(%s): IB connect failed: %s", side_l, e)
+            return
+
+        buy_syms: set[str] = set()
+        sell_syms: set[str] = set()
+        to_cancel: list = []  # list of ib_insync Trade objects
+        try:
+            ib.reqAllOpenOrders(); ib.sleep(1.5)
+            ib.reqOpenOrders(); ib.sleep(0.5)
+            for tr in ib.openTrades() or []:
+                c = getattr(tr, "contract", None)
+                o = getattr(tr, "order", None)
+                s = getattr(tr, "orderStatus", None)
+                if not (c and o and s):
+                    continue
+                if getattr(c, "secType", "") != "BAG":
+                    continue
+                status = (getattr(s, "status", "") or "").lower()
+                if status not in ("presubmitted", "submitted", "inactive"):
+                    continue
+                act = (getattr(o, "action", "") or "").upper()
+                sym = (getattr(c, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                # Side filter - skip orders outside the requested scope
+                if act == "BUY" and not want_buy:
+                    continue
+                if act == "SELL" and not want_sell:
+                    continue
+                to_cancel.append(tr)
+                if act == "BUY":
+                    buy_syms.add(sym)
+                elif act == "SELL":
+                    sell_syms.add(sym)
+
+            if not to_cancel:
+                LOG.info("--force-execute-pending(%s): no matching pending BAG orders; nothing to do.", side_l)
+                return
+
+            LOG.info("--force-execute-pending(%s): cancelling %d order(s) - BUY=%s SELL=%s",
+                     side_l, len(to_cancel), sorted(buy_syms), sorted(sell_syms))
+
+            # Phase 2: cancel all in-scope orders
+            for tr in to_cancel:
+                try:
+                    ib.cancelOrder(tr.order)
+                except Exception as e:
+                    LOG.warning("--force-execute-pending(%s): cancel failed for %s: %s",
+                                side_l, getattr(tr.contract, "symbol", "?"), e)
+
+            # Phase 3: poll until in-scope orders confirmed gone (Fix BO / AY2 pattern).
+            # Track by permId so we don't wait on unrelated BAG orders (e.g., SELL when side=buy).
+            _target_permids = {tr.order.permId for tr in to_cancel if getattr(tr.order, "permId", None)}
+            still: list = []
+            for _ in range(10):
+                ib.sleep(1.0)
+                still = [t for t in ib.openTrades()
+                         if getattr(t.contract, "secType", "") == "BAG"
+                         and getattr(t.order, "permId", None) in _target_permids
+                         and (t.orderStatus.status or "").lower() in
+                             ("presubmitted", "submitted", "inactive", "pendingcancel")]
+                if not still:
+                    break
+            if still:
+                LOG.warning("--force-execute-pending(%s): %d order(s) still active after "
+                            "10s cancel poll; proceeding anyway", side_l, len(still))
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        # Attempts CSV logging (per symbol, single row per action)
+        for sym in sorted(buy_syms):
+            try:
+                _AttemptLogger.write(symbol=sym, action="force_execute_pending",
+                                     status="submitted", reason="menu_8_8_buy_join",
+                                     source="dcm-menu-8-8")
+            except Exception:
+                pass
+        for sym in sorted(sell_syms):
+            try:
+                _AttemptLogger.write(symbol=sym, action="force_execute_pending",
+                                     status="submitted", reason="menu_8_8_sell_join",
+                                     source="dcm-menu-8-8")
+            except Exception:
+                pass
+
+        # Phase 4: re-place with join pricing - separate PlaceAnOrder calls
+        if buy_syms:
+            # Use previous trading day's CSV as signal source (matches Fix EK-b pattern).
+            # These BUYs are re-placements of orders originally placed from that CSV.
+            prev_folder = self._prev_trading_day_folder()
+            LOG.info("--force-execute-pending: re-placing %d BUY BAG(s) via join (from %s CSV): %s",
+                     len(buy_syms), prev_folder, sorted(buy_syms))
+            self._run_place_an_order([
+                "--mode", "from-signal",
+                "--date", prev_folder,
+                "--symbols", ",".join(sorted(buy_syms)),
+                "--use-live-open", "join",
+                "--use-live-close", "off",
+                "--allow-prev-day-opens",
+                "--oi-check", "off",
+                "--min-limit", "0.05",
+                "--bump-to-min",
+                "--live-timeout", "10",
+                "--rth-only",
+                "--quiet",
+            ])
+
+        if sell_syms:
+            LOG.info("--force-execute-pending: re-placing %d SELL BAG(s) via join: %s",
+                     len(sell_syms), sorted(sell_syms))
+            self._run_place_an_order([
+                "--mode", "force-close",
+                "--symbols", ",".join(sorted(sell_syms)),
+                "--use-live-close", "join",
+                "--fallback-individual-legs",
+                "--live-timeout", "10",
+                "--client-id", "101",
+                "--rth-only",
+                "--quiet",
+            ])
+
     def run_rth_open_cleanup(self) -> None:
         """
         Call this once shortly after the market opens (~09:35 ET).
@@ -4467,6 +4810,39 @@ if __name__ == "__main__":
             LOG.info("DailyCycleManagement runner completed.")
             sys.exit(0)
 
+        if "--after-hours" in _ch_argv:
+            # Fix EO: menu 8-4 manual "5 PM trigger". The second argparse __main__ block
+            # (args.after_hours) is dead code — sys.exit() fires here first — so --after-hours
+            # silently fell through to daily_trading_cycle(), which pre-market/pre-close runs
+            # the reconcile lookback instead of the after-hours batch. Dispatch directly so the
+            # after-hours batch (opens + close sweeps + STK-flatten prelude) actually runs.
+            _stk_recovery = "--stk-recovery" in _ch_argv
+            LOG.info("--after-hours: running _after_hours_batch_placement(manual_recovery=%s) directly (menu 8-4)",
+                     _stk_recovery)
+            r._after_hours_batch_placement(manual_recovery=_stk_recovery)
+            LOG.info("DailyCycleManagement runner completed.")
+            sys.exit(0)
+
+        # Fix EN: menu 8-8 --force-execute-pending {buy|sell|both}
+        # Cancel all pending BAG orders (filtered by side) and re-place with join pricing.
+        # Uses ordered list (not the _ch_argv set) because we need the value that follows the flag.
+        _fep_side = None
+        _argv_list = sys.argv[1:]
+        for _i, _a in enumerate(_argv_list):
+            if _a == "--force-execute-pending" and _i + 1 < len(_argv_list):
+                _fep_side = (_argv_list[_i + 1] or "").lower().strip()
+                break
+        if _fep_side is not None:
+            if _fep_side not in ("buy", "sell", "both"):
+                LOG.warning("--force-execute-pending: invalid side=%r; using 'both'", _fep_side)
+                _fep_side = "both"
+            LOG.info("--force-execute-pending(%s): menu 8-8 - cancelling %s pending BAG orders "
+                     "and re-placing with join pricing",
+                     _fep_side,
+                     {"buy": "BUY", "sell": "SELL", "both": "BUY+SELL"}[_fep_side])
+            r._force_execute_pending_join(side=_fep_side)
+            sys.exit(0)
+
         # No specific flag: run the full time-aware daily cycle (PlaceOpen.cmd / scheduled tasks)
         r.daily_trading_cycle()
         LOG.info("DailyCycleManagement runner completed.")
@@ -4490,6 +4866,8 @@ if __name__ == "__main__":
                         help="Pre-close sweep (≈15:00 ET): convert CLOSE LMTs & mismatches.")
     parser.add_argument("--after-hours", action="store_true",
                         help="After-hours batch: delegate opens and enforce CLOSE signals.")
+    parser.add_argument("--stk-recovery", action="store_true",
+                        help="With --after-hours: also run latest-CSV STK-flatten recovery (menu 8-4, Fix EO).")
     parser.add_argument("--enforce-closes", type=int, default=0,
                         help="If >0: enforce recent CLOSE signals for last N days (fallback path).")
     parser.add_argument("--risk-exits-only", action="store_true",
@@ -4523,7 +4901,7 @@ if __name__ == "__main__":
             host._pre_close_market_conversion()
 
         if args.after_hours:
-            host._after_hours_batch_placement()
+            host._after_hours_batch_placement(manual_recovery=args.stk_recovery)
 
         if args.reconcile:
             host._reconcile_positions_with_signals_lookback(days=21)
