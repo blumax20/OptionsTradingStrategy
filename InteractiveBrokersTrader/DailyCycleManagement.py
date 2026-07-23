@@ -29,6 +29,17 @@ WEEKLY_MAINTENANCE_DAY = 6             # Sunday
 # Minimum OI required for at least one leg to keep an order during RTH
 MIN_OI_FOR_RTH = 100
 
+# Fix EP: Risk-exit SL/TP master switch. Flip to False to disable entirely (kill switch).
+# Kept True: the sanity check below now protects against the socket-contention
+# mispricing that caused the PBR/ISRG false stop-outs on 2026-07-21 (reqMktData on
+# a contended API port returned near-zero garbage -> false STOP -> spread dumped).
+RISK_EXITS_ENABLED = True
+
+# Fix EP sanity fraction: if the live reqMktData spread value is below this fraction
+# of IB's portfolio-mark spread value, the live read is treated as unreliable
+# (socket contention) and the reliable portfolio/account mark is used instead.
+RISK_EXIT_SANITY_FRAC = 0.6
+
 # Fix EL: NYSE full-day closures. Verified against nyse.com/markets/hours-calendars.
 # Update annually as new years are announced (typically each fall for the following year).
 # Does NOT include early-close days (1 PM close) -- Fix EL only addresses full closures;
@@ -3093,6 +3104,10 @@ class DailyCycleManagementMixin:
         We infer entry price from OPEN executions per leg and compute current net using mid quotes per leg.
         If thresholds are met, we delegate the actual close placement to PlaceAnOrder (--mode force-close).
         """
+        # Fix EP: master on/off switch (kill switch). See RISK_EXITS_ENABLED at top of file.
+        if not RISK_EXITS_ENABLED:
+            LOG.info("Risk exits: disabled (RISK_EXITS_ENABLED=False) -- skipping.")
+            return
         try:
             from ib_insync import IB, Contract, Ticker, util, ExecutionFilter
         except Exception as e:
@@ -3119,7 +3134,9 @@ class DailyCycleManagementMixin:
                 return v is not None and not math.isnan(v)
             if _valid(t.bid) and _valid(t.ask):
                 if t.bid == 0 and t.ask == 0:
-                    return 0.0  # Worthless option
+                    # Fix EP: empty book (contended socket / feed not ready) != worthless.
+                    # Return None so the portfolio-mark path is used, not a false 0.0.
+                    return None
                 if t.ask > 0 and t.bid >= 0:
                     return (t.bid + t.ask) / 2
             return t.last if _valid(t.last) else None
@@ -3426,25 +3443,40 @@ class DailyCycleManagementMixin:
                         if _v is not None:
                             if _du_best_s is None or _v > _du_best_s:
                                 _du_best_s = _v
-                    curr = None
-                    ml = _du_best_l
-                    ms = _du_best_s
-                    # Fix AG1: fallback to portfolio market prices if reqMktData returns None
-                    if ml is None:
-                        ml = port_prices.get(long_leg["conId"])
-                        if ml is not None:
-                            LOG.info("Risk exits: %s %s using portfolio price for long leg (%.0f): %.4f",
-                                     sym, right, strike_low, ml)
-                    if ms is None:
-                        ms = port_prices.get(short_leg["conId"])
-                        if ms is not None:
-                            LOG.info("Risk exits: %s %s using portfolio price for short leg (%.0f): %.4f",
-                                     sym, right, strike_high, ms)
-                    if ml is not None and ms is not None:
-                        curr = max(0.0, ml - ms)
+                    # Fix EP: compute BOTH the live reqMktData spread value and IB's
+                    # portfolio-mark spread value, then decide which to trust. reqMktData on
+                    # the contended open socket can return near-zero garbage (PBR 2026-07-21:
+                    # live=0.05 vs portfolio=0.24 -> false STOP -> spread dumped). The
+                    # portfolio/account-update stream (Fix AG1 port_prices) stays reliable.
+                    live_ml, live_ms = _du_best_l, _du_best_s
+                    port_ml = port_prices.get(long_leg["conId"])
+                    port_ms = port_prices.get(short_leg["conId"])
+                    curr_live = (max(0.0, live_ml - live_ms)
+                                 if (live_ml is not None and live_ms is not None) else None)
+                    curr_port = (max(0.0, port_ml - port_ms)
+                                 if (port_ml is not None and port_ms is not None) else None)
+
+                    # Trust the portfolio mark when live is missing OR implausibly below it.
+                    if curr_port is not None and (
+                        curr_live is None or curr_live < RISK_EXIT_SANITY_FRAC * curr_port
+                    ):
+                        curr, _price_src = curr_port, "portfolio"
+                        if curr_live is not None:
+                            LOG.warning(
+                                "Risk exits: %s %s %.0f/%.0f REJECTED live curr=%.2f "
+                                "(< %.0f%% of portfolio %.2f) -- reqMktData unreliable "
+                                "(socket contention); using portfolio mark",
+                                sym, right, strike_low, strike_high, curr_live,
+                                RISK_EXIT_SANITY_FRAC * 100, curr_port,
+                            )
+                    elif curr_live is not None:
+                        curr, _price_src = curr_live, "live"
+                    else:
+                        curr, _price_src = None, "none"
+
                     if curr is None:
-                        LOG.info("Risk exits: %s %s %.0f/%.0f skipped - no valid market data (ml=%s, ms=%s)",
-                                 sym, right, strike_low, strike_high, ml, ms)
+                        LOG.info("Risk exits: %s %s %.0f/%.0f skipped - no valid market data (live=%s, port=%s)",
+                                 sym, right, strike_low, strike_high, curr_live, curr_port)
                         return
                 except Exception as e:
                     LOG.warning("Risk exits: MD error for %s %s strikes(%s,%s): %s", sym, right, strike_low, strike_high, e)
@@ -3456,8 +3488,12 @@ class DailyCycleManagementMixin:
                 # take-profit: current >= entry + gain_frac * (width - entry)
                 tp_hit = curr >= entry + gain_frac * max(0.0, (width - entry))
 
-                LOG.info("Risk exits: %s %s %.0f/%.0f entry=%.2f curr=%.2f width=%.2f stop=%s tp=%s",
-                         sym, right, strike_low, strike_high, entry, curr, width, stop_hit, tp_hit)
+                # Fix EP: full pricing breakdown so any future mispricing is diagnosable in one line.
+                LOG.info("Risk exits: %s %s %.0f/%.0f entry=%.2f curr=%.2f(%s) live=%s port=%s "
+                         "legs live[L=%s S=%s] port[L=%s S=%s] width=%.2f stop=%s tp=%s",
+                         sym, right, strike_low, strike_high, entry, curr, _price_src,
+                         curr_live, curr_port, live_ml, live_ms, port_ml, port_ms,
+                         width, stop_hit, tp_hit)
 
                 if not (stop_hit or tp_hit):
                     return

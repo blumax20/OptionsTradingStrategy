@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 21, 2026 (Fix EO: Signal-driven weekday STK-residual flatten + menu 8-4 recovery; supersedes EJ-b STK path)
+**Last Updated:** July 23, 2026 (Fix EP: Risk-exit decision sanity check — portfolio-mark-authoritative pricing + diagnostics + RISK_EXITS_ENABLED on/off switch)
 
 ---
 
@@ -5214,6 +5214,43 @@ Uses ordered `sys.argv[1:]` (not the `_ch_argv` set) so the value following the 
 3. Idempotency: next cycle after a flatten → position already 0 → `_flatten_stock_if_present` skips (qty=0), no attempts row.
 4. New assignment regression: Thu assignment + Thu CLOSE → Thu 5 PM flattens; a later Fri CALL_OPEN does not un-do it (already sold Thu).
 5. Weekend/holiday: `daily_trading_cycle()` Fix EL/CM guards prevent Sat/holiday fire; Sunday fires but today's-CSV pass no-ops.
+
+---
+
+### Fix EP: Risk-Exit Decision Sanity Check + Diagnostics + On/Off Switch (Jul 23)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — module constants `RISK_EXITS_ENABLED`/`RISK_EXIT_SANITY_FRAC` (~line 32); `_rth_risk_exits()` on/off guard (~line 3099); `_mid()` empty-book fix (~line 3123); `_process_vertical()` sanity check (~line 3446); enhanced decision log (~line 3491). **PlaceAnOrder.py (execution) intentionally untouched.**
+
+**Incident:** On 2026-07-21 09:48 the RTH risk-exit pass stop-lossed **PBR** (CALL 18/18.5, exp Aug 14) and **ISRG** (CALL 390/395) on garbage prices. PBR realized **−$45.32** on a $0.49 entry (long 18C +$3.34, short 18.5C −$48.66). The `force_close` SELL went out at LMT **$0.05** for a spread whose true value was ~**$0.24**, rested unfilled ~45 min, then filled at ~$0.03 net.
+
+**Root cause (confirmed from `ib_cycle.log` — NOT cold data, NOT low OI):** at 09:46–09:48 there was heavy connect/disconnect churn and multi-client contention on API port 7497 (clientId 101 subprocess sessions of 4–9s each, plus the listener on clientId 42, plus the risk-exit on clientId 878). IBKR's data was live and correct — its **portfolio/account-update stream** reported PBR long 18C=$0.7645 / short 18.5C=$0.5208 → true spread ≈ **$0.24** the entire time. What failed was our **`reqMktData` subscription on the contended socket**, which returned a near-zero/partial snapshot → `_mid` computed **curr=$0.05** → false STOP (`PBR CALL 18/18 entry=0.49 curr=0.05 ... stop=True`; ISRG hit identically with `curr=0.00`; AER/AZN escaped only because their quotes happened to be ready). PBR OI was high (846/6943) and there were no 10197/10091/354 errors — ruling out low OI and subscription/competing-session causes.
+
+The pre-existing logic had the priority backwards: it trusted the **fragile** channel (`reqMktData` mid) first and only fell back to the **reliable** channel (portfolio mark) when the live value was literally `None` (Fix AG1). A small-but-nonzero garbage value ($0.05) slipped straight through.
+
+**Note — TP vs SL confusion:** a 18/18.5 call debit spread is only worth its full $0.50 width *at expiration*; 24 DTE with the stock at 18.54 it's worth ~$0.24, so PBR was genuinely ~50% down (a real loss, never near a profit — TP threshold ~$0.485 was never approached). The STOP was borderline-legitimate; the **fill price** ($0.05 vs ~$0.24 fair) was the ~$20/contract of avoidable damage.
+
+**Scope (agreed with user):** minimal changes to the **risk-exit decision only**. The execution path (PlaceAnOrder force-close pricing/placement) works well and was left untouched. Keep a simple on/off switch. Add diagnostics so future mispricing is visible in one log line.
+
+**Fix — five changes, all in DailyCycleManagement.py:**
+1. **`RISK_EXITS_ENABLED = True`** master switch (kill switch — flip to `False` to disable all SL/TP; guarded as the first statement in `_rth_risk_exits()`). Covers all three call sites (daily cycle, `--risk-exits-only` 10:30 retry, dead argparse block). The 10:30 handler's enrichment + low-OI cleanup live outside the function and are unaffected.
+2. **`RISK_EXIT_SANITY_FRAC = 0.6`** — live is rejected if `curr_live < 0.6 × curr_port`.
+3. **`_mid()`**: `bid==ask==0` → return `None` (was `0.0`). Empty book = "no data," not "worthless," so it can't masquerade as a real price.
+4. **`_process_vertical()` sanity check:** compute BOTH `curr_live` (reqMktData max-poll) and `curr_port` (portfolio marks via Fix AG1 `port_prices`). Trust the portfolio mark when live is missing OR implausibly below it (`curr_live < RISK_EXIT_SANITY_FRAC × curr_port`); else use live; else skip. Directly implements the user's rule: *if the spread has real portfolio value, a garbage 0 must not trigger a stop.*
+5. **Enhanced decision log:** `entry=X curr=Y(source) live=.. port=.. legs live[L/S] port[L/S] width= stop= tp=` — full breakdown so socket-garbage vs real prices are diagnosable at a glance.
+
+**What this does NOT do:**
+- Does not touch PlaceAnOrder or any execution/order-placement pricing (`live_spread_price`, Fix AM, force-close) — out of scope; works well.
+- Does not reduce the underlying socket contention (deferred; the sanity check neutralizes its effect on the decision).
+- Does not change scheduled tasks, OI cleanup, opens, reconcile, or Fix EO STK-flatten.
+- Does not turn PBR's genuine ~50% loss into a win — it removes the extra ~$20/contract from dumping at $0.05 instead of ~$0.24, and prevents false stops when portfolio shows real value.
+
+**Verification:**
+1. `python -m py_compile DailyCycleManagement.py` — OK.
+2. Toggle: `RISK_EXITS_ENABLED = False` → next 9:48/10:30 run logs `Risk exits: disabled (RISK_EXITS_ENABLED=False) -- skipping.` and nothing else; set back to `True` to resume.
+3. Next contended open: `ib_cycle.log` shows e.g. `REJECTED live curr=0.05 (< 60% of portfolio 0.24) ... using portfolio mark` and `entry=0.49 curr=0.24(portfolio) live=0.05 port=0.24 legs live[...] port[...] stop=False/True tp=...`.
+4. Normal case (live ≈ portfolio): decision line shows `curr=X(live)` — behavior unchanged.
+5. No diffs in PlaceAnOrder.py.
 
 ---
 
