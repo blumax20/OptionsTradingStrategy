@@ -421,6 +421,12 @@ _CLOSE_REASON: str | None = None
 # (prevents Inactive+DAY carry-over into next trading day for 10:30 low-OI retries).
 _RTH_ONLY: bool = False
 
+# Fix EQ: symbols being rolled to new strikes (strike-aware roll). For these, bypass the
+# same-side OPEN guard AND do NOT cancel the symbol's working CLOSE orders — the roll's
+# MKT close of the OLD strikes must survive while we open the NEW strikes. Set from
+# --roll-symbols in run_from_csv().
+_ROLL_SYMS: set = set()
+
 def record_attempt(symbol: str, action: str, status: str, reason: str, **fields):
     """
     Accumulate a row for this run and also emit a HEALTH_EVT line.
@@ -534,6 +540,9 @@ def parse_args():
                    help="Fix CQ: use --date CSV date instead of today for the same-day OPEN signal filter (10 AM skipped-opens retry only).")
     p.add_argument("--rth-only", action="store_true", default=False,
                    help="Fix EK-b: skip outsideRth=True on BAG orders so the order is DAY-only during RTH (IB cancels at 16:00 if unfilled).")
+    p.add_argument("--roll-symbols", type=str, default="",
+                   help="Fix EQ: comma-separated symbols being rolled to new strikes. For these, bypass the same-side "
+                        "OPEN guard and keep the existing (roll) CLOSE order of the OLD strikes.")
     p.add_argument("--live-timeout", type=float, default=3.0,
                    help="Timeout in seconds for live_spread_price() market data polling (default 3.0; use 8.0 at market open).")
     p.add_argument("--close-reason", type=str, default=None,
@@ -3179,13 +3188,17 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
     return submitted
 
 def run_from_csv():
-    global _CLOSE_REASON, _RTH_ONLY
+    global _CLOSE_REASON, _RTH_ONLY, _ROLL_SYMS
     args = parse_args()
     # Fix Z5: Set module-level close reason so all record_attempt calls include it
     _CLOSE_REASON = getattr(args, "close_reason", None)
     # Fix EK-b: propagate --rth-only to module-level flag consumed by _tag_after_hours_limit
     # and by the MKT paths in place_debit_spread that would otherwise set outsideRth=True.
     _RTH_ONLY = bool(getattr(args, "rth_only", False))
+    # Fix EQ: symbols being rolled — bypass same-side OPEN guard + keep the roll's OLD-strikes close.
+    _ROLL_SYMS = {s.strip().upper() for s in str(getattr(args, "roll_symbols", "") or "").split(",") if s.strip()}
+    if _ROLL_SYMS:
+        logger.info("Fix EQ: roll symbols (same-side guard bypass + keep roll close): %s", sorted(_ROLL_SYMS))
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     # Quiet console noise if requested
@@ -3578,15 +3591,20 @@ def run_from_csv():
                 if stype == "CALL_OPEN":
                     # Check if we already have a CALL position (same-side) -> skip
                     sym_sides = position_sides.get(symbol.upper(), set())
-                    if 'C' in sym_sides:
+                    _is_roll = symbol.upper() in _ROLL_SYMS  # Fix EQ: strike-aware roll bypass
+                    if 'C' in sym_sides and not _is_roll:
                         record_attempt(symbol, "open", "skipped", "skip_open_same_side_position",
                                        exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='C')
                         logger.info(f"[{symbol}] Skipping CALL_OPEN: already have CALL position")
                         continue
-                    # Latest-signal-wins: cancel any working CLOSE orders before we open
-                    cxl_close = cancel_close_orders_for_symbol(ib, symbol)
-                    if cxl_close > 0:
-                        logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
+                    if _is_roll:
+                        logger.info(f"[{symbol}] Fix EQ: roll — opening NEW CALL strikes despite held CALL (keeping roll's OLD-strikes close)")
+                    # Latest-signal-wins: cancel any working CLOSE orders before we open.
+                    # Fix EQ: for a roll, do NOT cancel — the roll's MKT close of the OLD strikes must survive.
+                    if not _is_roll:
+                        cxl_close = cancel_close_orders_for_symbol(ib, symbol)
+                        if cxl_close > 0:
+                            logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to CALL_OPEN")
                     # Fix S / Fix AA1: Proactively unwind existing PUT spreads (opposite side) using limit orders
                     # Fix AA1: Only allow CALL_OPEN if unwind succeeds; block if unwind fails or returns 0
                     if 'P' in sym_sides:
@@ -3640,15 +3658,20 @@ def run_from_csv():
                 elif stype == "PUT_OPEN":
                     # Check if we already have a PUT position (same-side) -> skip
                     sym_sides = position_sides.get(symbol.upper(), set())
-                    if 'P' in sym_sides:
+                    _is_roll = symbol.upper() in _ROLL_SYMS  # Fix EQ: strike-aware roll bypass
+                    if 'P' in sym_sides and not _is_roll:
                         record_attempt(symbol, "open", "skipped", "skip_open_same_side_position",
                                        exp=expiration, atm=float(atm) if not pd.isna(atm) else None, right='P')
                         logger.info(f"[{symbol}] Skipping PUT_OPEN: already have PUT position")
                         continue
-                    # Latest-signal-wins: cancel any working CLOSE orders before we open
-                    cxl_close = cancel_close_orders_for_symbol(ib, symbol)
-                    if cxl_close > 0:
-                        logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
+                    if _is_roll:
+                        logger.info(f"[{symbol}] Fix EQ: roll — opening NEW PUT strikes despite held PUT (keeping roll's OLD-strikes close)")
+                    # Latest-signal-wins: cancel any working CLOSE orders before we open.
+                    # Fix EQ: for a roll, do NOT cancel — the roll's MKT close of the OLD strikes must survive.
+                    if not _is_roll:
+                        cxl_close = cancel_close_orders_for_symbol(ib, symbol)
+                        if cxl_close > 0:
+                            logger.info(f"[{symbol}] Cancelled {cxl_close} pending CLOSE combo order(s) prior to PUT_OPEN")
                     # Fix S / Fix AA1: Proactively unwind existing CALL spreads (opposite side) using limit orders
                     # Fix AA1: Only allow PUT_OPEN if unwind succeeds; block if unwind fails or returns 0
                     if 'C' in sym_sides:

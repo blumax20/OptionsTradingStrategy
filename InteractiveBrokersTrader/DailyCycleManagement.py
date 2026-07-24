@@ -40,6 +40,18 @@ RISK_EXITS_ENABLED = True
 # (socket contention) and the reliable portfolio/account mark is used instead.
 RISK_EXIT_SANITY_FRAC = 0.6
 
+# Fix EQ: Strike-aware roll master switch. When True, the after-hours cycle detects a
+# still-held same-side spread whose strikes no longer match the latest same-side OPEN
+# signal (i.e. a prior CLOSE never filled) and rolls it: guaranteed MKT close of the OLD
+# strikes + LMT open of the NEW strikes, both executing at the next open. Flip to False
+# to disable (kill switch) — the reconcile then just holds the stale spread as before.
+ROLL_ON_STRIKE_MISMATCH = True
+
+# Fix EQ: a held long-leg strike is "materially" repriced vs the latest OPEN signal's
+# atm_strike when |signal_atm - held_longK| exceeds this multiple of the spread width.
+# Reuses Fix AF1's wrong-strike heuristic (1.5x width): filters out ordinary ATM drift.
+ROLL_MISMATCH_WIDTH_MULT = 1.5
+
 # Fix EL: NYSE full-day closures. Verified against nyse.com/markets/hours-calendars.
 # Update annually as new years are announced (typically each fall for the following year).
 # Does NOT include early-close days (1 PM close) -- Fix EL only addresses full closures;
@@ -855,6 +867,11 @@ class DailyCycleManagementMixin:
         # Track symbols for which a CLOSE was already submitted in this run
         submitted_close_syms = getattr(self, "_submitted_close_syms", set())
 
+        # Fix EQ: symbols rolled by _roll_repriced_positions() — their OLD strikes were just
+        # MKT-closed; open the NEW strikes here despite the still-held OLD position by passing
+        # --roll-symbols to PlaceAnOrder (bypasses its same-side guard, keeps the roll close).
+        roll_syms = getattr(self, "_roll_open_syms", set())
+
         now_d = self._now_ny().date()
         paths = DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, last_n_csvs))
         if not paths:
@@ -885,7 +902,8 @@ class DailyCycleManagementMixin:
                                    held_sign != signal_sign)
 
                         # If we already hold an options position in this symbol, skip unless it's a flip
-                        if sym in held_syms and not is_flip:
+                        # (Fix EQ: or a roll — rolled symbols are opened here with --roll-symbols).
+                        if sym in held_syms and not is_flip and sym not in roll_syms:
                             # Check if it's same-side (would be a duplicate) vs opposite-side (flip)
                             if held_sign == signal_sign:
                                 try:
@@ -955,8 +973,12 @@ class DailyCycleManagementMixin:
             # (Fix CQ) and skip stale OI check (10:30 AM cleanup cancels any low-OI orders).
             _prev_day_flags = (["--allow-prev-day-opens", "--oi-check", "off"]
                                if folder != today_folder else [])
+            # Fix EQ: for rolled symbols in this folder, pass --roll-symbols so PlaceAnOrder
+            # bypasses its same-side guard and keeps the roll's OLD-strikes MKT close.
+            _roll_in_folder = sorted(syms & roll_syms)
+            _roll_flags = ["--roll-symbols", ",".join(_roll_in_folder)] if _roll_in_folder else []
             argv = ["--mode","from-signal","--date",folder,"--symbols", ",".join(sorted(syms)),
-                    "--min-limit","0.05","--bump-to-min","--use-live-open","join","--quiet"] + _prev_day_flags
+                    "--min-limit","0.05","--bump-to-min","--use-live-open","join","--quiet"] + _prev_day_flags + _roll_flags
             try:
                 self._attempt(action="open", status="queued", reason=f"from_csv_{folder}", source="dcm-open")
             except Exception:
@@ -2529,6 +2551,240 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("Attempts summary failed: %s", e)
 
+    def _roll_mkt_close_old(self, sym: str, h: dict) -> bool:
+        """
+        Fix EQ: cancel any stale working CLOSE for `sym`, then place a guaranteed MKT
+        (DAY + outsideRth) SELL close of the held OLD-strikes debit vertical described by
+        `h` (long/short conIds, strikes, qty). Returns True if IB confirmed the order.
+
+        Deliberate carve-out to the "no MKT after hours" rule (Fixes Y3/AB3) — roll symbols
+        only. After hours the order goes Inactive+DAY and fills at the next open, so the old
+        spread is guaranteed to clear roughly when the new LMT open fills (no lingering 2x).
+        """
+        up = (sym or "").upper()
+        # Cancel any stale working close first (clientId 101, self-contained, polls until gone).
+        try:
+            self._cancel_symbol_close_orders(up)
+        except Exception as e:
+            LOG.warning("Roll: cancel stale close for %s failed (continuing): %s", up, e)
+        try:
+            from ib_insync import IB, Contract, ComboLeg, MarketOrder
+        except Exception as e:
+            LOG.warning("Roll: ib_insync unavailable for %s close: %s", up, e)
+            return False
+        ib = IB()
+        try:
+            # clientId=101 so the preclose cancel path (also 101) can cancel/replace it later (Fix BO2/BX).
+            ib.connect(IB_HOST, IB_PORT, clientId=101, timeout=6)
+        except Exception as e:
+            LOG.warning("Roll: connect failed for %s close (clientId=101): %s", up, e)
+            return False
+        try:
+            bag = Contract()
+            bag.symbol = up
+            bag.secType = 'BAG'
+            bag.exchange = 'SMART'
+            bag.currency = 'USD'
+            bag.comboLegs = [
+                ComboLeg(conId=int(h['longConId']), ratio=1, action='BUY', exchange='SMART'),
+                ComboLeg(conId=int(h['shortConId']), ratio=1, action='SELL', exchange='SMART'),
+            ]
+            order = MarketOrder('SELL', int(h['qty']))  # close a long debit vertical -> overall SELL
+            order.tif = "DAY"
+            order.outsideRth = True  # Fix EQ carve-out: after-hours MKT for roll only -> fills at open
+            tr = ib.placeOrder(bag, order)
+            LOG.info("Roll: %s -> MKT SELL close of OLD %s %.2f/%.2f (qty %d)",
+                     up, h['side'], h['longK'], h['shortK'], int(h['qty']))
+            # Confirm IB accepted the order before disconnecting (Fix ED pattern).
+            confirmed = False
+            working = {"PreSubmitted", "Submitted", "PendingSubmit"}
+            st = ""
+            perm = 0
+            for _ in range(20):  # 20 x 0.15s = 3s
+                ib.sleep(0.15)
+                st = getattr(tr.orderStatus, "status", "") or ""
+                perm = getattr(tr.orderStatus, "permId", 0)
+                if st == "Inactive" and order.tif == "DAY":
+                    confirmed = True; break
+                if st in working and perm != 0:
+                    confirmed = True; break
+                if st == "Filled":
+                    confirmed = True; break
+                if st in ("Cancelled", "ApiCancelled"):
+                    LOG.warning("Roll: %s MKT close rejected/cancelled (status=%s)", up, st); break
+            try:
+                _AttemptLogger.write(
+                    symbol=up, action="close", status=("placed" if confirmed else "error"),
+                    reason="roll_mkt_close", exp="", right=h['side'],
+                    longK=str(h['longK']), shortK=str(h['shortK']),
+                    order_type="MKT", order_action="SELL", qty=str(int(h['qty'])),
+                    source="dcm-roll",
+                )
+            except Exception:
+                pass
+            if confirmed:
+                LOG.info("Roll: %s MKT close confirmed (status=%s permId=%s)", up, st, perm)
+            else:
+                LOG.warning("Roll: %s MKT close NOT confirmed after 3s (status=%s permId=%s)", up, st, perm)
+            return confirmed
+        except Exception as e:
+            LOG.warning("Roll: MKT close placement failed for %s: %s", up, e)
+            return False
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    def _roll_repriced_positions(self, lookback_days: int = 2) -> None:
+        """
+        Fix EQ: Strike-aware roll. When a same-side OPEN signal arrives at materially
+        different strikes than a still-held spread (i.e. a prior CLOSE never filled), roll:
+          1. cancel any stale working CLOSE for the symbol,
+          2. submit a guaranteed MKT close of the OLD strikes (DAY + outsideRth -> fills at
+             the next open), and
+          3. mark the symbol in self._roll_open_syms so _delegate_open_from_recent_csvs opens
+             the NEW strikes via PlaceAnOrder with --roll-symbols (same-side guard bypass).
+
+        Runs in the after-hours cycle BEFORE _delegate_open_from_recent_csvs. Uses the same
+        last-`lookback_days`-CSV window as open-delegate so the reprice signal it detects is
+        one open-delegate can actually place. The MKT close is guaranteed to clear the old
+        spread at the open, so the two orders never leave us holding 2x the same side for long.
+        """
+        # Reset each cycle so stale roll marks can't leak into a later open-delegate pass.
+        self._roll_open_syms = set()
+        if not ROLL_ON_STRIKE_MISMATCH:
+            LOG.info("Roll: disabled (ROLL_ON_STRIKE_MISMATCH=False) -- skipping.")
+            return
+        try:
+            from ib_insync import IB
+        except Exception as e:
+            LOG.warning("Roll: ib_insync unavailable: %s", e)
+            return
+
+        def _to_f(v):
+            try:
+                x = float(str(v).strip())
+                return None if x != x else x
+            except Exception:
+                return None
+
+        # 1) Scan held option positions -> per symbol: held long/short leg (strike, conId), width, side.
+        ib = IB()
+        try:
+            ib.connect(IB_HOST, IB_PORT, clientId=890, timeout=6)  # 890: prewarmed (Fix DG), not concurrent here
+        except Exception as e:
+            LOG.warning("Roll: could not connect (clientId=890): %s", e)
+            return
+        held: dict[str, dict] = {}
+        try:
+            legs_by_sym: dict[str, list[dict]] = {}
+            for p in ib.positions() or []:
+                c = getattr(p, 'contract', None)
+                if getattr(c, 'secType', '') != 'OPT':
+                    continue
+                q = float(getattr(p, 'position', 0.0) or 0.0)
+                if abs(q) < 1e-9:
+                    continue
+                s = (getattr(c, 'symbol', '') or '').upper()
+                legs_by_sym.setdefault(s, []).append({
+                    'right': (getattr(c, 'right', '') or '').upper(),
+                    'strike': float(getattr(c, 'strike', 0.0)),
+                    'qty': q,
+                    'conId': getattr(c, 'conId', 0),
+                })
+            for s, legs in legs_by_sym.items():
+                for side in ('C', 'P'):
+                    longs = [l for l in legs if l['right'] == side and l['qty'] > 0]
+                    shorts = [l for l in legs if l['right'] == side and l['qty'] < 0]
+                    if not longs or not shorts:
+                        continue
+                    lng, sht = longs[0], shorts[0]
+                    held[s] = {
+                        'side': side,
+                        'longK': lng['strike'],
+                        'shortK': sht['strike'],
+                        'longConId': lng['conId'],
+                        'shortConId': sht['conId'],
+                        'width': abs(sht['strike'] - lng['strike']),
+                        'qty': int(abs(lng['qty'])) or 1,
+                    }
+                    break  # one vertical per symbol is the norm
+        except Exception as e:
+            LOG.warning("Roll: position scan failed: %s", e)
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        if not held:
+            LOG.info("Roll: no held verticals to evaluate.")
+            return
+
+        # 2) Latest signal per held symbol from the last `lookback_days` CSVs (same window as open-delegate).
+        from datetime import datetime as _dt
+        def _pts(s):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+                try:
+                    return _dt.strptime((s or "").strip(), fmt)
+                except Exception:
+                    continue
+            return None
+        latest: dict[str, dict] = {}
+        for path in DailyCycleManagementMixin._csv_paths_by_priority(days=max(1, lookback_days)):
+            try:
+                with open(path, newline="", encoding="utf-8") as fh:
+                    for r in csv.DictReader(fh):
+                        s = (r.get("symbol") or "").strip().upper()
+                        if not s or s not in held:
+                            continue
+                        st = (r.get("signal_type") or r.get("signal_side") or "").strip().upper()
+                        if "CALL" in st and "OPEN" in st:
+                            sig_side = 'C'
+                        elif "PUT" in st and "OPEN" in st:
+                            sig_side = 'P'
+                        else:
+                            sig_side = None  # CLOSE/unknown: latest CLOSE suppresses a roll
+                        ts = _pts(r.get("timestamp_ny")) or _dt.min
+                        prev = latest.get(s)
+                        if prev is None or ts >= prev['ts']:
+                            latest[s] = {'sig_side': sig_side, 'atm': _to_f(r.get("atm_strike")), 'ts': ts}
+            except Exception as e:
+                LOG.warning("Roll: failed reading %s: %s", path, e)
+
+        # 3) Decide + execute the roll for each candidate.
+        rolled: list[str] = []
+        for s, h in sorted(held.items()):
+            sig = latest.get(s)
+            if not sig or sig['sig_side'] is None:
+                continue  # no fresh OPEN signal, or latest signal is CLOSE -> not a roll
+            if sig['sig_side'] != h['side']:
+                continue  # opposite-side re-signal is a flip, handled by existing unwind logic
+            if sig['atm'] is None:
+                continue
+            gap = abs(float(sig['atm']) - float(h['longK']))
+            thr = ROLL_MISMATCH_WIDTH_MULT * max(h['width'], 0.01)
+            if gap <= thr:
+                continue  # ordinary ATM drift -> hold (no roll)
+            LOG.info("Roll: %s %s held longK=%.2f width=%.2f vs latest OPEN atm=%.2f "
+                     "(gap %.2f > %.1fx width) -> MKT close old + LMT open new",
+                     s, h['side'], h['longK'], h['width'], sig['atm'], gap, ROLL_MISMATCH_WIDTH_MULT)
+            try:
+                if self._roll_mkt_close_old(s, h):
+                    if not hasattr(self, "_roll_open_syms"):
+                        self._roll_open_syms = set()
+                    self._roll_open_syms.add(s)
+                    rolled.append(s)
+                else:
+                    LOG.warning("Roll: %s MKT close not confirmed; NOT opening new strikes this cycle.", s)
+            except Exception as e:
+                LOG.warning("Roll: execution failed for %s: %s", s, e)
+        if rolled:
+            LOG.info("Roll: marked %d symbol(s) for repriced reopen: %s", len(rolled), ", ".join(rolled))
+        else:
+            LOG.info("Roll: no repriced-reopen candidates this cycle.")
+
     def _after_hours_batch_placement(self, manual_recovery: bool = False) -> None:
         """
         After-hours orchestration that *only* delegates to PlaceAnOrder.py.
@@ -2562,6 +2818,15 @@ class DailyCycleManagementMixin:
                 ran_host = True
             except Exception as e:
                 LOG.exception("After-hours batch placement (host) failed: %s", e)
+
+        # Fix EQ: strike-aware roll — detect held spreads whose strikes no longer match the
+        # latest same-side OPEN signal (prior CLOSE never filled), MKT-close the OLD strikes
+        # and mark them so the open-delegate below opens the NEW strikes with --roll-symbols.
+        # Runs before open-delegate so rolled symbols are opened in the same cycle.
+        try:
+            self._roll_repriced_positions(lookback_days=2)
+        except Exception as e:
+            LOG.warning("Fix EQ: roll pass failed (continuing): %s", e)
 
         # Delegate OPENs from most recent CSVs under policy
         self._delegate_open_from_recent_csvs(min_dte=20, last_n_csvs=2)

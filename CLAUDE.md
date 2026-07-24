@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 23, 2026 (Fix EP: Risk-exit decision sanity check — portfolio-mark-authoritative pricing + diagnostics + RISK_EXITS_ENABLED on/off switch)
+**Last Updated:** July 24, 2026 (Fix EQ: Strike-aware roll — MKT-close old strikes + LMT-open new strikes when a repriced same-side OPEN arrives before the prior close fills)
 
 ---
 
@@ -5251,6 +5251,49 @@ The pre-existing logic had the priority backwards: it trusted the **fragile** ch
 3. Next contended open: `ib_cycle.log` shows e.g. `REJECTED live curr=0.05 (< 60% of portfolio 0.24) ... using portfolio mark` and `entry=0.49 curr=0.24(portfolio) live=0.05 port=0.24 legs live[...] port[...] stop=False/True tp=...`.
 4. Normal case (live ≈ portfolio): decision line shows `curr=X(live)` — behavior unchanged.
 5. No diffs in PlaceAnOrder.py.
+
+---
+
+### Fix EQ: Strike-Aware Roll — MKT-Close Old + LMT-Open New When a Repriced Reopen Arrives Before the Old Close Fills (Jul 24)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — module constants `ROLL_ON_STRIKE_MISMATCH`/`ROLL_MISMATCH_WIDTH_MULT` (~line 48); new methods `_roll_repriced_positions()` and `_roll_mkt_close_old()` (before `_after_hours_batch_placement`); call site in `_after_hours_batch_placement()` before `_delegate_open_from_recent_csvs()`; open-delegate `roll_syms` bypass + `--roll-symbols` argv. `InteractiveBrokersTrader/PlaceAnOrder.py` — module `_ROLL_SYMS`, `--roll-symbols` arg, set in `run_from_csv()`, consumed by the two same-side OPEN guards.
+
+**Incident:** The strategy reprices a position by emitting a CLOSE then a fresh same-side OPEN at new strikes. When the CLOSE fills, the reopen proceeds. But when the CLOSE fails to fill (illiquid combo priced above bid), the old spread stays held and the next same-side OPEN at new strikes is blocked by the strike-blind same-side guards (`skip_open_same_side_position` in DCM open-delegate and PlaceAnOrder; reconcile `latest_open_matches` hold). The position freezes on stale, deep-OTM strikes.
+
+Concrete case: ISRG held CALL 390/395 (Aug 14) since Jul 15; stock fell 389→353; Jul 17 CLOSE never filled; Jul 20 the strategy signaled CALL_OPEN **352.5/355** (Aug 21) → skipped as a same-side duplicate because 390/395 was still held.
+
+**Intended workflow (agreed with user):**
+- **Day N:** CLOSE signal → close order placed (existing path).
+- **Day N+1:** the Day-N close is still unfilled (old spread still held) **and** a new same-side OPEN at *materially different strikes* arrives → submit a guaranteed **MKT close** of the old strikes **and** a **LMT open** of the new strikes (both Inactive+DAY after hours).
+- **Day N+2 open:** the old closes at the open, the new fills → roll complete.
+
+The guaranteed MKT close is what makes the same-cycle LMT open safe: the old spread is certain to clear at the N+2 open, so the two orders never leave the account holding 2× the same side for long. Trigger = **any material strike mismatch** (per user), detected in the same last-2-CSV window that open-delegate places from.
+
+**Deliberate carve-out:** intentionally breaks the standing *"never place MKT orders after hours"* rule (Fixes Y3/AB3) — **for roll symbols only**. An after-hours MKT close (DAY + `outsideRth` → fills at the next open) trades opening-auction price risk for a guaranteed exit from the stale strikes. No other close path changes.
+
+**Design — `_roll_repriced_positions(lookback_days=2)`:**
+1. **Detect.** Scan held OPT positions (clientId 890, prewarmed): per symbol record the held long-leg strike/conId, short-leg conId, width, side ('C'/'P'). Load the latest signal per held symbol from the last 2 CSVs (same window as open-delegate). A symbol is a roll candidate when the latest signal is a same-side OPEN and `abs(signal_atm − held_longK) > ROLL_MISMATCH_WIDTH_MULT × width` (default 1.5 — reuses Fix AF1's wrong-strike heuristic). A latest CLOSE (or opposite-side OPEN) suppresses the roll.
+   - ISRG: `|352.5 − 390| = 37.5 > 1.5×5 = 7.5` → roll; ATM drift `390→392.5` (2.5) → hold.
+2. **MKT-close old** (`_roll_mkt_close_old`): cancel any stale working close (`_cancel_symbol_close_orders`, clientId 101), then place a BAG MKT SELL of the held vertical (`MarketOrder("SELL", qty)`, `tif="DAY"`, `outsideRth=True`, clientId 101 so preclose can cancel/replace it later). Confirm via the Fix ED status loop. Log `close,placed,roll_mkt_close` (or `error`) to the attempts CSV with `source=dcm-roll`.
+3. **Mark for reopen:** on confirmed close, add the symbol to `self._roll_open_syms` (reset at the start of each pass so stale marks can't leak). Do **not** open here.
+4. **Open new (same cycle):** `_delegate_open_from_recent_csvs()` reads `roll_syms`, lets rolled symbols past the same-side skip, and appends `--roll-symbols <syms>` to the PlaceAnOrder argv for the folder. PlaceAnOrder's two same-side guards bypass for `_ROLL_SYMS`, and (critically) **skip** `cancel_close_orders_for_symbol()` for those symbols so the roll's MKT close of the OLD strikes is not cancelled by the new OPEN.
+
+**Config + audit:** `ROLL_ON_STRIKE_MISMATCH = True` (kill switch → reconcile just holds as before), `ROLL_MISMATCH_WIDTH_MULT = 1.5`. One `LOG.info` per candidate with held longK/width vs signal atm and the gap/threshold.
+
+**What this does NOT do:**
+- Does not build a 4-leg combo or change any execution/pricing code (`live_spread_price`, force-close, PlaceAnOrder open pricing) — the open still goes through the normal PlaceAnOrder path with only the guard/cancel bypass.
+- Does not relax "no MKT after hours" for anything except roll-close symbols.
+- Does not change risk exits, OI cleanup, STK-flatten, reconcile hold/flip, or normal open/close/preclose flows.
+- Does not retroactively fix the already-stale ISRG (its Jul 20 signal is outside the 2-CSV window) — flatten that manually; Fix EQ handles the forward flow.
+- Does not require an explicit prior CLOSE signal — a still-held old spread + a materially-different same-side OPEN is the trigger.
+
+**Verification:**
+1. `python -m py_compile` both files — OK.
+2. Threshold + vertical-detection sanity (standalone): ISRG `(atm 352.5, longK 390, w 5)` → ROLL; `(392.5, 390, 5)` → hold; PUT `(60, 75, 2.5)` → ROLL; opposite side → skip; `$1`-wide `(27.5, 30, 1)` → ROLL.
+3. Next 5 PM cycle with a repriced held spread: `ib_cycle.log` shows `Roll: SYM C held longK=390.00 width=5.00 vs latest OPEN atm=352.50 (gap 37.50 > 1.5x width) -> MKT close old + LMT open new`; attempts CSV shows `close,placed,roll_mkt_close` (`dcm-roll`) and `open_*,placed,success` for the new strikes; both orders visible in TWS as Inactive+DAY.
+4. Next-open: old closes at the open, new fills → single-side position at new strikes; no lingering 2× (Health.ps1 / positions).
+5. Toggle `ROLL_ON_STRIKE_MISMATCH = False` → `Roll: disabled ... skipping`; reconcile holds the stale spread as before.
 
 ---
 
