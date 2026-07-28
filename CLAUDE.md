@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 27, 2026 (Fix ER: Independently disable stop-loss while keeping take-profit via RISK_EXIT_STOP_LOSS_ENABLED)
+**Last Updated:** July 28, 2026 (Fix EX: reject out-of-book `last` tick in strike selection; Fix EY: watchdog 2-consecutive hard-fail only in 16:00-16:30 window)
 
 ---
 
@@ -5331,3 +5331,39 @@ reason = "STOP(...)" if stop_act else "TP(...)"
 
 ---
 
+
+### Fix EX: Reject Out-of-Book `last` Tick in Strike Selection (Jul 28)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/listener.py` — new `_last_within_book()` helper (before `get_option_data`); price-selection block in `get_option_data` (~line 859).
+
+**Incident:** SF CALL_OPEN (Mon 7/27, signal 16:03:30) recorded `current_price=91.27` → ATM 90 → bought a 90/95 debit spread. IB daily bars show SF 7/27 **O=81.79 H=83.04 L=81.73 C=82.37** — 91.27 is **above the day's high**, so it was never a regular-session trade. It was a bad after-hours `last` print (thin AH liquidity). The signal landed at 16:03, inside the 16:00-16:30 window where Fix AN uses the market-hours branch (`last` first) — and there was no sanity check, so the outlier flowed straight into ATM selection. Result: a deep-OTM, near-worthless spread now held.
+
+**Fix:** `_last_within_book(last, bid, ask, tol=0.01)` returns `last` only if it sits inside `[bid*(1-tol), ask*(1+tol)]`; otherwise None. In `get_option_data`, precompute `mid` and a book-validated `last`, then:
+- Market-hours branch: valid-`last` → mid → close.
+- After-hours branch (>=16:30 / off-hours): close (official settlement) → valid-`last` → mid.
+A rejected `last` falls through to **mid** (freshest fair value) instead of the outlier, and logs `SYM: last X outside book [b, a] -- using mid Y (Fix EX)`. When bid/ask are unavailable, `last` is accepted as before (best effort); the existing `reqHistoricalData` fallback still covers the all-empty case. No extra IB calls in the hot path (bid/ask already fetched) — safe during a webhook burst.
+
+**Impact:** SF-type bad ticks (`last` 91.27 vs book ~82/83) are rejected → ATM snaps to the real strike from mid (~82.5). Legit fast-market prints within 1% of the book are unaffected.
+
+**Verification:** AST OK; `_last_within_book(91.27, 82.4, 82.7)` -> None, `(82.5, 82.4, 82.7)` -> 82.5, `(82.5, None, None)` -> 82.5.
+
+---
+
+### Fix EY: Watchdog — Require 2 Consecutive Hard-Fails Only in the 16:00-16:30 Window (Jul 28)
+**Status:** IMPLEMENTED (deployed only — `C:\OptionsHistory\bin\IB_Watchdog.ps1`; repo `bin/` copy is stale/diverged, not updated)
+
+**Incident:** The 16:01-16:07 close webhook burst (~21 signals, ~15-19s apart, each blocking the single-threaded Flask listener in `get_option_data`) starved the `/health` endpoint. The 16:07 watchdog check timed out (no werkzeug `/health` line between 16:01:22 and 16:08:16) → hard "Listener DOWN" → full `BounceServices` → IBGateway restart → **live-account 2FA** at ~4:30 PM. The saturation did NOT corrupt data (every webhook returned 200 and wrote its CSV row); only `/health` responsiveness suffered.
+
+**Fix:** In the hard `/health`-fail branch (CHECK 2), new flag file `watchdog_healthfail.txt` and time-boxed logic:
+- **Not in 16:00-16:30, OR IBGateway port DOWN:** unchanged — immediate `BounceServices` (clears the flag).
+- **In 16:00-16:30 AND port UP** (Gateway fine; likely close-burst starving `/health`): first hard-fail writes the flag and **defers one cycle** (`exit 0`, no restart); a **second consecutive** hard-fail (flag present, < 20 min) escalates to `BounceServices` (2FA accepted). No listener-only restart (user has had reliability issues with it).
+- **Healthy OK path:** clears the flag (resets the counter).
+
+Timing (checks at :07/:22/:37/:52; in-window = 16:07 and 16:22): this incident → 16:07 defer, 16:22 healthy → flag cleared → no BounceServices, no 2FA. Genuine death right before 16:07 → 16:07 defer, 16:22 BounceServices → 2FA ~15 min later.
+
+**Note:** The FIFO/async webhook-queue rework was considered and **deferred** — saturation doesn't corrupt output and Fix EY removes the only observed harm, so the ib_insync thread-safety risk isn't warranted now. Revisit only if a burst ever spans two 15-min watchdog checks.
+
+**Verification:** `[Parser]::ParseFile` PARSE OK; edits ASCII-only.
+
+---

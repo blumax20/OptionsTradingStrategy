@@ -788,6 +788,20 @@ def _safe_cancel_md(t):
     except Exception:
         pass
 
+def _last_within_book(last, bid, ask, tol=0.01):
+    """Fix EX: return `last` only if it's a plausible trade (inside the current
+    book +/- tol), else None. A print outside [bid, ask] by more than tol is an
+    erroneous/thin tick (e.g. SF 7/27 last=91.27 vs book ~82/83, above the day's
+    high) and must not drive ATM strike selection. When bid/ask are unavailable
+    we cannot validate, so `last` is accepted as-is (best effort)."""
+    if last is None:
+        return None
+    if bid is not None and ask is not None and ask >= bid > 0:
+        lo, hi = bid * (1.0 - tol), ask * (1.0 + tol)
+        if not (lo <= last <= hi):
+            return None
+    return last
+
 def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
     symbol = _clean_symbol(symbol)
@@ -845,22 +859,37 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
                 or (_now_al.hour == 16 and _now_al.minute >= 30)
                 or _now_al.hour > 16
             )
+            # Fix EX: reject an out-of-book `last` tick before it drives ATM
+            # selection. Precompute mid (freshest fair value) and a book-validated
+            # last. A rejected last falls through to mid rather than the outlier.
+            _bid = float(vals["bid"]) if vals.get("bid") is not None else None
+            _ask = float(vals["ask"]) if vals.get("ask") is not None else None
+            _mid = (_bid + _ask) / 2.0 if (_bid is not None and _ask is not None) else None
+            _last_raw = float(vals["last"]) if vals.get("last") is not None else None
+            _last_ok = _last_within_book(_last_raw, _bid, _ask)
+            if _last_raw is not None and _last_ok is None:
+                logger.warning(
+                    "%s: last %.2f outside book [%s, %s] -- using %s (Fix EX)",
+                    symbol, _last_raw, _bid, _ask,
+                    ("mid %.2f" % _mid) if _mid is not None else "close/fallback",
+                )
+            _close = float(vals["close"]) if vals.get("close") is not None else None
             if _after_hours_al:
-                # After hours: close (official settlement) > last (AH trade) > mid
-                if vals.get("close") is not None:
-                    current_price = float(vals["close"])
-                elif vals.get("last") is not None:
-                    current_price = float(vals["last"])
-                elif vals.get("bid") is not None and vals.get("ask") is not None:
-                    current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
+                # After hours: close (official settlement) > valid last > mid
+                if _close is not None:
+                    current_price = _close
+                elif _last_ok is not None:
+                    current_price = _last_ok
+                elif _mid is not None:
+                    current_price = _mid
             else:
-                # Market hours: last (real-time trade) > close > mid
-                if vals.get("last") is not None:
-                    current_price = float(vals["last"])
-                elif vals.get("close") is not None:
-                    current_price = float(vals["close"])
-                elif vals.get("bid") is not None and vals.get("ask") is not None:
-                    current_price = (float(vals["bid"]) + float(vals["ask"])) / 2.0
+                # Market hours: valid last (real-time trade) > mid > close
+                if _last_ok is not None:
+                    current_price = _last_ok
+                elif _mid is not None:
+                    current_price = _mid
+                elif _close is not None:
+                    current_price = _close
         except Exception:
             current_price = None
     # Always cancel stock market data after polling
