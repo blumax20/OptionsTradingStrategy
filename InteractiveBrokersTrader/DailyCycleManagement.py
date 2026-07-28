@@ -40,6 +40,12 @@ RISK_EXITS_ENABLED = True
 # (socket contention) and the reliable portfolio/account mark is used instead.
 RISK_EXIT_SANITY_FRAC = 0.6
 
+# Fix ER: independently disable the stop-loss branch of risk exits while keeping
+# take-profit. When False, a stop-loss condition is logged (stop=True(act=False))
+# but does NOT place a close; take-profit still triggers normally. RISK_EXITS_ENABLED
+# must remain True for take-profit to run.
+RISK_EXIT_STOP_LOSS_ENABLED = False
+
 # Fix EQ: Strike-aware roll master switch. When True, the after-hours cycle detects a
 # still-held same-side spread whose strikes no longer match the latest same-side OPEN
 # signal (i.e. a prior CLOSE never filled) and rolls it: guaranteed MKT close of the OLD
@@ -3753,18 +3759,22 @@ class DailyCycleManagementMixin:
                 # take-profit: current >= entry + gain_frac * (width - entry)
                 tp_hit = curr >= entry + gain_frac * max(0.0, (width - entry))
 
+                # Fix ER: SL can be turned off while TP stays on. stop_hit is kept for
+                # the log; stop_act is what actually triggers a close.
+                stop_act = stop_hit and RISK_EXIT_STOP_LOSS_ENABLED
+
                 # Fix EP: full pricing breakdown so any future mispricing is diagnosable in one line.
                 LOG.info("Risk exits: %s %s %.0f/%.0f entry=%.2f curr=%.2f(%s) live=%s port=%s "
-                         "legs live[L=%s S=%s] port[L=%s S=%s] width=%.2f stop=%s tp=%s",
+                         "legs live[L=%s S=%s] port[L=%s S=%s] width=%.2f stop=%s(act=%s) tp=%s",
                          sym, right, strike_low, strike_high, entry, curr, _price_src,
                          curr_live, curr_port, live_ml, live_ms, port_ml, port_ms,
-                         width, stop_hit, tp_hit)
+                         width, stop_hit, stop_act, tp_hit)
 
-                if not (stop_hit or tp_hit):
+                if not (stop_act or tp_hit):
                     return
 
                 # Build the same human-readable reason used in DailyCycle.log
-                reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_hit else "TP(>=%.0f%% max profit)" % (gain_frac*100)
+                reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_act else "TP(>=%.0f%% max profit)" % (gain_frac*100)
 
                 # Also append to DCM attempts CSV so we can see that this CLOSE is TP/SL-driven
                 try:

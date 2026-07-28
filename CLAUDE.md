@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 24, 2026 (Fix EQ: Strike-aware roll — MKT-close old strikes + LMT-open new strikes when a repriced same-side OPEN arrives before the prior close fills)
+**Last Updated:** July 27, 2026 (Fix ER: Independently disable stop-loss while keeping take-profit via RISK_EXIT_STOP_LOSS_ENABLED)
 
 ---
 
@@ -5294,6 +5294,40 @@ The guaranteed MKT close is what makes the same-cycle LMT open safe: the old spr
 3. Next 5 PM cycle with a repriced held spread: `ib_cycle.log` shows `Roll: SYM C held longK=390.00 width=5.00 vs latest OPEN atm=352.50 (gap 37.50 > 1.5x width) -> MKT close old + LMT open new`; attempts CSV shows `close,placed,roll_mkt_close` (`dcm-roll`) and `open_*,placed,success` for the new strikes; both orders visible in TWS as Inactive+DAY.
 4. Next-open: old closes at the open, new fills → single-side position at new strikes; no lingering 2× (Health.ps1 / positions).
 5. Toggle `ROLL_ON_STRIKE_MISMATCH = False` → `Roll: disabled ... skipping`; reconcile holds the stale spread as before.
+
+---
+
+### Fix ER: Independently Disable Stop-Loss While Keeping Take-Profit (Jul 27)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — module constant `RISK_EXIT_STOP_LOSS_ENABLED` (~line 54); `_rth_risk_exits._process_vertical()` stop/TP decision (~line 3757).
+
+**Motivation:** On live trading, the user wanted risk exits to keep taking profit but stop firing stop-losses "for now." The `RISK_EXITS_ENABLED` master switch (Fix EP) turns off *both* TP and SL, so a separate, finer gate was needed.
+
+**Change — one constant + a gated stop action:**
+```python
+# Fix ER (module level):
+RISK_EXIT_STOP_LOSS_ENABLED = False   # False => SL never closes; TP unaffected
+
+# _process_vertical():
+stop_hit = curr <= (1.0 - loss_frac) * entry          # unchanged (kept for logging)
+tp_hit   = curr >= entry + gain_frac * max(0.0, (width - entry))
+stop_act = stop_hit and RISK_EXIT_STOP_LOSS_ENABLED   # Fix ER: what actually triggers
+# log now shows: ... stop=%s(act=%s) tp=%s  (stop_hit, stop_act, tp_hit)
+if not (stop_act or tp_hit):
+    return
+reason = "STOP(...)" if stop_act else "TP(...)"
+```
+
+**Behavior:**
+- **Take-profit closes exactly as before.** `RISK_EXITS_ENABLED` stays `True` (the function must run for TP).
+- **Stop-loss no longer places a close.** A losing position logs `stop=True(act=False)` for visibility but rides until a CLOSE signal / preclose / reconcile handles it. (Ends the recurring PBR/ISRG-type deep-loss STOP attempts.)
+- Committed default is **`False`** (SL off) to match the running system; re-enable with `RISK_EXIT_STOP_LOSS_ENABLED = True`.
+- Takes effect on the next scheduled risk-exit run (fresh process; no restart).
+
+**Not committed:** the live-port toggle (`ib_config.py`/`Health.ps1` → 7496) remains an uncommitted local override, managed by `switch_trading_mode.py` — committing a live-by-default port is a deliberate no.
+
+**Verification:** `python -m py_compile` OK. Next 9:48/10:30 run: losing position logs `stop=True(act=False) tp=False` with no `rth_risk_exit:STOP` attempts row; a TP-hitting position still logs `rth_risk_exit:TP...` and closes.
 
 ---
 
