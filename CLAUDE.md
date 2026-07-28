@@ -5351,7 +5351,7 @@ A rejected `last` falls through to **mid** (freshest fair value) instead of the 
 ---
 
 ### Fix EY: Watchdog — Require 2 Consecutive Hard-Fails Only in the 16:00-16:30 Window (Jul 28)
-**Status:** IMPLEMENTED (deployed only — `C:\OptionsHistory\bin\IB_Watchdog.ps1`; repo `bin/` copy is stale/diverged, not updated)
+**Status:** IMPLEMENTED (deployed `C:\OptionsHistory\bin\IB_Watchdog.ps1`; repo `bin/IB_Watchdog.ps1` synced byte-for-byte)
 
 **Incident:** The 16:01-16:07 close webhook burst (~21 signals, ~15-19s apart, each blocking the single-threaded Flask listener in `get_option_data`) starved the `/health` endpoint. The 16:07 watchdog check timed out (no werkzeug `/health` line between 16:01:22 and 16:08:16) → hard "Listener DOWN" → full `BounceServices` → IBGateway restart → **live-account 2FA** at ~4:30 PM. The saturation did NOT corrupt data (every webhook returned 200 and wrote its CSV row); only `/health` responsiveness suffered.
 

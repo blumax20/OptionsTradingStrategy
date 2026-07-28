@@ -41,7 +41,7 @@
 # (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
 #   Paper trading : $IB_GW_PORT = 7497
 #   Live trading  : $IB_GW_PORT = 7496
-$IB_GW_PORT = 7497
+$IB_GW_PORT = 7496
 
 $LogDir = "C:\OptionsHistory\logs"
 $Log    = Join-Path $LogDir "watchdog.log"
@@ -49,6 +49,7 @@ $CooldownFile  = Join-Path $LogDir "watchdog_last_restart.txt"
 $PrewarmFlag   = Join-Path $LogDir "watchdog_prewarm_needed.txt"  # Fix DM
 $PrewarmCmd    = "C:\OptionsHistory\bin\PrewarmConnections.cmd"   # Fix DM
 $StoppedFlag   = Join-Path $LogDir "system_stopped.txt"           # Fix EI
+$HealthFailFlag = Join-Path $LogDir "watchdog_healthfail.txt"     # Fix EY: 2-consecutive hard-fail counter (close-burst window)
 $CooldownMinutes = 10
 $HealthUrl = "http://127.0.0.1:5001/health"
 
@@ -259,7 +260,33 @@ if (-not $needFullRestart) {
     }
     if (-not $httpOk -and -not $needFullRestart) {
         Write-Log "FAIL: /health did not return HTTP 200 (Listener DOWN or unhealthy)"
-        $needFullRestart = $true
+        # Fix EY: Between 16:00-16:30 ET the close webhook burst can starve the
+        # single-threaded listener so /health times out even though it is healthy.
+        # In that window, with the IBGateway port still UP, require 2 consecutive
+        # hard-fails before BounceServices (which kills IBGateway and forces a
+        # live-account 2FA). Outside the window, or if the port is DOWN, keep the
+        # original immediate behavior.
+        $nowEy = Get-Date
+        $inCloseWindow = ($nowEy.Hour -eq 16 -and $nowEy.Minute -lt 30)
+        if ($inCloseWindow -and $gw) {
+            $eyRecent = $false
+            if (Test-Path $HealthFailFlag) {
+                $eyAge = ((Get-Date) - (Get-Item $HealthFailFlag).LastWriteTime).TotalMinutes
+                if ($eyAge -lt 20) { $eyRecent = $true }
+            }
+            if ($eyRecent) {
+                Write-Log "HARD-FAIL (2nd consecutive) in 16:00-16:30 window, port UP -- escalating to BounceServices"
+                Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
+                $needFullRestart = $true
+            } else {
+                Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $HealthFailFlag -Encoding ASCII
+                Write-Log "HARD-FAIL: /health down in 16:00-16:30 window but port UP -- deferring one cycle (possible close-burst saturation)"
+                exit 0
+            }
+        } else {
+            Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
+            $needFullRestart = $true
+        }
     }
 }
 
@@ -322,6 +349,8 @@ if (-not $needFullRestart -and -not $needTunnelRestart) {
             Write-Log "PREWARM SKIP: $PrewarmCmd not found."
         }
     }
+    # Fix EY: healthy check clears the 2-consecutive hard-fail counter.
+    Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
     Write-Log "OK"
     exit 0
 }
