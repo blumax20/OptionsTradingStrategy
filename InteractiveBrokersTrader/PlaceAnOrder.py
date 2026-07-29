@@ -411,6 +411,7 @@ ATTEMPT_FIELDS = [
     "order_type","order_action","qty","order_id","prev_status",
     "raw_theo","oi_atm","oi_otm","threshold",
     "close_reason",  # Fix Z5: TP/SL reason from DCM risk exits
+    "source","uid",  # Fix EZ: canonical superset shared with DCM _AttemptLogger (24 cols)
 ]
 
 # Fix Z5: Module-level close reason, set from --close-reason CLI arg

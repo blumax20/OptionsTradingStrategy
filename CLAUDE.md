@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 28, 2026 (Fix EX: reject out-of-book `last` tick in strike selection; Fix EY: watchdog 2-consecutive hard-fail only in 16:00-16:30 window)
+**Last Updated:** July 29, 2026 (Fix EZ: attempts-CSV schema unification [EZ-1], roll tuning 1.0x width + 1-day lookback [EZ-2], Health unfilled-close flag [EZ-3])
 
 ---
 
@@ -5365,5 +5365,44 @@ Timing (checks at :07/:22/:37/:52; in-window = 16:07 and 16:22): this incident �
 **Note:** The FIFO/async webhook-queue rework was considered and **deferred** — saturation doesn't corrupt output and Fix EY removes the only observed harm, so the ib_insync thread-safety risk isn't warranted now. Revisit only if a burst ever spans two 15-min watchdog checks.
 
 **Verification:** `[Parser]::ParseFile` PARSE OK; edits ASCII-only.
+
+---
+
+### Fix EZ: Attempts-CSV Schema Unification + Roll Tuning (1.0x/1-day) + Health Unfilled-Close Flag (Jul 29)
+**Status:** IMPLEMENTED (EZ-1/EZ-2 committed; EZ-3 deployed in both `Health.ps1` files, which stay uncommitted due to the live-port `$IB_PORT` override)
+
+Three related fixes grouped under one commit, triggered by an SF investigation (held CALL 90/95, repriced CALL_OPEN to 85/90 that wasn't rolling; a 3 PM close placed at ~mid never filled; and no health signal for "close placed but never filled").
+
+#### EZ-1: Attempts-CSV schema unification (`PlaceAnOrder.py`, `DailyCycleManagement.py`)
+**Issue:** Two writers append to the same dated `attempts_<yy_mm_dd>.csv` with divergent schemas. PlaceAnOrder's `ATTEMPT_FIELDS` had `order_id, prev_status, raw_theo, oi_atm, oi_otm, threshold` (22 cols); DCM's `_AttemptLogger.write` had `source, uid` but lacked the OI columns (18 cols). Consequences depended on which process created the file first that day:
+1. **OI drop:** when DCM created the file, PlaceAnOrder's `_attempts_append` (reads existing header, `extrasaction="ignore"`) silently dropped `oi_atm/oi_otm/threshold` from open-skip rows.
+2. **Column misalignment:** when PlaceAnOrder created the file, DCM's `_AttemptLogger.write` always wrote its own 18-field order without reading the existing header, so 18 values landed under a 22-col header (every field from col 16 shifted). `Import-Csv` consumers (Health.ps1) then mapped values to wrong column names.
+
+**Fix:** One canonical 24-col superset used by both:
+`ts,symbol,action,status,reason,exp,right,atm,oth,limit,longK,shortK,order_type,order_action,qty,order_id,prev_status,raw_theo,oi_atm,oi_otm,threshold,close_reason,source,uid`
+- PlaceAnOrder `ATTEMPT_FIELDS` (line ~407): appended `source, uid`.
+- DCM `_AttemptLogger.write` (~line 127): row dict gained `order_id, prev_status, raw_theo, oi_atm, oi_otm, threshold`; new `_write_row()` helper now **reads and adopts the existing header** (with `extrasaction="ignore"`) for both the primary and dated writes — eliminating the misalignment.
+- DCM low-OI cancel sites (CSV `_cancel_low_oi_working_orders_from_csv` ~4308, live `_rth_liquidity_cleanup` ~4048) now also pass `oi_atm/oi_otm/threshold` into the dedicated columns (kept the `reason` string too for back-compat/grep).
+
+**Impact:** OI numbers land in `oi_atm/oi_otm` for every OI row regardless of which writer created the file; column alignment preserved both ways; Health.ps1 no longer mis-maps DCM rows. Verified by writing PlaceAnOrder-style + DCM-style rows to one file in both creation orders (24 aligned cols, OI present, `source`/`close_reason` correct).
+
+#### EZ-2: Roll tuning — 1.0x width + 1-day lookback (`DailyCycleManagement.py`)
+**Issue:** Fix EQ's roll gate (`gap > 1.5 x width`) was too lax — a full one-width strike reprice (SF: held longK 90 vs signal atm 85, width 5 -> gap 5 <= 7.5) was held, letting the old spread decay deep OTM (low bid, poor MKT-close economics). And the 2-day lookback could open a NEW position off a 1-trading-day-old OPEN signal at stale prior-day pricing; it was also at odds with the open-delegate's Fix DS (which drops older folders when today has signals), so a 2-day roll on a prior-day signal would MKT-close the old spread but never reopen (close-without-reopen).
+
+**Fix:**
+- `ROLL_MISMATCH_WIDTH_MULT` 1.5 -> **1.0** (line 59); gate `if gap <= thr` -> `if gap < thr` (~line 2790) so a full one-width drift rolls, sub-width wobble holds.
+- `_roll_repriced_positions` lookback 2 -> **1** (method default ~2661 + call site ~2849): the roll acts only on a SAME-DAY reprice using today's pricing, aligned with Fix DS so the close AND reopen happen together.
+- `ROLL_ON_STRIKE_MISMATCH` unchanged (`True`, rolling stays enabled).
+
+**Impact:** One-width reprices roll (MKT-close old + LMT-open new at today's pricing); no acting on day-old signals; no close-without-reopen. Trade-off: rolls fire somewhat more often (realizing the small residual value of the old spread + commissions) vs holding a decaying far-OTM spread. If the after-hours open can't price (`no_viable_limit_or_conditions`), the 10:00 AM PlaceSkippedOpens (Fix CP) retries it with live pricing once the old spread has MKT-closed at the open (position guard prevents double-exposure if the close hasn't filled). Roll runs only via `_after_hours_batch_placement` (menu 8-4 `--after-hours`, scheduled 5 PM, Sunday) — not 8-1/8-2/8-3.
+
+#### EZ-3: Health "Closes Attempted But Still Open" flag (both `Health.ps1` files)
+**Issue:** When a close is *placed* but never *fills* (e.g. low demand — a SELL limit at ~mid resting above the natural combo bid), the attempts CSV shows `placed`/`submitted` (never a fill), so there was no health signal that a close is stuck. The only cues were the symbol still in Current Positions and absent from Last-20-Closed.
+
+**Fix:** New read-only section (dedicated ASCII-only embedded Python probe, clientId 885) that reads today's attempts CSV for `action in {close, force_close, close_individual_leg}` + `status in {placed, submitted}`, connects IB for current positions, and prints each symbol that is BOTH (attempted a close today AND still held): `SYM close placed limit=.. (reason) -- STILL OPEN, likely unfilled (low demand); consider manual close`. Applied to repo `Health.ps1` and `C:\OptionsHistory\bin\Health.ps1`.
+
+**Impact:** SF-type "placed but didn't fill" closes surface in the daily health report for manual intervention. Verified: both files PowerShell-parse OK, embedded Python AST OK, zero stray `$var` interpolation.
+
+**Note:** `Health.ps1` and `ib_config.py` remain uncommitted (they carry the live-port `$IB_PORT`/config toggle); EZ-3's Health change is deployed to both files but not committed, consistent with that convention.
 
 ---

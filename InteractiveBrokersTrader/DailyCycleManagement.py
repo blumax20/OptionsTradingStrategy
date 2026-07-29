@@ -54,9 +54,10 @@ RISK_EXIT_STOP_LOSS_ENABLED = False
 ROLL_ON_STRIKE_MISMATCH = True
 
 # Fix EQ: a held long-leg strike is "materially" repriced vs the latest OPEN signal's
-# atm_strike when |signal_atm - held_longK| exceeds this multiple of the spread width.
-# Reuses Fix AF1's wrong-strike heuristic (1.5x width): filters out ordinary ATM drift.
-ROLL_MISMATCH_WIDTH_MULT = 1.5
+# atm_strike when |signal_atm - held_longK| meets/exceeds this multiple of the spread width.
+# Fix FA: lowered 1.5 -> 1.0 (roll when the ATM has moved a full width; the new spread only
+# abuts the old, e.g. old 90/95 vs new 85/90). Sub-width ATM wobble still holds (no churn on noise).
+ROLL_MISMATCH_WIDTH_MULT = 1.0
 
 # Fix EL: NYSE full-day closures. Verified against nyse.com/markets/hours-calendars.
 # Update annually as new years are announced (typically each fall for the following year).
@@ -135,26 +136,47 @@ class _AttemptLogger:
             "atm":          kw.get("atm", ""),
             "oth":          kw.get("oth", ""),
             "limit":        kw.get("limit", ""),
-            # Fix BN-3: expanded schema — matches PlaceAnOrder ATTEMPT_FIELDS so that
-            # when PlaceAnOrder appends to this file it can write longK/shortK/close_reason
-            # instead of having them silently dropped by extrasaction="ignore".
+            # Fix BN-3 / Fix EZ: canonical 24-col superset shared with PlaceAnOrder ATTEMPT_FIELDS
+            # so both writers agree on column order regardless of which process created the file.
             "longK":        kw.get("longK", ""),
             "shortK":       kw.get("shortK", ""),
             "order_type":   kw.get("order_type", ""),
             "order_action": kw.get("order_action", ""),
             "qty":          kw.get("qty", ""),
+            "order_id":     kw.get("order_id", ""),      # Fix EZ
+            "prev_status":  kw.get("prev_status", ""),   # Fix EZ
+            "raw_theo":     kw.get("raw_theo", ""),      # Fix EZ
+            "oi_atm":       kw.get("oi_atm", ""),        # Fix EZ: OI in dedicated column, not just reason string
+            "oi_otm":       kw.get("oi_otm", ""),        # Fix EZ
+            "threshold":    kw.get("threshold", ""),     # Fix EZ
             "close_reason": kw.get("close_reason", ""),
             "source":       kw.get("source", "dcm"),
             "uid":          kw.get("uid", str(uuid.uuid4())[:8]),
         }
-        hdr = list(row.keys())
+        # Canonical header (this row's key order). Fix EZ: if the file already exists, adopt its
+        # header instead of forcing our own order — this mirrors PlaceAnOrder._attempts_append and
+        # prevents column misalignment when PlaceAnOrder created the file first with its own layout.
+        canon_hdr = list(row.keys())
+
+        def _write_row(fpath: str) -> None:
+            exists = os.path.exists(fpath) and os.path.getsize(fpath) > 0
+            hdr = canon_hdr
+            if exists:
+                try:
+                    with open(fpath, "r", newline="", encoding="utf-8") as rf:
+                        existing = next(csv.reader(rf), None)
+                    if existing:
+                        hdr = existing
+                except Exception:
+                    hdr = canon_hdr
+            with open(fpath, "a", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=hdr, extrasaction="ignore")
+                if not exists:
+                    w.writeheader()
+                w.writerow(row)
+
         # Write to primary log file (logs folder or wherever _active_path points)
-        exists = os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=hdr)
-            if not exists:
-                w.writeheader()
-            w.writerow(row)
+        _write_row(path)
 
         # Additionally, write to today's dated folder under C:\OptionsHistory\<yy_mm_dd>\attempts_<yy_mm_dd>.csv
         try:
@@ -164,12 +186,7 @@ class _AttemptLogger:
             root = fr"C:\OptionsHistory\{folder}" if sys.platform.startswith("win") else f"./{folder}"
             os.makedirs(root, exist_ok=True)
             dated_csv = os.path.join(root, f"attempts_{folder}.csv")
-            exists_dated = os.path.exists(dated_csv)
-            with open(dated_csv, "a", newline="", encoding="utf-8") as fh2:
-                w2 = csv.DictWriter(fh2, fieldnames=hdr)
-                if not exists_dated:
-                    w2.writeheader()
-                w2.writerow(row)
+            _write_row(dated_csv)
         except Exception as e:
             LOG.warning("Failed to write to daily attempts CSV: %s", e)
 
@@ -2642,7 +2659,7 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-    def _roll_repriced_positions(self, lookback_days: int = 2) -> None:
+    def _roll_repriced_positions(self, lookback_days: int = 1) -> None:
         """
         Fix EQ: Strike-aware roll. When a same-side OPEN signal arrives at materially
         different strikes than a still-held spread (i.e. a prior CLOSE never filled), roll:
@@ -2771,10 +2788,10 @@ class DailyCycleManagementMixin:
                 continue
             gap = abs(float(sig['atm']) - float(h['longK']))
             thr = ROLL_MISMATCH_WIDTH_MULT * max(h['width'], 0.01)
-            if gap <= thr:
-                continue  # ordinary ATM drift -> hold (no roll)
+            if gap < thr:  # Fix FA: roll when gap >= 1.0x width (was gap > 1.5x width)
+                continue  # ordinary sub-width ATM drift -> hold (no roll)
             LOG.info("Roll: %s %s held longK=%.2f width=%.2f vs latest OPEN atm=%.2f "
-                     "(gap %.2f > %.1fx width) -> MKT close old + LMT open new",
+                     "(gap %.2f >= %.1fx width) -> MKT close old + LMT open new",
                      s, h['side'], h['longK'], h['width'], sig['atm'], gap, ROLL_MISMATCH_WIDTH_MULT)
             try:
                 if self._roll_mkt_close_old(s, h):
@@ -2830,7 +2847,7 @@ class DailyCycleManagementMixin:
         # and mark them so the open-delegate below opens the NEW strikes with --roll-symbols.
         # Runs before open-delegate so rolled symbols are opened in the same cycle.
         try:
-            self._roll_repriced_positions(lookback_days=2)
+            self._roll_repriced_positions(lookback_days=1)  # Fix FA: today only (avoid stale-signal rolls + Fix DS drop)
         except Exception as e:
             LOG.warning("Fix EQ: roll pass failed (continuing): %s", e)
 
@@ -4050,6 +4067,9 @@ class DailyCycleManagementMixin:
                         right=_r,
                         atm=_atm,
                         oth=_oth,
+                        oi_atm=_oi_atm_live,          # Fix EZ: OI in dedicated columns too
+                        oi_otm=_oi_oth_live,
+                        threshold=MIN_OI_FOR_RTH,
                     )
                 except Exception as _be_err:
                     LOG.warning("RTH cleanup: attempts CSV write failed for %s: %s", sym, _be_err)
@@ -4310,6 +4330,9 @@ class DailyCycleManagementMixin:
                         right=right,
                         atm=str(atm),
                         oth=str(oth),
+                        oi_atm=oi_atm,          # Fix EZ: OI in dedicated columns too
+                        oi_otm=oi_oth,
+                        threshold=threshold,
                     )
                 except Exception as e:
                     LOG.warning("CSV OI cancel: cancel failed for %s %s %s: %s", sym, exp, right, e)
