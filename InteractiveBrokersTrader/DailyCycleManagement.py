@@ -1063,13 +1063,18 @@ class DailyCycleManagementMixin:
             LOG.info("Diagnose-close: %s → %d symbols: %s",
                      label, len(buckets[label]), ", ".join(sorted(buckets[label])))
 
-    def _delegate_close_from_csvs_within(self, days: int) -> None:
+    def _delegate_close_from_csvs_within(self, days: int, force_market_final: bool = False) -> None:
         """
         Delegate CLOSE placements to PlaceAnOrder.py for symbols whose *latest* row
         within `days` (today + previous sessions) indicates a CLOSE.
         This scans newest→older CSVs once and keeps the first (newest) row per symbol
         across the whole window to avoid double-submitting per day.
         Implementation: only delegates to PlaceAnOrder.py (no direct IB order placement).
+
+        Fix FA: when force_market_final=True (Sunday weekly sweep), skip the LMT Stages 1/1.5/2
+        and instead force a BAG MKT close (fills Monday open) for each held CLOSE-wanted symbol
+        whose CLOSE signal is OLDER than the last trading day (recency guard: >= 2 weekday limit
+        attempts). Worthless spreads still close via $0.05 individual legs (handled in PlaceAnOrder).
         """
         _prev_phase = getattr(self, "_in_close_phase", False)
         self._in_close_phase = True
@@ -1177,6 +1182,51 @@ class DailyCycleManagementMixin:
             # _has_working_close_order() creates a fresh IB connection and may miss orders placed just
             # seconds ago (IB cross-clientId propagation delay). Using this set avoids the race condition.
             _submitted_syms = getattr(self, "_submitted_close_syms", set())
+
+            # --- Fix FA: Sunday weekly MKT backstop (force_market_final) ---
+            # Limits are re-placed every weekday (3 PM preclose + 5 PM reconcile) but never escalate to
+            # MKT for a priceable-but-low-demand spread. On the Sunday sweep, cross to market for anything
+            # the strategy still wants closed and still holds. `pick` already means "newest signal is
+            # CLOSE + held", so no extra latest-signal gate is needed. Recency guard: only if the CLOSE
+            # signal is OLDER than the last trading day (had >= 2 weekday limit attempts).
+            if force_market_final:
+                _last_td_folder = self._prev_trading_day_folder(self._now_ny())  # YY_MM_DD (Fri, or Thu if Fri holiday)
+                for sym in sorted(pick):
+                    _row, _close_lbl, _ = latest_by_sym[sym]
+                    # Recency guard: YY_MM_DD sorts chronologically; skip if CLOSE not older than last td.
+                    if _close_lbl >= _last_td_folder:
+                        LOG.info("Fix FA: %s CLOSE from %s not older than last trading day %s -- skipping Sunday MKT (recency guard).",
+                                 sym, _close_lbl, _last_td_folder)
+                        try:
+                            self._attempt(symbol=sym, action="close", status="skipped",
+                                          reason="sunday_mkt_recency_guard", source="dcm-close")
+                        except Exception:
+                            pass
+                        continue
+                    # Cancel any stuck working LMT close (Fri 5 PM Inactive+DAY) so PlaceAnOrder's close
+                    # guard won't block the MKT (clientId 101; polls until gone, Fix BO).
+                    try:
+                        self._cancel_symbol_close_orders(sym)
+                    except Exception as e:
+                        LOG.warning("Fix FA: %s cancel stuck close failed (continuing): %s", sym, e)
+                    try:
+                        self._attempt(symbol=sym, action="close", status="queued",
+                                      reason="sunday_force_market_close", source="dcm-close")
+                    except Exception:
+                        pass
+                    LOG.info("Fix FA: %s CLOSE from %s -> forcing BAG MKT close (fills Monday open).", sym, _close_lbl)
+                    self._run_place_an_order([
+                        "--mode", "force-close", "--symbols", sym,
+                        "--force-market-close", "--fallback-individual-legs",
+                        "--allow-market-fallback", "--client-id", "101",
+                        "--quantity", "50", "--quiet",
+                    ])
+                    try:
+                        self._attempt(symbol=sym, action="close", status="submitted",
+                                      reason="sunday_force_market_close", source="dcm-close")
+                    except Exception:
+                        pass
+                return
 
             # --- Stage 1: per-day CSV -> from-signal CLOSE limits (no live) ---
             # Build per-day lists so PlaceAnOrder reads the correct CSV ('--date' specifies folder)
@@ -2863,7 +2913,7 @@ class DailyCycleManagementMixin:
 
         if ny_today.weekday() == 6:  # Sunday = 6 (Mon=0)
             LOG.info("After-hours: running weekly CSV-based CLOSE sweeps for last 21 days (Sunday).")
-            self._delegate_close_from_csvs_within(days=21)
+            self._delegate_close_from_csvs_within(days=21, force_market_final=True)  # Fix FA: Sunday MKT backstop
         else:
             LOG.info("After-hours: skipping weekly CSV-based CLOSE sweeps (not Sunday).")
         # NEW: after-hours credit/inverted sweep (daily)

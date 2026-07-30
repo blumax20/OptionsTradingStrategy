@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 29, 2026 (Fix EZ: attempts-CSV schema unification [EZ-1], roll tuning 1.0x width + 1-day lookback [EZ-2], Health unfilled-close flag [EZ-3])
+**Last Updated:** July 29, 2026 (Fix EZ: attempts-CSV schema unification [EZ-1], roll tuning 1.0x width + 1-day lookback [EZ-2], Health unfilled-close flag [EZ-3]; Fix FA: weekly Sunday MKT backstop for stuck closes)
 
 ---
 
@@ -5404,5 +5404,27 @@ Three related fixes grouped under one commit, triggered by an SF investigation (
 **Impact:** SF-type "placed but didn't fill" closes surface in the daily health report for manual intervention. Verified: both files PowerShell-parse OK, embedded Python AST OK, zero stray `$var` interpolation.
 
 **Note:** `Health.ps1` and `ib_config.py` remain uncommitted (they carry the live-port `$IB_PORT`/config toggle); EZ-3's Health change is deployed to both files but not committed, consistent with that convention.
+
+---
+
+### Fix FA: Weekly Sunday MKT Backstop for Stuck (Unfillable) Closes (Jul 29)
+**Status:** IMPLEMENTED
+
+**Issue:** A CLOSE-wanted position (latest signal CLOSE / mismatch, still held) gets a LMT close re-placed **every trading day** — the 3 PM preclose re-prices it (live join/mid), the `tif=DAY` order expires unfilled at 4 PM, and the 5 PM reconcile re-places a fresh LMT. But it **never escalates to MKT** as long as any limit is computable: the pricing chain in `force_close_symbol_via_positions()` is live join → mid (Fix CE) → CSV theo (Fix CF) → portfolio marks (Fix AM), and portfolio marks almost always yield a price ≥ min_limit → a LMT at ~mid is placed. A LMT at mid rests *above* the natural combo bid, so in low demand it never fills — and the code has no path to cross to market. A true MKT only fired when ALL of join/mid/CSV/portfolio returned None (a total market-data blackout) AND `--allow-market-fallback` was set (3 PM preclose / reconcile fallback). So a priceable-but-low-demand spread could sit at an unfillable LMT indefinitely, resolved only by demand appearing, decay-to-worthless ($0.05 legs), or expiration.
+
+**Fix — two parts:**
+
+**FA-1 (`PlaceAnOrder.py`): `--force-market-close` flag.** New argparse flag (default False). In `force_close_symbol_via_positions()`, after the worthless-detection block (and its AF2 override), when `args.force_market_close` and the spread is NOT worthless (`not skip_combo`): override `order_type="MKT"`, `limit=None`, and place a **BAG MKT** close via the normal `place_debit_spread(order_type="MKT")` path (which sets `outsideRth=True` after-hours per Fix AB5, calls `_await_working`, and honours the close guard). Worthless spreads (both legs < $0.05) keep the existing fixed-price `$0.05` individual-leg path — a near-$0 spread never gets a MKT.
+
+**FA-2 (`DailyCycleManagement.py`): Sunday Stage 3.** `_delegate_close_from_csvs_within(days, force_market_final=False)`; the Sunday call site (`_after_hours_batch_placement`) passes `force_market_final=True`; the `--enforce-closes N` menu call stays default False (weekday LMT behaviour unchanged). When `force_market_final`, after `pick` is built + held-filtered (Fix AB7), the LMT Stages 1/1.5/2 are **skipped** and a single **Stage 3** runs: for each held CLOSE-wanted symbol (`pick` already means "newest signal is CLOSE + held"):
+1. **Recency guard** — only proceed if the symbol's newest CLOSE-row folder date is OLDER than the last trading day (`_prev_trading_day_folder`, holiday-aware via Fix EL). A close from the last trading day (Fri, or Thu if Fri is a holiday) had only ~1 day of limit attempts → skipped this Sunday (`close,skipped,sunday_mkt_recency_guard`), gets weekday limits next week, then the following Sunday's MKT if still stuck. YY_MM_DD folder strings compare chronologically.
+2. `_cancel_symbol_close_orders(sym)` (clientId 101, polls until the stuck Fri Inactive+DAY LMT is gone, Fix BO) so PlaceAnOrder's close guard won't block the MKT.
+3. `_run_place_an_order(["--mode","force-close","--symbols",sym,"--force-market-close","--fallback-individual-legs","--allow-market-fallback","--client-id","101","--quantity","50","--quiet"])`. Attempts row `close,submitted,sunday_force_market_close` (source `dcm-close`).
+
+The MKT BAG goes DAY+outsideRth → Inactive over the weekend → fills at the **Monday open**. No PDT issue: the position is held over the weekend (opened a prior day), so a Monday close is never a day trade.
+
+**What stays the same:** weekday 3 PM preclose + 5 PM reconcile (daily LMT re-tries); menu 8-5 `--enforce-closes N` (LMT stages); worthless spreads ($0.05 legs); OPEN-signaled held positions (held, never force-closed — `pick` excludes them since their newest signal isn't CLOSE); all other close paths and kill/roll switches.
+
+**Verification:** `python -m py_compile` both files OK. Recency guard: Fri (last td) close → skip; Thu/older → MKT (YY_MM_DD string compare confirmed chronological). Logic: held CLOSE-wanted symbol with a Fri-5PM Inactive+DAY LMT, on Sunday → Stage 3 cancels the LMT, places BAG MKT (Inactive+DAY) → Monday open; worthless → $0.05 legs; OPEN-signaled held → excluded from `pick`.
 
 ---

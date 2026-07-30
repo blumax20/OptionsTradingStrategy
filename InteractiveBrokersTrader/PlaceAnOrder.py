@@ -537,6 +537,8 @@ def parse_args():
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     p.add_argument("--allow-market-fallback", action="store_true", default=False,
                    help="If all limit pricing fails, place MARKET order (only use during market hours like preclose).")
+    p.add_argument("--force-market-close", action="store_true", default=False,
+                   help="Fix FA: force a BAG MKT close for non-worthless spreads (skip the limit chain); worthless spreads still use $0.05 legs. Sunday weekly backstop only.")
     p.add_argument("--allow-prev-day-opens", action="store_true", default=False,
                    help="Fix CQ: use --date CSV date instead of today for the same-day OPEN signal filter (10 AM skipped-opens retry only).")
     p.add_argument("--rth-only", action="store_true", default=False,
@@ -2524,6 +2526,17 @@ def force_close_symbol_via_positions(ib: IB, symbol: str, args) -> int:
             both_worthless = True
             skip_combo = True
             use_fallback = True  # enable individual-leg path regardless of CLI flag
+
+        # Fix FA: --force-market-close routes NON-worthless spreads to a BAG MKT close (Sunday weekly
+        # backstop after limits failed all week). Worthless spreads keep the individual $0.05-leg path
+        # (skip_combo already True above), so a near-$0 spread never gets a MKT.
+        if getattr(args, "force_market_close", False) and not skip_combo:
+            order_type = "MKT"
+            limit = None
+            logger.warning(
+                "[%s] Fix FA: force-market-close -> BAG MKT close for %s %.2f/%.2f",
+                symbol, right, float(longK), float(shortK),
+            )
 
         tr = None
         if not skip_combo:
