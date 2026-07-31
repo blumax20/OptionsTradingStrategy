@@ -130,7 +130,7 @@ class _AttemptLogger:
             "symbol":       kw.get("symbol", ""),
             "action":       kw.get("action", ""),     # e.g., close / hold / noop
             "status":       kw.get("status", ""),     # submitted / skipped / placed
-            "reason":       kw.get("reason", ""),     # reconcile_mismatch / reconcile_close_signal / ...
+            "reason":       kw.get("reason", ""),     # close_signal / reconcile_flip_* / reconcile_mismatch / ...
             "exp":          kw.get("exp", ""),
             "right":        kw.get("right", ""),
             "atm":          kw.get("atm", ""),
@@ -1595,6 +1595,7 @@ class DailyCycleManagementMixin:
 
         submitted = False
         _bv_limit_used = None  # Fix BV: capture limit from _place_combo for return
+        self._last_close_detail = None  # Fix FD (D1): leg detail for accurate reconcile-close logging
         up = (sym or '').upper()
         try:
             # Collect all open legs for symbol (OPT and STK)
@@ -1721,6 +1722,24 @@ class DailyCycleManagementMixin:
                             break
                     if _ed_confirmed:
                         _bv_limit_used = theo_limit  # Fix BV: capture limit for return
+                        # Fix FD (D1): capture leg detail so the reconcile close row logs full
+                        # right/longK/shortK/order_action/exp/qty (not a bare row that the
+                        # Closed-P/L matcher and Submitted list would drop).
+                        try:
+                            _fd_lk = next((l['strike'] for l in opt_legs if l['conId'] == longConId), None)
+                            _fd_sk = next((l['strike'] for l in opt_legs if l['conId'] == shortConId), None)
+                            _fd_exp = next((l['exp'] for l in opt_legs if l['conId'] == longConId), "")
+                            _fd_qty = next((abs(l['qty']) for l in opt_legs if l['conId'] == longConId), 1.0)
+                            self._last_close_detail = {
+                                "right": (right or "").upper()[:1],
+                                "longK": _fd_lk,
+                                "shortK": _fd_sk,
+                                "exp": _fd_exp or "",
+                                "order_action": action,
+                                "qty": int(_fd_qty) if _fd_qty else 1,
+                            }
+                        except Exception:
+                            self._last_close_detail = None
                         LOG.info("direct-close: %s order confirmed (status=%s, permId=%s)",
                                  up, _ed_st, _ed_perm)
                         return True
@@ -3310,9 +3329,12 @@ class DailyCycleManagementMixin:
             side_to_close: str | None = None
 
             if latest_is_close:
-                # Latest signal explicitly says "close" -> close both sides
+                # Latest signal explicitly says "close" -> close both sides.
+                # Fix FD (D1): this is an ordinary signal-driven close, not a flip/mismatch;
+                # label it "close_signal" (reconcile_flip_*/reconcile_mismatch remain for
+                # genuine orientation changes).
                 should_close = True
-                reason = "reconcile_close_signal"
+                reason = "close_signal"
                 side_to_close = None  # both
             else:
                 # Flip logic: if latest OPEN is CALL_OPEN but we still have put vertical(s), close PUT side only.
@@ -3369,10 +3391,21 @@ class DailyCycleManagementMixin:
                     if ok:
                         self._submitted_close_syms.add(sym)
                         submitted += 1
+                        # Fix FD (D1): log full leg detail captured by _try_close_from_positions
+                        # so the close row is as rich as PlaceAnOrder's force_close,success rows
+                        # (Closed-P/L matcher + Submitted list can pair/display it).
+                        _cd = getattr(self, "_last_close_detail", None) or {}
                         try:
-                            _AttemptLogger.write(symbol=sym, action="close", status="placed",
-                                                reason=reason, exp="", right=(try_side.upper() if try_side else ""),
-                                                source="dcm-reconcile", limit=_bv_limit)  # Fix BV: log limit price
+                            _AttemptLogger.write(
+                                symbol=sym, action="close", status="placed",
+                                reason=reason,
+                                exp=str(_cd.get("exp", "") or ""),
+                                right=(_cd.get("right") or (try_side.upper()[:1] if try_side else "")),
+                                longK=(_cd.get("longK") if _cd.get("longK") is not None else ""),
+                                shortK=(_cd.get("shortK") if _cd.get("shortK") is not None else ""),
+                                order_action=(_cd.get("order_action") or "SELL"),
+                                qty=(_cd.get("qty") if _cd.get("qty") is not None else 1),
+                                source="dcm-reconcile", limit=_bv_limit)  # Fix BV: log limit price
                         except Exception:
                             pass
                     else:
@@ -4481,9 +4514,17 @@ class DailyCycleManagementMixin:
 
         _syms: list[str] = []
         for _r in _rows:
+            _reason = (_r.get("reason") or "")
+            # Fix FB: no-pricing / wide-spread skips. Fix FD (D2): also retry opens that IB
+            # rejected asynchronously with Error 201 (bs_rejected_bag_e201) — e.g. transient
+            # margin/permission rejections. Position-guarded downstream; a hard margin 201
+            # simply re-rejects (bounded, one attempt/symbol/morning).
+            _is_skip = (_r.get("status") == "skipped"
+                        and _reason in ("no_viable_limit_or_conditions", "wide_spread_after_hours"))
+            _is_e201 = (_r.get("status") == "error"
+                        and _reason.startswith("bs_rejected_bag_e201"))
             if (_r.get("action") in ("open_call", "open_put")
-                    and _r.get("status") == "skipped"
-                    and _r.get("reason") in ("no_viable_limit_or_conditions", "wide_spread_after_hours")  # Fix FB
+                    and (_is_skip or _is_e201)
                     and _r.get("symbol")):
                 _sym = _r["symbol"].strip()
                 if _sym and _sym not in _syms:
