@@ -173,13 +173,37 @@ def _ensure_cols(cols, need):
         if c not in cols:
             cols.append(c)
 
+def _ba_pct(bid, ask):
+    """
+    Fix FC: bid-ask spread as a percent of mid (mirrors listener._ba_pct).
+    Returns None when there is no usable ask. A missing/NaN/negative bid
+    (IB's -1 'no-bid' sentinel) with a valid ask is treated as 0 -> wide.
+    """
+    try:
+        a = float(ask) if ask is not None else None
+    except Exception:
+        a = None
+    if a is None or a != a or a <= 0:
+        return None
+    try:
+        b = float(bid) if bid is not None else 0.0
+    except Exception:
+        b = 0.0
+    if b != b or b < 0:
+        b = 0.0
+    mid = (a + b) / 2.0
+    if mid <= 0:
+        return None
+    return round((a - b) / mid * 100.0, 1)
+
+
 def _default_fetcher(symbol: str, right: str, exp: str, strike: float):
     """
-    Placeholder fetcher; returns (oi, iv) as (None, None).
+    Placeholder fetcher; returns (oi, iv, ba) as (None, None, None).
     Caller should provide a real fetcher that queries IB for
-    open interest and IV on the specific option contract.
+    open interest, IV, and bid-ask % on the specific option contract.
     """
-    return None, None
+    return None, None, None
 
 
 def _get_strike_increment(price: float) -> float:
@@ -466,12 +490,14 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
                 # Fix EM-2: reject 0/negative IV — IV of 0 is unphysical
                 if isinstance(iv_val, (int, float)) and not (iv_val != iv_val) and iv_val > 0:
                     iv = float(iv_val)
+            # Fix FC: compute live bid-ask % from the same ticker (top-of-book always delivered)
+            ba = _ba_pct(getattr(t, "bid", None), getattr(t, "ask", None))
             # Clean up subscription
             try: ib.cancelMktData(opt)
             except Exception: pass
-            return (oi, iv)
+            return (oi, iv, ba)
         except Exception:
-            return (None, None)
+            return (None, None, None)
     return _fetch
 
 def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
@@ -505,7 +531,9 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
         return False
 
     # Ensure targets exist
-    need_cols = ["oi_atm", "oi_oth", "iv_atm", "iv_oth"]
+    # Fix FC: add the 4 ba% columns so pre-Fix-FC prev-day CSVs get them on enrichment.
+    need_cols = ["oi_atm", "oi_oth", "iv_atm", "iv_oth",
+                 "ba_pct_atm_call", "ba_pct_otm_call", "ba_pct_atm_put", "ba_pct_otm_put"]
     _ensure_cols(cols, need_cols)
 
     updates = 0
@@ -549,7 +577,14 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
 
         # ATM leg fill
         if _need(row.get("oi_atm")) or _need(row.get("iv_atm")):
-            oi1, iv1 = fetch(symbol, right, expiry, k1)
+            oi1, iv1, ba1 = fetch(symbol, right, expiry, k1)
+            # Fix FC: overwrite the ATM ba% with the fresh RTH value (replaces the stale
+            # wide after-hours value the listener wrote at 5 PM). Not _need-gated.
+            if ba1 is not None:
+                _ba_col_atm = "ba_pct_atm_call" if right == "C" else "ba_pct_atm_put"
+                if _ba_col_atm in cols:
+                    row[_ba_col_atm] = ba1
+                    updates += 1
             # Fix EM-2: skip write when fetch returns 0 (defense in depth with fetcher guard)
             if oi1 is not None and oi1 > 0:
                 row["oi_atm"] = int(oi1)
@@ -572,7 +607,13 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
 
         # OTH leg fill (only if we have a valid OTM strike)
         if k2 is not None and (_need(row.get("oi_oth")) or _need(row.get("iv_oth"))):
-            oi2, iv2 = fetch(symbol, right, expiry, k2)
+            oi2, iv2, ba2 = fetch(symbol, right, expiry, k2)
+            # Fix FC: overwrite the OTM ba% with the fresh RTH value. Not _need-gated.
+            if ba2 is not None:
+                _ba_col_oth = "ba_pct_otm_call" if right == "C" else "ba_pct_otm_put"
+                if _ba_col_oth in cols:
+                    row[_ba_col_oth] = ba2
+                    updates += 1
             # Fix EM-2: skip write when fetch returns 0
             if oi2 is not None and oi2 > 0:
                 row["oi_oth"] = int(oi2)

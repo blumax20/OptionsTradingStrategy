@@ -367,8 +367,8 @@ app = Flask(__name__)
 VERSION = "listener-2025-09-12d"
 
 # Expiration selection preferences
-TARGET_DTE = 30     # target days to expiration
-MIN_DTE = 21        # require at least >20 days (i.e., 21+) for new positions
+TARGET_DTE = 60     # Fix FC: target days to expiration (was 30)
+MIN_DTE = 42        # Fix FC: require at least 42 days for new positions (was 21)
 
 # === Black–Scholes helpers and NaN guard ===
 def _is_nan(x) -> bool:
@@ -647,6 +647,7 @@ def _append_csv_row(row: dict):
         "call_debit_theo_5","put_debit_theo_5",
         "open_interest_atm_call","open_interest_otm_call",
         "open_interest_atm_put","open_interest_otm_put",
+        "ba_pct_atm_call","ba_pct_otm_call","ba_pct_atm_put","ba_pct_otm_put",
         "signal_side","signal_type","strategy_position","raw_message"
     ]
     write_header = not out_csv.exists()
@@ -763,6 +764,10 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         "open_interest_otm_call": result.get("open_interest_otm"),
         "open_interest_atm_put": result.get("open_interest_atm_put"),
         "open_interest_otm_put": result.get("open_interest_otm_put"),
+        "ba_pct_atm_call": result.get("ba_pct_atm_call"),
+        "ba_pct_otm_call": result.get("ba_pct_otm_call"),
+        "ba_pct_atm_put": result.get("ba_pct_atm_put"),
+        "ba_pct_otm_put": result.get("ba_pct_otm_put"),
         "signal_side": signal_fields.get("signal_side"),
         "signal_type": signal_fields.get("signal_type"),
         "strategy_position": signal_fields.get("strategy_position"),
@@ -801,6 +806,27 @@ def _last_within_book(last, bid, ask, tol=0.01):
         if not (lo <= last <= hi):
             return None
     return last
+
+def _ba_pct(bid, ask):
+    """Fix FB: bid-ask spread as a percent of mid. Returns None (fail open)
+    when there is no usable ask. A missing/NaN/negative bid (IB's -1 'no-bid'
+    sentinel) with a valid ask is treated as 0 -> a wide spread."""
+    try:
+        a = float(ask) if ask is not None else None
+    except Exception:
+        a = None
+    if a is None or a != a or a <= 0:  # None / NaN / non-positive ask
+        return None
+    try:
+        b = float(bid) if bid is not None else 0.0
+    except Exception:
+        b = 0.0
+    if b != b or b < 0:  # NaN or IB "no-bid" (-1) sentinel
+        b = 0.0
+    mid = (a + b) / 2.0
+    if mid <= 0:
+        return None
+    return round((a - b) / mid * 100.0, 1)
 
 def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
@@ -1230,6 +1256,11 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             "open_interest_atm": legs_info[0]['callOpenInterest'] if legs_info else None,
             "implied_volatility_otm": legs_info[1]['impliedVolatility'] if len(legs_info) > 1 else None,
             "open_interest_otm": legs_info[1]['callOpenInterest'] if len(legs_info) > 1 else None,
+            # Fix FB: bid-ask % (of mid) per leg, from the quotes just fetched.
+            "ba_pct_atm_call": _ba_pct(legs_info[0].get("bid"), legs_info[0].get("ask")) if legs_info else None,
+            "ba_pct_otm_call": _ba_pct(legs_info[1].get("bid"), legs_info[1].get("ask")) if len(legs_info) > 1 else None,
+            "ba_pct_atm_put": _ba_pct(put_legs_info[0].get("bid"), put_legs_info[0].get("ask")) if put_legs_info else None,
+            "ba_pct_otm_put": _ba_pct(put_legs_info[1].get("bid"), put_legs_info[1].get("ask")) if len(put_legs_info) > 1 else None,
             "call_debit": call_debit,
             "put_debit": put_debit,
             "call_debit_limit_1": call_debit_limit_1,

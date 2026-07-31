@@ -3985,18 +3985,41 @@ class DailyCycleManagementMixin:
             except Exception:
                 return None
 
-        # Helper: fetch live open interest for a given option contract (generic tick 101)
-        def _live_oi(opt_contract: Contract) -> int | None:
+        # Fix FC: bid-ask % of mid from a live quote (mirrors listener/LiquidityFilter _ba_pct)
+        def _ba_from_quote(bid, ask):
+            try:
+                a = float(ask) if ask is not None else None
+            except Exception:
+                a = None
+            if a is None or a != a or a <= 0:
+                return None
+            try:
+                b = float(bid) if bid is not None else 0.0
+            except Exception:
+                b = 0.0
+            if b != b or b < 0:
+                b = 0.0
+            mid = (a + b) / 2.0
+            if mid <= 0:
+                return None
+            return round((a - b) / mid * 100.0, 1)
+
+        # Helper: fetch live open interest + bid-ask % for a given option contract (generic tick 101)
+        def _live_oi(opt_contract: Contract):
+            """Fix FC: returns (oi, ba_pct). oi is int or None; ba_pct is float or None."""
             try:
                 tkr: Ticker = ib.reqMktData(opt_contract, genericTickList='101', snapshot=False, regulatorySnapshot=False)
-                # give the feed a brief moment to populate; then poll a couple of times
+                # give the feed a brief moment to populate; poll the full window so top-of-book
+                # bid/ask populate alongside OI (needed for the Fix FC ba% keep-guard).
+                oi = None
                 for _ in range(6):
                     ib.sleep(0.2)
-                    if getattr(tkr, 'optionOpenInterest', None) is not None:
-                        return int(tkr.optionOpenInterest)
-                return None
+                    if oi is None and getattr(tkr, 'optionOpenInterest', None) is not None:
+                        oi = int(tkr.optionOpenInterest)
+                ba = _ba_from_quote(getattr(tkr, 'bid', None), getattr(tkr, 'ask', None))
+                return (oi, ba)
             except Exception:
-                return None
+                return (None, None)
 
         try:
             ib.reqAllOpenOrders()
@@ -4055,11 +4078,21 @@ class DailyCycleManagementMixin:
                     continue
                 sym = next(iter(syms)); exp = next(iter(exps)); right = next(iter(rights))
 
-                # Pull live OI for each leg
+                # Pull live OI + bid-ask % for each leg
                 oi_values = []
+                ba_values = []
                 for oc in leg_opts:
-                    oi = _live_oi(oc)
+                    oi, ba = _live_oi(oc)
                     oi_values.append(oi if oi is not None else -1)
+                    ba_values.append(ba)
+
+                # Fix FC: OR-gate — keep the order when BOTH legs are tight (ba% <= 30), even if
+                # OI is under threshold. Mirrors the RTH OR-gate in PlaceAnOrder. Missing ba%
+                # (None) is "not tight" -> fall through to the OI decision below.
+                if (ba_values[0] is not None and ba_values[1] is not None
+                        and ba_values[0] <= 30.0 and ba_values[1] <= 30.0):
+                    LOG.info("RTH cleanup: keeping %s %s %s — tight spread ba%%=%s<=30 (OI=%s)", sym, exp, right, ba_values, oi_values)
+                    continue
 
                 # Fix BR: skip only when BOTH legs are unknown. When one leg is confirmed
                 # below threshold and none are confirmed above, cancel the order.
@@ -4130,13 +4163,19 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-    def _cancel_low_oi_working_orders_from_csv(self, threshold: int = MIN_OI_FOR_RTH) -> None:
+    def _cancel_low_oi_working_orders_from_csv(self, threshold: int = MIN_OI_FOR_RTH,
+                                               ba_threshold: float = 30.0) -> None:
         """
         9:35am RTH guard: cancel *working* combo orders (BAG) where BOTH legs have OI < threshold
         using the combined_listener_spreads.csv from today, with automatic fallback to the prior day.
         This avoids keeping thin orders intraday while still allowing after-hours placement without
         an OI guard. We only cancel when we can positively read OI for both legs from the CSV.
         Loads today's CSV and the most recent prior trading day's CSV (weekend/holiday-aware).
+
+        Fix FC: an order is KEPT when BOTH legs' bid-ask % (of mid, refreshed by the
+        LiquidityFilter pre-hook above) is <= ba_threshold, even if OI is under threshold —
+        mirrors the RTH OR-gate in PlaceAnOrder. Missing ba% is treated as "not tight" and
+        falls through to the OI cancel decision.
         """
         # Populate OI in combined CSVs first (today and previous trading day)
         try:
@@ -4209,6 +4248,8 @@ class DailyCycleManagementMixin:
                     "oth_strike": ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike"),
                     "oi_atm":     ("oi_atm", "atm_oi", "oi_call_atm", "open_interest_atm_call", "open_interest_atm", "oi1"),
                     "oi_oth":     ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                    "ba_atm":     ("ba_pct_atm_call",),   # Fix FC
+                    "ba_oth":     ("ba_pct_otm_call",),   # Fix FC
                 }
             else:  # PUT
                 cand_keys = {
@@ -4219,6 +4260,8 @@ class DailyCycleManagementMixin:
                     "oth_strike": ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike"),
                     "oi_atm":     ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1"),
                     "oi_oth":     ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                    "ba_atm":     ("ba_pct_atm_put",),   # Fix FC
+                    "ba_oth":     ("ba_pct_otm_put",),   # Fix FC
                 }
 
             def _get(row, keys):
@@ -4255,12 +4298,15 @@ class DailyCycleManagementMixin:
                 if oi_a is None or oi_o is None:
                     # Not definitive; keep searching older rows
                     continue
+                # Fix FC: read the same row's bid-ask % for both legs (may be None)
+                ba_a = _coerce_float(_get(row, cand_keys["ba_atm"]))
+                ba_o = _coerce_float(_get(row, cand_keys["ba_oth"]))
                 try:
-                    return (int(oi_a), int(oi_o), row.get("_csv_src"))
+                    return (int(oi_a), int(oi_o), ba_a, ba_o, row.get("_csv_src"))
                 except Exception:
-                    return (None, None, None)
+                    return (None, None, None, None, None)
 
-            return (None, None, None)
+            return (None, None, None, None, None)
 
         ib = IB()
         try:
@@ -4337,7 +4383,15 @@ class DailyCycleManagementMixin:
                 else:
                     atm, oth = (min(k1, k2), max(k1, k2))
 
-                oi_atm, oi_oth, src = _find_csv_oi(sym, right, exp, atm, oth)
+                oi_atm, oi_oth, ba_atm, ba_oth, src = _find_csv_oi(sym, right, exp, atm, oth)
+                # Fix FC: OR-gate — keep the order when BOTH legs are tight (ba% <= ba_threshold),
+                # even if OI is under threshold. Mirrors the RTH OR-gate in PlaceAnOrder. Missing
+                # ba% is "not tight" -> fall through to the OI decision below.
+                if (ba_atm is not None and ba_oth is not None
+                        and ba_atm <= ba_threshold and ba_oth <= ba_threshold):
+                    LOG.info("CSV OI cancel: keeping %s %s %s atm/oth=%s/%s — tight spread ba%%=%s/%s<=%.0f (OI=%s/%s)",
+                             sym, exp, right, atm, oth, ba_atm, ba_oth, ba_threshold, oi_atm, oi_oth)
+                    continue
                 # Fix EE: cancel if ANY known leg is below threshold.
                 # Only keep when BOTH legs are confirmed ≥ threshold.
                 if oi_atm is None and oi_oth is None:
@@ -4429,7 +4483,7 @@ class DailyCycleManagementMixin:
         for _r in _rows:
             if (_r.get("action") in ("open_call", "open_put")
                     and _r.get("status") == "skipped"
-                    and _r.get("reason") == "no_viable_limit_or_conditions"
+                    and _r.get("reason") in ("no_viable_limit_or_conditions", "wide_spread_after_hours")  # Fix FB
                     and _r.get("symbol")):
                 _sym = _r["symbol"].strip()
                 if _sym and _sym not in _syms:
@@ -4568,11 +4622,15 @@ class DailyCycleManagementMixin:
                 keys_oth = ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2")
                 keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike")
                 keys_oth_strike = ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike")
+                keys_ba_atm = ("ba_pct_atm_call",)   # Fix FC
+                keys_ba_oth = ("ba_pct_otm_call",)   # Fix FC
             else:
                 keys_atm = ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1")
                 keys_oth = ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2")
                 keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "high_strike", "upper_strike")
                 keys_oth_strike = ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike")
+                keys_ba_atm = ("ba_pct_atm_put",)   # Fix FC
+                keys_ba_oth = ("ba_pct_otm_put",)   # Fix FC
 
             def _g(row, keys):
                 for k in keys:
@@ -4603,9 +4661,12 @@ class DailyCycleManagementMixin:
                 oi_o = _coerce(_g(row, keys_oth))
                 if oi_a is None and oi_o is None:
                     continue  # keep searching older rows
+                ba_a = _coerce(_g(row, keys_ba_atm))  # Fix FC (may be None)
+                ba_o = _coerce(_g(row, keys_ba_oth))  # Fix FC (may be None)
                 return (int(oi_a) if oi_a is not None else None,
-                        int(oi_o) if oi_o is not None else None)
-            return (None, None)
+                        int(oi_o) if oi_o is not None else None,
+                        ba_a, ba_o)
+            return (None, None, None, None)
 
         # Duplicate guard: fetch held OPT symbols + working BUY BAG symbols from IB
         try:
@@ -4655,12 +4716,15 @@ class DailyCycleManagementMixin:
                 LOG.info("Fix EK-b: %s already retried today; skip", _sym)
                 _skips.append(f"{_sym}(already_retried)")
                 continue
-            oi_a, oi_o = _lookup_oi(_sym, _right, _exp, _atm, _oth)
+            oi_a, oi_o, ba_a, ba_o = _lookup_oi(_sym, _right, _exp, _atm, _oth)
             _atm_ok = (oi_a is not None and oi_a >= threshold)
             _oth_ok = (oi_o is not None and oi_o >= threshold)
-            if not (_atm_ok or _oth_ok):
-                LOG.info("Fix EK-b: %s %s/%s %s — 10:30 OI atm/oth=%s/%s; no leg above threshold; skip",
-                         _sym, _atm, _oth, _right, oi_a, oi_o)
+            # Fix FC: OR-gate consistency — also retry when BOTH legs are tight (ba% <= 30),
+            # mirroring the RTH placement gate and the cancel keep-guard.
+            _ba_tight = (ba_a is not None and ba_o is not None and ba_a <= 30.0 and ba_o <= 30.0)
+            if not (_atm_ok or _oth_ok or _ba_tight):
+                LOG.info("Fix EK-b: %s %s/%s %s — 10:30 OI atm/oth=%s/%s ba=%s/%s; no leg above threshold and not tight; skip",
+                         _sym, _atm, _oth, _right, oi_a, oi_o, ba_a, ba_o)
                 _skips.append(f"{_sym}(both<{threshold})")
                 continue
             if _sym in _held_syms:

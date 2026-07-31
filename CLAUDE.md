@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 29, 2026 (Fix EZ: attempts-CSV schema unification [EZ-1], roll tuning 1.0x width + 1-day lookback [EZ-2], Health unfilled-close flag [EZ-3]; Fix FA: weekly Sunday MKT backstop for stuck closes)
+**Last Updated:** July 30, 2026 (Fix FC: bid-ask % liquidity gate — after-hours skip + RTH OR-gate (place if both legs OI>=100 OR both legs ba%<=30), LiquidityFilter refreshes ba% during RTH, same OR-gate on the 9:45/10:30 low-OI cancel + 10:30 retry, and entry DTE widened to 60 (min 42). Supersedes/absorbs the never-committed Fix FB.)
 
 ---
 
@@ -5426,5 +5426,43 @@ The MKT BAG goes DAY+outsideRth → Inactive over the weekend → fills at the *
 **What stays the same:** weekday 3 PM preclose + 5 PM reconcile (daily LMT re-tries); menu 8-5 `--enforce-closes N` (LMT stages); worthless spreads ($0.05 legs); OPEN-signaled held positions (held, never force-closed — `pick` excludes them since their newest signal isn't CLOSE); all other close paths and kill/roll switches.
 
 **Verification:** `python -m py_compile` both files OK. Recency guard: Fri (last td) close → skip; Thu/older → MKT (YY_MM_DD string compare confirmed chronological). Logic: held CLOSE-wanted symbol with a Fri-5PM Inactive+DAY LMT, on Sunday → Stage 3 cancels the LMT, places BAG MKT (Inactive+DAY) → Monday open; worthless → $0.05 legs; OPEN-signaled held → excluded from `pick`.
+
+---
+
+### Fix FC: Bid-Ask % Liquidity Gate — After-Hours Skip + RTH OR-Gate + LiquidityFilter Refresh + DTE 60/42 (Jul 30)
+**Status:** IMPLEMENTED
+
+Fix FC bundles the (never-committed) after-hours bid-ask % gate with a set of follow-on changes.
+There is no separate Fix FB — all of it ships here as FC.
+
+**Context:** The OI gate (`_oi_ok`, `PlaceAnOrder.py`) is RTH-only, so at 5 PM nothing filtered illiquid spreads (hard to close if price moves against them); and during RTH a spread with a highly liquid ATM leg but an OTM leg just under 100 OI was skipped even though it is perfectly closable. Add a per-leg **bid-ask % (of mid)** liquidity signal used both ways: an after-hours skip and an RTH escape hatch.
+
+**Phase 0 calibration probe (read-only, discarded):** raw bid/ask is not persisted (the listener uses `legs_info`/`put_legs_info` bid/ask only for the net debit, then discards). A one-off `reqMktData` probe (frozen/delayed-frozen, clientId 885) re-fetched the 7/30 legs. Finding: after-hours option spreads are **uniformly enormous** (ATM median ~58-67%, OTM ~68-97% of mid) because equity options stop trading at 4:00 PM and MMs pull quotes; the width is **inversely** related to actual liquidity (VIPS OI 482/800 → ATM 58%/OTM 100%; TGT OI 39/9 → ATM 13%/OTM 19%). So after-hours ba% mostly filters "did the MM leave a quote," not liquidity — accepted as a conservative pre-filter because everything skipped is re-checked at 10 AM against live OI (nothing lost). **The RTH ba% used by the OR-gate is the *refreshed* intraday value (Change 2), which IS a real tightness signal.**
+
+**Decision (confirmed):** mid-divisor bid-ask %; threshold **30.0** (`<= 30%` on BOTH legs = tight); gate both ATM and OTM legs.
+
+**Ask 1 — PlaceAnOrder reads the new format (verification, no change):** the combined CSV is read via `pd.read_csv` and accessed by name with `row.get(...)` — no positional/fixed-width parsing, no strict schema. The 4 new ba% columns are available on demand; old CSVs without them → `row.get("ba_pct_*")` = None. Confirmed against the live 26_07_30 CSV (32 cols, pre-FC): loads fine, `.get()` returns None for absent ba% cols.
+
+**Change A — listener writes 4 bid-ask % columns (`listener.py`):** new `_ba_pct(bid, ask)` = `(ask-bid)/mid*100` rounded 1dp; no usable ask → None; missing/NaN/negative bid (IB's -1 "no-bid" sentinel) with a valid ask → 0 (wide). Computed from `legs_info[0/1]` / `put_legs_info[0/1]` in `get_option_data`'s main return; added `ba_pct_atm_call, ba_pct_otm_call, ba_pct_atm_put, ba_pct_otm_put` to the CSV header + writer row (theo-only/error returns leave them blank).
+
+**Change B — PlaceAnOrder gates (`PlaceAnOrder.py`):**
+- `_ba_ok(row, right, threshold, fail_open=True)` — reads the side's ATM+OTM `ba_pct_*`; a leg > threshold → False. `fail_open` controls missing/NaN: **True** (after-hours) → pass (never mass-skip on absent quotes); **False** (RTH OR) → "not proven tight" → False.
+- **After-hours skip:** CLI `--ba-check {off,afterhours,always}` (default **afterhours**) + `--ba-pct-threshold` (default **30.0**). Beside the OI gate in both OPEN handlers; when `--ba-check afterhours and not _is_rth()` (or `always`) and `_ba_ok(fail_open=True)` fails → `open_*,skipped,wide_spread_after_hours` + continue. Auto-off during RTH.
+- **RTH OR-gate (new):** at all 4 OI-gate sites (CALL/PUT early gate + CALL/PUT `debit_limit` fallback gate), when `_need_oi and not _oi_ok(...)`, additionally check `_ba_ok(row, right, ba_pct_threshold, fail_open=False)`. If the spread is tight → **place** (log "OI under threshold but spread tight"); else the existing `oi_below_threshold` skip stands. Net RTH rule: **place if BOTH legs OI ≥ 100 OR BOTH legs ba% ≤ 30**. Fail-closed on the ba leg so a missing ba% never weakens the OI gate.
+
+**Change C — LiquidityFilter refreshes ba% during RTH (`LiquidityFilter.py`):** the 9:45/10:30 enrichment already fetches each leg's ticker (`reqMktData(opt,"100,101,106,588")`) — piggyback ba% on it (zero extra IB calls). Added a local `_ba_pct`; `_ib_fetcher_factory._fetch` and `_default_fetcher` now return `(oi, iv, ba)`; the two enrich call sites unpack the 3rd value and **overwrite** `ba_pct_{atm,otm}_{call,put}` with the fresh RTH value (NOT `_need`-gated — replaces the stale wide 5 PM value). The 4 ba% columns added to `need_cols` so pre-FC prev-day CSVs get them. Piggyback is sufficient: on the first RTH enrichment the enrichment-owned `oi_atm`/`iv_atm` are empty for every row → `_fetch` runs everywhere → ba% refreshed everywhere.
+
+**Change D — same OR-gate on the 9:45/10:30 low-OI cancel + 10:30 retry (`DailyCycleManagement.py`):** the low-OI cancel keyed off OI alone and would cancel exactly the tight-but-OTM-OI-just-under-100 spreads the RTH gate keeps. Both cancel passes run AFTER the RTH ba% refresh (9:45 `run_rth_open_cleanup`, 10:30 `--risk-exits-only`), so ba% is live-tight at cancel time. New rule everywhere: **keep** a working OPEN when BOTH legs OI ≥ threshold OR BOTH legs ba% ≤ 30; missing ba% → not tight → fall through to the OI decision (fail-closed).
+- `_cancel_low_oi_working_orders_from_csv` (+`ba_threshold=30.0` kwarg): `_find_csv_oi` now returns `(oi_atm, oi_oth, ba_atm, ba_oth, src)`; keep-guard before the Fix EE cancel decision.
+- `_rth_liquidity_cleanup`: `_live_oi` now returns `(oi, ba)` (polls the full window so top-of-book bid/ask populate alongside OI); keep-guard before the Fix BR/EE decision.
+- `_retry_low_oi_cancels_from_today` (Fix EK-b): `_lookup_oi` now returns ba% too; retry eligibility is `(≥1 leg OI ≥ threshold) OR (both ba% ≤ 30)` — consistency backstop (the cancel guard already keeps tight spreads).
+
+**Change E — widen entry DTE (`listener.py`):** `TARGET_DTE = 30 → 60`, `MIN_DTE = 21 → 42`. `_fallback_expiration_str(TARGET_DTE)` and the `valid = [... if dte >= MIN_DTE]` selection pick up the new values. Risk-exit interaction is safe: 60-DTE entries have `dte >= 30` → Fix CA skips the DTE age *fallback* heuristic (`estimated_age = max(0, 30 - dte)`, DCM), and Fix DD/DD-2's attempts-CSV timestamp is the authoritative age source anyway.
+
+**What stays the same:** after-hours gate fail-open behavior; `--oi-check` (off/rth/always), `--oi-threshold` (100), `MIN_OI_FOR_RTH`; the 10 AM `_retry_skipped_opens_from_prev_day` collecting `wide_spread_after_hours`; CLOSE orders never gated/cancelled by these paths (OPEN/BUY-only); Fix EE / BK / BR still apply *after* the new ba% keep-guard; preclose, reconcile, risk exits, roll (EQ/EZ), STK-flatten (EO) untouched.
+
+**Caveat (known):** at 5 PM the CSV's OI is only populated for CALL rows (listener leaves put OI empty until 9:45 AM enrichment, Fix AO/BL). The ba% gate does not depend on OI, so this doesn't affect FC; a hypothetical after-hours OI gate would fail-open on all puts.
+
+**Verification:** `python -m py_compile listener.py PlaceAnOrder.py LiquidityFilter.py DailyCycleManagement.py` OK. `_ba_ok` (fail_open=True): TGT `(13.4,19.2)`→True, VIPS `(57.9,100)`→False, missing→True, 30.0→True, 30.1→False. `_ba_ok` (fail_open=False, RTH): missing→False, one-missing→False, both≤30→True. LiquidityFilter `_ba_pct`: `(6.25,7.15)`→13.4, `(None,0.95)`→200.0, `(-1.0,0.35)`→200.0, `(1.0,None)`→None, `(0.4,0.95)`→81.5. Ask-1 pandas smoke read of 26_07_30 CSV OK. End-to-end (next RTH 9:45): combined CSV `ba_pct_*` show tight intraday values; a row with OTM OI 72 but both legs ba% ≤30 → `open_*,placed,success` (was `oi_below_threshold`) and the low-OI cancel **keeps** it ("tight spread"); OTM ba% 45 → still skipped/cancelled. DTE: next 5 PM batch `days_to_exp` clusters near 60, never <42.
 
 ---

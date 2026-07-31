@@ -490,6 +490,40 @@ def _oi_ok(row: pd.Series, right: str, threshold: int) -> bool:
     except Exception:
         return False
 
+def _ba_ok(row: pd.Series, right: str, threshold: float, fail_open: bool = True) -> bool:
+    """
+    Fix FC: True when BOTH legs' bid-ask % (of mid, written by the listener /
+    refreshed by LiquidityFilter during RTH) is <= threshold (a leg > threshold
+    returns False).
+
+    fail_open controls how a missing/NaN leg value is treated:
+      - True  (after-hours ba gate): missing quote -> pass, so absent quotes never
+        cause a mass-skip (the original Fix FB behaviour).
+      - False (RTH OR-gate): missing ba% -> "not proven tight" -> return False, so
+        the OR with the OI gate cannot be satisfied without real evidence of a
+        tight market.
+    """
+    try:
+        if right.upper() == 'C':
+            v1 = row.get("ba_pct_atm_call"); v2 = row.get("ba_pct_otm_call")
+        else:
+            v1 = row.get("ba_pct_atm_put"); v2 = row.get("ba_pct_otm_put")
+        for v in (v1, v2):
+            if v is None:
+                if fail_open:
+                    continue
+                return False
+            fv = float(v)
+            if fv != fv:  # NaN
+                if fail_open:
+                    continue
+                return False
+            if fv > float(threshold):
+                return False
+        return True
+    except Exception:
+        return fail_open
+
 def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
@@ -533,6 +567,10 @@ def parse_args():
                    help="Minimum OI required on BOTH legs to allow OPEN orders (applies per --oi-check).")
     p.add_argument("--oi-check", choices=["off","rth","always"], default="rth",
                    help="When to enforce the OI gate for OPEN orders: 'off' (never), 'rth' (only during 09:30–16:00 NY), or 'always'.")
+    p.add_argument("--ba-check", choices=["off","afterhours","always"], default="afterhours",
+                   help="Fix FB: when to enforce the bid-ask %% gate for OPEN orders: 'off', 'afterhours' (only when NOT 09:30-16:00 NY), or 'always'.")
+    p.add_argument("--ba-pct-threshold", type=float, default=30.0,
+                   help="Fix FB: skip an OPEN if either leg's bid-ask %% (of mid) is > this (<= places). Default 30.")
     p.add_argument("--fallback-individual-legs", action="store_true",
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     p.add_argument("--allow-market-fallback", action="store_true", default=False,
@@ -4015,16 +4053,27 @@ def run_from_csv():
                 # Early OI gate for CALL opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
                 if _need_oi and not _oi_ok(row, 'C', args.oi_threshold):
-                    try:
-                        oi1 = float(row.get("open_interest_atm_call") or 0.0)
-                        oi2 = float(row.get("open_interest_otm_call") or 0.0)
-                    except Exception:
-                        oi1 = oi2 = 0.0
-                    record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                    # Fix FC: RTH OR-gate — OI may be under threshold if BOTH legs are tight (<= ba%).
+                    if _ba_ok(row, 'C', args.ba_pct_threshold, fail_open=False):
+                        vprint(args.verbose, f"[{symbol}] CALL OPEN OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
+                    else:
+                        try:
+                            oi1 = float(row.get("open_interest_atm_call") or 0.0)
+                            oi2 = float(row.get("open_interest_otm_call") or 0.0)
+                        except Exception:
+                            oi1 = oi2 = 0.0
+                        record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                                       exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
+                                       oth=float(k_call) if not pd.isna(k_call) else None,
+                                       oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
+                        # Skip any CALL open attempts for this row
+                        continue
+                # Fix FB: after-hours bid-ask % gate (both legs must be tight)
+                _need_ba = (args.ba_check == "always") or (args.ba_check == "afterhours" and not _is_rth())
+                if _need_ba and not _ba_ok(row, 'C', args.ba_pct_threshold):
+                    record_attempt(symbol, "open_call", "skipped", "wide_spread_after_hours",
                                    exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
-                                   oth=float(k_call) if not pd.isna(k_call) else None,
-                                   oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
-                    # Skip any CALL open attempts for this row
+                                   oth=float(k_call) if not pd.isna(k_call) else None)
                     continue
                 attempted = False
                 live_open_limit = None
@@ -4112,6 +4161,10 @@ def run_from_csv():
                             oi_ok = (oi1 >= args.oi_threshold) and (oi2 >= args.oi_threshold)
                         except Exception:
                             oi_ok = False
+                        # Fix FC: RTH OR-gate — allow the fallback path when both legs are tight (<= ba%).
+                        if not oi_ok and _ba_ok(row, 'C', args.ba_pct_threshold, fail_open=False):
+                            oi_ok = True
+                            vprint(args.verbose, f"[{symbol}] CALL OPEN fallback OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
                         if not oi_ok:
                             record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
                                            oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
@@ -4174,16 +4227,27 @@ def run_from_csv():
                 # Early OI gate for PUT opens (applies to both theo/live and fallback paths)
                 _need_oi = (args.oi_check == "always") or (args.oi_check == "rth" and _is_rth())
                 if _need_oi and not _oi_ok(row, 'P', args.oi_threshold):
-                    try:
-                        oi1 = float(row.get("open_interest_atm_put") or 0.0)
-                        oi2 = float(row.get("open_interest_otm_put") or 0.0)
-                    except Exception:
-                        oi1 = oi2 = 0.0
-                    record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
-                                   exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
-                                   oth=float(k_put) if not pd.isna(k_put) else None,
-                                   oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
+                    # Fix FC: RTH OR-gate — OI may be under threshold if BOTH legs are tight (<= ba%).
+                    if _ba_ok(row, 'P', args.ba_pct_threshold, fail_open=False):
+                        vprint(args.verbose, f"[{symbol}] PUT OPEN OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
+                    else:
+                        try:
+                            oi1 = float(row.get("open_interest_atm_put") or 0.0)
+                            oi2 = float(row.get("open_interest_otm_put") or 0.0)
+                        except Exception:
+                            oi1 = oi2 = 0.0
+                        record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                                       exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
+                                       oth=float(k_put) if not pd.isna(k_put) else None,
+                                       oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
                     # Skip any PUT open attempts for this row
+                    continue
+                # Fix FB: after-hours bid-ask % gate (both legs must be tight)
+                _need_ba = (args.ba_check == "always") or (args.ba_check == "afterhours" and not _is_rth())
+                if _need_ba and not _ba_ok(row, 'P', args.ba_pct_threshold):
+                    record_attempt(symbol, "open_put", "skipped", "wide_spread_after_hours",
+                                   exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
+                                   oth=float(k_put) if not pd.isna(k_put) else None)
                     continue
                 attempted = False
                 live_open_limit = None
@@ -4271,6 +4335,10 @@ def run_from_csv():
                             oi_ok = (oi1 >= args.oi_threshold) and (oi2 >= args.oi_threshold)
                         except Exception:
                             oi_ok = False
+                        # Fix FC: RTH OR-gate — allow the fallback path when both legs are tight (<= ba%).
+                        if not oi_ok and _ba_ok(row, 'P', args.ba_pct_threshold, fail_open=False):
+                            oi_ok = True
+                            vprint(args.verbose, f"[{symbol}] PUT OPEN fallback OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
                         if not oi_ok:
                             record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
                                            oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
