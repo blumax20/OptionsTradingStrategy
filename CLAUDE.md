@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 31, 2026 (Fix FD: accurate attempts logging + Health report — reconcile pass now logs regular signal-driven closes as `close_signal` with full leg detail (right/longK/shortK/order_action/qty) instead of a bare `reconcile_close_signal` row; 10:00 AM retry also re-tries `bs_rejected_bag_e201` opens; Health.ps1 "Last 20 Submitted" now sourced from the persistent attempts CSV (+reqOpenOrders reclaim), new "Rejected/Errored Orders" section, Closed-P/L matches reconcile/roll closes via symbol fallback, P/L Summary uses `reqPnL` realized/unrealized with Day Total = their sum and negatives in parentheses, the "Last 10 submitted" sub-list and "Recent Logs" selection were fixed to show real recent activity. DCM committed; Health.ps1 deploy-only. Prior: Fix FC bid-ask % liquidity gate.)
+**Last Updated:** July 31, 2026 (Fix FE: populate `ba_pct` after hours so the FC liquidity gate actually filters illiquid opens at 5 PM. Root cause — only `reqMarketDataType(2)` (FROZEN) returns after-hours option bid/ask; type-4 gives OI but `bid/ask=-1`, and the listener's old type-3 fallback never fired (−1 ≠ None). Listener + LiquidityFilter enrichment now do a frozen(2) bid/ask re-fetch when there's no usable ask; new 16:45 backstop task `IB_AH_Enrich_1645` (`DCM --afterhours-enrich`) snaps missing strikes then enriches today's CSV before the 17:00 placement; `populate_missing_strikes` now qualifies strikes per-expiry (HSBC 106.42→105/110, not the heuristic 107.5). Verified on 26_07_31: SHEL recovered (tight→place), LNC/RPM/HSBC skip wide. OI/IV column consolidation deferred. listener/LiquidityFilter/DCM committed; .cmd + task deploy-only. Prior: Fix FD accurate attempts logging + Health report.)
 
 ---
 
@@ -5493,3 +5493,37 @@ There is no separate Fix FB — all of it ships here as FC.
 **Verification:** `python -m py_compile DailyCycleManagement.py` OK. Both `Health.ps1` copies pass `[…Language.Parser]::ParseFile`; all 4 embedded Python heredocs `ast.parse` clean (ASCII-only). Smoke tests against live attempts CSVs: Submitted reader returns 20 rows incl. HSBC/LNC (+`[working]` demo); H3 matcher pairs HSBC (est +$14) and LNC (est −$106) via symbol-fallback. Going forward: next 5 PM reconcile close logs `close,placed,close_signal` with full `right/longK/shortK/order_action=SELL/exp/qty`; next 10:00 AM `Fix CP` retry set includes prior-evening 201-rejected opens.
 
 ---
+
+---
+
+### Fix FE: Populate `ba_pct` After Hours — Frozen(2) Bid/Ask + 16:45 Enrichment Backstop (Strike-Snap + Per-Expiry Qualify) (Jul 31)
+**Status:** IMPLEMENTED (listener/LiquidityFilter/DCM committed; AfterHoursEnrich.cmd + IB_AH_Enrich_1645 task are deploy-only)
+
+**Incident:** The 5 PM batch CSV `26_07_31/combined_listener_spreads.csv` had **every `ba_pct_*` blank**. The FC after-hours liquidity gate (`--ba-check afterhours`, `_ba_ok` fail-open) therefore let illiquid opens through — LNC (OTM ba 34.5%) and RPM (43.9/82.0%) were submitted at 5 PM and only bounced on IB Error 201 (margin), not on the ba gate.
+
+**Root cause (confirmed by live probe):**
+- The listener runs `MARKET_DATA_TYPE=4` (delayed-frozen). After the 4 PM close, a **fresh type-4 request returns `bid=-1/ask=-1`** (IB's no-quote sentinel) for options — it delivers the cached daily OI snapshot but **no bid/ask**. `_ba_pct` needs a positive ask → returns None → blank.
+- **Only `reqMarketDataType(2)` (FROZEN) returns after-hours bid/ask** (last regular-session quote). Probe: LNC 45C `bid=2.35/ask=2.70`, JD 32C `1.94/2.27` under type 2; `bid=-1/ask=-1` under types 1/3/4.
+- The listener's existing fallback (`if all(vals is None)` → `reqMarketDataType(3)`) **never fired**: `_wait_for_fields` returns `bid=-1/ask=-1` (not None, since only None/0 count as empty), so the `is None` test is False; and type 3 (plain delayed) is dead after the close anyway.
+- Yesterday's "populated" `ba_pct` was a red herring — it was written by the **10:30 AM RTH enrichment at 10:41** into the prior-day file (proven by the file mtime and the enrichment-only `oi_atm` column co-located with it), not by the listener after hours.
+
+**Fix — five parts:**
+
+**FE-1 (retroactive, one-off):** Populated `26_07_31` `ba_pct` immediately via a frozen(2) fetch of each open row's legs so place-order could be re-run against real quotes. LNC 13.9/34.5, RPM 43.9/82.0 → both correctly wide.
+
+**FE-2 (listener — `listener.py`):** In both leg-fetch blocks of `get_option_data`, replaced the `reqMarketDataType(3)` fallback with a **frozen(2) re-fetch triggered on "no usable ask"**. New helpers `_empty_or_neg(x)` (None/NaN/<=0, i.e. the -1 sentinel) and `_no_usable_ask(vals)`. OI/IV are captured from the primary (type-4) subscription **before** the frozen re-fetch on a separate ticker (frozen gives no OI), then `_preferred_md_type()` is restored. Bounded 3s wait per leg; RTH path unchanged (ask present → no frozen pass).
+
+**FE-3 (enrichment fetcher — `LiquidityFilter.py`):** In `_ib_fetcher_factory._fetch`, after computing `ba` from the primary type-4 ticker, if `ba is None` do a **frozen(2) re-fetch for bid/ask only**, then restore type 4. This is what makes the 16:45 backstop able to fill `ba_pct` after hours (type-4 enrichment alone gets OI but `bid/ask=-1`). Verified live: LNC/RPM `ba_pct` populated after hours.
+
+**FE-4 (16:45 backstop — `DailyCycleManagement.py` + bin):** New `--afterhours-enrich` CLI interceptor (first `__main__` block, next to `--after-hours`), guarded by `_is_trading_day()` (Fix EL holiday-aware). It runs, for **today's folder only**: (1) `_populate_missing_strikes_for_folder` (snap invalid/missing strikes — frozen price + secdef work after hours), then (2) `_run_liquidity_filter_for_folder(only_rth=False)` (type-4 enrichment with the FE-3 frozen fallback). New launcher `C:\OptionsHistory\bin\AfterHoursEnrich.cmd` (Fix EI sentinel guard, logs to `ib_cycle.log`) and scheduled task `IB_AH_Enrich_1645` (daily 16:45, `_is_trading_day` guard covers weekends/holidays), between the 16:01–16:17 signal burst and the 17:00 `IB_AfterHours_PlaceFromWebhook_1700` placement.
+
+**FE-5 (per-expiry strike qualify — `LiquidityFilter.py`):** `populate_missing_strikes` used a price-based increment heuristic (`_get_strike_increment`: $106 → 2.5 → 107.5) that ignores an expiry's real spacing — HSBC Sept is **5-wide** (105/110), so 107.5 doesn't exist and HSBC stayed broken. New `_qualified_strikes_for_expiry()` fetches the listed strikes (`reqSecDefOptParams`) and `qualifyContracts()` against the **specific expiration**: nearest qualifying strike to price = ATM, adjacent qualifying strikes = OTM (natural spacing, matching the listener). Used as primary in `_get_atm_and_otm_strikes`, heuristic as fallback. Only `qualifyContracts` (no market data) → works after hours. Verified: HSBC 106.42 → **105/110/100**, SHEL → 92.5/95/90, ABBV → 250/260/240.
+
+**End-to-end result on `26_07_31` (full backstop replay):** SHEL 92.5/95 ba **7.3/5.4 → PLACE** (a genuinely liquid open that was being lost to the qualify-failure — recovered); LNC/RPM/HSBC → **skip wide**; GLNCY/PROSY (no chain) → skip on qualify. No illiquid opens placed; the one good trade rescued.
+
+**What this does NOT do:**
+- Does not add per-symbol frozen retries during RTH (ask present → skipped) — no burst-latency change during market hours; after-hours the burst is bounded at ~3s/leg and Fix EY tolerates a single starved `/health` in the 16:00–16:30 window.
+- Does not fix symbols with no options chain (GLNCY/PROSY ADRs) — genuinely unfixable.
+- **Deferred follow-up:** enrichment still appends `oi_atm/oi_oth/iv_oth` at the end of the CSV instead of overwriting the listener's existing `open_interest_*`/`iv_otm` columns. Consolidating those is a separate change (touches `_find_csv_oi`/`_lookup_oi`/Health readers) — not in Fix FE.
+
+**Verification:** `python -m py_compile listener.py LiquidityFilter.py DailyCycleManagement.py` OK. Frozen(2) probe confirms after-hours bid/ask; `_qualified_strikes_for_expiry` unit-tested (HSBC 105/110, SHEL 92.5/95, RPM 105/110); full `--afterhours-enrich` replay on `26_07_31` snaps HSBC→105/110 and fills `ba_pct` for all valid opens. `IB_AH_Enrich_1645` registered (Ready, daily 16:45, PT15M limit).

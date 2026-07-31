@@ -828,6 +828,19 @@ def _ba_pct(bid, ask):
         return None
     return round((a - b) / mid * 100.0, 1)
 
+def _empty_or_neg(x) -> bool:
+    """True when a quote field is missing / NaN / <= 0 (IB's -1 'no-quote' sentinel)."""
+    if x is None:
+        return True
+    if isinstance(x, (int, float)):
+        return (x != x) or x <= 0
+    return False
+
+def _no_usable_ask(vals: dict) -> bool:
+    """Fix FE: after hours the live/delayed feed returns ask=-1. Only a positive ask
+    yields a real bid-ask %, so treat missing/<=0 ask as 'no usable quote'."""
+    return _empty_or_neg(vals.get("ask"))
+
 def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
     symbol = _clean_symbol(symbol)
@@ -1087,24 +1100,38 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             try:
                 t = ib.reqMktData(option, '101,106', False, False)
                 vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
-                # if still empty, try delayed mdtype=3 briefly
-                if all(vals.get(k) is None for k in ("bid","ask")):
-                    try: ib.reqMarketDataType(3)
-                    except Exception: pass
-                    vals2, _ = _wait_for_fields(t, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
-                    for k in ("bid","ask","last","close"):
-                        if vals2.get(k) is not None and vals.get(k) is None:
-                            vals[k] = vals2.get(k)
+                # Capture OI/IV from the primary (delayed-frozen) subscription before any
+                # frozen re-fetch overwrites them.
+                _iv_leg = getattr(t, 'impliedVolatility', None)
+                _oi_leg = getattr(t, 'callOpenInterest', None)
+                # Fix FE: after hours the primary feed returns ask=-1 (no usable quote).
+                # Frozen (type 2) serves the last regular-session bid/ask. Re-fetch on a
+                # separate ticker so OI/IV (already captured) are not lost, then restore.
+                if _no_usable_ask(vals):
+                    try:
+                        ib.reqMarketDataType(2)
+                        tf = ib.reqMktData(option, '', False, False)
+                        vals2, _ = _wait_for_fields(tf, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
+                        for k in ("bid","ask","last","close"):
+                            if not _empty_or_neg(vals2.get(k)) and _empty_or_neg(vals.get(k)):
+                                vals[k] = vals2.get(k)
+                        _safe_cancel_md(tf)
+                    except Exception:
+                        pass
+                    finally:
+                        try: ib.reqMarketDataType(_preferred_md_type())
+                        except Exception: pass
                 _safe_cancel_md(t)
             except Exception:
-                t = None
+                _iv_leg = None
+                _oi_leg = None
                 vals = {}
             legs_info.append({
                 "strike": strike,
                 "bid": vals.get("bid"),
                 "ask": vals.get("ask"),
-                "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
-                "callOpenInterest": getattr(t, 'callOpenInterest', None) if t else None
+                "impliedVolatility": _iv_leg,
+                "callOpenInterest": _oi_leg
             })
 
         # --- Fetch put legs for a put debit spread (long ATM put, short lower strike put) ---
@@ -1128,27 +1155,39 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
                 try:
                     t = ib.reqMktData(option, '101,106', False, False)
                     vals, _ = _wait_for_fields(t, fields=("bid","ask"), timeout_ms=10000, step_ms=200)
-                    # if still empty, try delayed mdtype=3 briefly
-                    if all(vals.get(k) is None for k in ("bid","ask")):
-                        try: ib.reqMarketDataType(3)
-                        except Exception: pass
-                        vals2, _ = _wait_for_fields(t, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
-                        for k in ("bid","ask","last","close"):
-                            if vals2.get(k) is not None and vals.get(k) is None:
-                                vals[k] = vals2.get(k)
+                    # Capture OI/IV from the primary subscription before any frozen re-fetch.
+                    _iv_leg = getattr(t, 'impliedVolatility', None)
+                    _oi_leg = getattr(t, 'putOpenInterest', None)
+                    # Fix FE: frozen (type 2) for the after-hours bid/ask (ask=-1 otherwise).
+                    if _no_usable_ask(vals):
+                        try:
+                            ib.reqMarketDataType(2)
+                            tf = ib.reqMktData(option, '', False, False)
+                            vals2, _ = _wait_for_fields(tf, fields=("bid","ask","last","close"), timeout_ms=3000, step_ms=200)
+                            for k in ("bid","ask","last","close"):
+                                if not _empty_or_neg(vals2.get(k)) and _empty_or_neg(vals.get(k)):
+                                    vals[k] = vals2.get(k)
+                            _safe_cancel_md(tf)
+                        except Exception:
+                            pass
+                        finally:
+                            try: ib.reqMarketDataType(_preferred_md_type())
+                            except Exception: pass
                     _safe_cancel_md(t)
                 except Exception:
-                    t = None
+                    _iv_leg = None
+                    _oi_leg = None
                     vals = {}
             else:
-                t = None
+                _iv_leg = None
+                _oi_leg = None
                 vals = {}
             put_legs_info.append({
                 "strike": strike,
                 "bid": vals.get("bid"),
                 "ask": vals.get("ask"),
-                "impliedVolatility": getattr(t, 'impliedVolatility', None) if t else None,
-                "putOpenInterest": getattr(t, 'putOpenInterest', None) if t else None
+                "impliedVolatility": _iv_leg,
+                "putOpenInterest": _oi_leg
             })
 
         # Compute net debit limits from quotes (may be None)

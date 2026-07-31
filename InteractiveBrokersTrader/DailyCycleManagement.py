@@ -5312,6 +5312,31 @@ if __name__ == "__main__":
             LOG.info("DailyCycleManagement runner completed.")
             sys.exit(0)
 
+        if "--afterhours-enrich" in _ch_argv:
+            # Fix FE: 16:45 backstop. Enrich TODAY's combined CSV so ba_pct (and OI) are
+            # populated before the 17:00 after-hours placement — otherwise the FC
+            # --ba-check afterhours gate is fail-open and illiquid opens get placed.
+            # only_rth=False selects LiquidityFilter's type-4 no-flag path, which (after the
+            # Fix FE frozen(2) fallback in _ib_fetcher_factory) serves after-hours bid/ask.
+            if not r._is_trading_day():
+                LOG.info("--afterhours-enrich: skipping — not a trading day (Fix FE)")
+                sys.exit(0)
+            try:
+                _fe_today = r._now_ny().strftime("%y_%m_%d")
+            except Exception:
+                _fe_today = datetime.now(NY).strftime("%y_%m_%d")
+            # Fix FE: snap invalid/missing strikes FIRST (frozen price + secdef work after
+            # hours), so qualify-failure rows (e.g. HSBC->105/110, SHEL->92.5) get valid
+            # legs, then enrich ba_pct/OI. Mirrors the 10:00 AM Fix CP-B order.
+            LOG.info("--afterhours-enrich: snapping missing strikes then enriching today's CSV (%s) before 5 PM (Fix FE)", _fe_today)
+            try:
+                r._populate_missing_strikes_for_folder(_fe_today)
+            except Exception as _fe_ps_err:
+                LOG.warning("--afterhours-enrich: strike population failed (%s); proceeding to enrich", _fe_ps_err)
+            r._run_liquidity_filter_for_folder(_fe_today, only_rth=False)
+            LOG.info("DailyCycleManagement runner completed.")
+            sys.exit(0)
+
         # Fix EN: menu 8-8 --force-execute-pending {buy|sell|both}
         # Cancel all pending BAG orders (filtered by side) and re-place with join pricing.
         # Uses ordered list (not the _ch_argv set) because we need the value that follows the flag.

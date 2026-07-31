@@ -225,6 +225,58 @@ def _round_to_strike(price: float, increment: float) -> float:
     return round(price / increment) * increment
 
 
+def _qualified_strikes_for_expiry(ib: "IB", stock, symbol: str, expiration: str,
+                                  price: float, logger=None,
+                                  max_probe: int = 8):
+    """
+    Fix FE: pick strikes that actually exist for THIS expiration.
+
+    The price-based increment heuristic (_get_strike_increment) doesn't know an
+    expiry's real spacing — e.g. HSBC Sept is 5-wide (105/110) but a $106 stock
+    maps to a 2.5 increment -> 107.5, which does not exist. Fetch the listed
+    strikes and qualifyContracts() against the specific expiration: nearest
+    qualifying strike to price = ATM, then the adjacent qualifying strikes
+    (natural spacing, matching the listener) for the OTM legs.
+
+    Returns (atm, otm_call, otm_put) or None if secdef/qualify is unavailable.
+    Only qualifyContracts is used (no market data), so it works after hours.
+    """
+    if ib is None or Option is None:
+        return None
+    try:
+        params = ib.reqSecDefOptParams(symbol, "", "STK", stock.conId)
+        strikes = sorted({float(s) for p in (params or []) for s in p.strikes})
+        if not strikes:
+            return None
+
+        def _qual(k) -> bool:
+            try:
+                o = Option(symbol, expiration, float(k), 'C', "SMART", "100", "USD")
+                return bool(ib.qualifyContracts(o))
+            except Exception:
+                return False
+
+        atm = None
+        for k in sorted(strikes, key=lambda s: abs(s - price))[:max_probe]:
+            if _qual(k):
+                atm = k
+                break
+        if atm is None:
+            return None
+        otm_call = next((s for s in strikes if s > atm and _qual(s)), None)
+        otm_put = next((s for s in reversed(strikes) if s < atm and _qual(s)), None)
+        if otm_call is None and otm_put is None:
+            return None
+        if logger:
+            logger(f"[{symbol}] Fix FE per-expiry strikes ({expiration}): "
+                   f"ATM={atm} OTM_call={otm_call} OTM_put={otm_put}")
+        return (atm, otm_call, otm_put)
+    except Exception as e:
+        if logger:
+            logger(f"[{symbol}] Fix FE per-expiry qualify failed: {e}")
+        return None
+
+
 def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type: str, logger=None) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Given a symbol and expiration, fetch the current price and compute ATM + OTM strikes.
@@ -301,6 +353,15 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
                 logger(f"[{symbol}] Could not get valid price (last={getattr(ticker, 'last', None)}, close={getattr(ticker, 'close', None)})")
             return (None, None, None, None)
 
+        # Fix FE: prefer strikes that actually qualify for THIS expiration (handles
+        # per-expiry spacing the price heuristic can't know, e.g. HSBC Sept 5-wide ->
+        # 105/110 instead of 107.5). Fall back to the increment heuristic if secdef
+        # or qualify is unavailable.
+        _real = _qualified_strikes_for_expiry(ib, stock, symbol, expiration, price, logger)
+        if _real is not None:
+            atm, otm_call, otm_put = _real
+            return (atm, otm_call, otm_put, price)
+
         # Determine strike increment and ATM
         increment = _get_strike_increment(price)
         atm = _round_to_strike(price, increment)
@@ -312,7 +373,7 @@ def _get_atm_and_otm_strikes(ib: "IB", symbol: str, expiration: str, signal_type
         otm_put = atm - increment
 
         if logger:
-            logger(f"[{symbol}] price=${price:.2f} -> ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put}")
+            logger(f"[{symbol}] price=${price:.2f} -> ATM={atm}, OTM_call={otm_call}, OTM_put={otm_put} (heuristic)")
 
         return (atm, otm_call, otm_put, price)
 
@@ -492,9 +553,25 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
                     iv = float(iv_val)
             # Fix FC: compute live bid-ask % from the same ticker (top-of-book always delivered)
             ba = _ba_pct(getattr(t, "bid", None), getattr(t, "ask", None))
-            # Clean up subscription
+            # Clean up primary subscription
             try: ib.cancelMktData(opt)
             except Exception: pass
+            # Fix FE: after hours the primary type (live/delayed-frozen) returns bid/ask=-1,
+            # so ba is None even though OI populates. Frozen (type 2) serves the last
+            # regular-session bid/ask. Re-fetch bid/ask only, then restore delayed-frozen.
+            if ba is None:
+                try:
+                    ib.reqMarketDataType(2)
+                    tf = ib.reqMktData(opt, "", False, False)
+                    ib.sleep(poll_seconds)
+                    ba = _ba_pct(getattr(tf, "bid", None), getattr(tf, "ask", None))
+                    try: ib.cancelMktData(opt)
+                    except Exception: pass
+                except Exception:
+                    pass
+                finally:
+                    try: ib.reqMarketDataType(4)
+                    except Exception: pass
             return (oi, iv, ba)
         except Exception:
             return (None, None, None)
