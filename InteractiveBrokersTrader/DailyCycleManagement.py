@@ -608,6 +608,40 @@ class DailyCycleManagementMixin:
                 continue
         return False, None
 
+    def _tp_risk_exit_symbols_today(self) -> set[str]:
+        """
+        Fix FF: Return the set of symbols that had a take-profit risk-exit close placed today.
+
+        Reads today's attempts CSV and collects any symbol with a row where action is a close
+        (close / force_close) and the close_reason field contains "TP". TP-specific on purpose:
+        a stop-loss exit (if RISK_EXIT_STOP_LOSS_ENABLED is re-enabled, Fix ER) is urgent and
+        must still convert to aggressive join at 3 PM, so it is NOT collected here.
+
+        The 3 PM preclose uses this set to leave patient TP limit orders alone instead of
+        cancelling + re-pricing them with aggressive join (which destroys the gain). Fail-safe:
+        returns an empty set on any error, preserving the current force-close behavior.
+        """
+        out: set[str] = set()
+        try:
+            day = self._now_ny().strftime("%y_%m_%d")
+            path = fr"C:\OptionsHistory\{day}\attempts_{day}.csv"
+            if not os.path.exists(path):
+                return out
+            with open(path, "r", newline="") as f:
+                for row in csv.DictReader(f):
+                    action = (row.get("action") or "").lower()
+                    if action not in ("close", "force_close"):
+                        continue
+                    if "TP" not in (row.get("close_reason") or ""):
+                        continue
+                    sym = (row.get("symbol") or "").strip().upper()
+                    if sym:
+                        out.add(sym)
+        except Exception as e:
+            LOG.warning("Fix FF: _tp_risk_exit_symbols_today failed (%s); no TP skip", e)
+            return set()
+        return out
+
     def _submit_close_shared(self, sym: str, csv_exists_today: bool, lookback_days: int, context: str) -> None:
         """
         Shared submission path used by both pre-close (≈15:00) and after-hours reconcile.
@@ -2619,6 +2653,28 @@ class DailyCycleManagementMixin:
 
         if non_candidates:
             LOG.info("Pre-close: skipping (no close/mismatch): %s", ", ".join(sorted(non_candidates)))
+        # Fix FF: Leave patient take-profit risk-exit orders alone. A working close that is
+        # neither a CLOSE signal nor an orientation mismatch (i.e. in non_candidates) AND was
+        # placed by a TP risk exit today should NOT be cancelled + re-priced with aggressive
+        # join at 3 PM — that destroys the gain. Skip it: the morning mid limit rides to 4 PM,
+        # then the position carries overnight for the next morning's risk-exit re-try.
+        try:
+            tp_syms = self._tp_risk_exit_symbols_today()
+            _nc_set = set(non_candidates)
+            skip_tp = [s for s in sorted(set(work_syms) & tp_syms) if s in _nc_set]
+            for s in skip_tp:
+                close_candidates.discard(s)
+            if skip_tp:
+                LOG.info("Pre-close: skipping TP risk-exit orders (leaving morning limit to ride to close): %s",
+                         ", ".join(skip_tp))
+                for s in skip_tp:
+                    try:
+                        self._attempt(symbol=s, action="close", status="skipped",
+                                      reason="preclose_skip_tp_risk_exit", source="dcm-preclose")
+                    except Exception:
+                        pass
+        except Exception as e:
+            LOG.warning("Pre-close: TP risk-exit skip evaluation failed; continuing: %s", e)
         # Add any credit/inverted verticals to the close candidate set
         try:
             credit_syms = self._detect_credit_or_inverted_spreads()

@@ -524,6 +524,29 @@ def _ba_ok(row: pd.Series, right: str, threshold: float, fail_open: bool = True)
     except Exception:
         return fail_open
 
+def _ba_desc(row: pd.Series, right: str) -> str:
+    """
+    Fix FF: compact "atm/otm" bid-ask% string for logging (e.g. "43.9/82.0", "blank/82.0",
+    "blank/blank"). Used to annotate an `oi_below_threshold` skip so a genuinely wide spread
+    (a leg > threshold) is distinguishable from a missing quote (blank), which the RTH OR-gate
+    both treat as "not proven tight" via _ba_ok(fail_open=False).
+    """
+    if right.upper() == 'C':
+        v1 = row.get("ba_pct_atm_call"); v2 = row.get("ba_pct_otm_call")
+    else:
+        v1 = row.get("ba_pct_atm_put"); v2 = row.get("ba_pct_otm_put")
+    def _fmt(v):
+        try:
+            if v is None:
+                return "blank"
+            fv = float(v)
+            if fv != fv:  # NaN
+                return "blank"
+            return f"{fv:.1f}"
+        except Exception:
+            return "blank"
+    return f"{_fmt(v1)}/{_fmt(v2)}"
+
 def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
@@ -4062,7 +4085,7 @@ def run_from_csv():
                             oi2 = float(row.get("open_interest_otm_call") or 0.0)
                         except Exception:
                             oi1 = oi2 = 0.0
-                        record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                        record_attempt(symbol, "open_call", "skipped", f"oi_below_threshold:ba={_ba_desc(row, 'C')}",
                                        exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
                                        oth=float(k_call) if not pd.isna(k_call) else None,
                                        oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
@@ -4166,7 +4189,7 @@ def run_from_csv():
                             oi_ok = True
                             vprint(args.verbose, f"[{symbol}] CALL OPEN fallback OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
                         if not oi_ok:
-                            record_attempt(symbol, "open_call", "skipped", "oi_below_threshold",
+                            record_attempt(symbol, "open_call", "skipped", f"oi_below_threshold:ba={_ba_desc(row, 'C')}",
                                            oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
                                            exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
                                            oth=float(k_call) if not pd.isna(k_call) else None, scope=args.oi_check)
@@ -4236,7 +4259,7 @@ def run_from_csv():
                             oi2 = float(row.get("open_interest_otm_put") or 0.0)
                         except Exception:
                             oi1 = oi2 = 0.0
-                        record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                        record_attempt(symbol, "open_put", "skipped", f"oi_below_threshold:ba={_ba_desc(row, 'P')}",
                                        exp=str(expiration), atm=float(atm) if not pd.isna(atm) else None,
                                        oth=float(k_put) if not pd.isna(k_put) else None,
                                        oi_atm=oi1, oi_otm=oi2, threshold=int(args.oi_threshold), scope=args.oi_check)
@@ -4340,7 +4363,7 @@ def run_from_csv():
                             oi_ok = True
                             vprint(args.verbose, f"[{symbol}] PUT OPEN fallback OI under threshold but spread tight (ba%<= {args.ba_pct_threshold}); placing")
                         if not oi_ok:
-                            record_attempt(symbol, "open_put", "skipped", "oi_below_threshold",
+                            record_attempt(symbol, "open_put", "skipped", f"oi_below_threshold:ba={_ba_desc(row, 'P')}",
                                            oi_atm=oi1, oi_otm=oi2, threshold=args.oi_threshold,
                                            exp=expiration, atm=float(atm) if not pd.isna(atm) else None,
                                            oth=float(k_put) if not pd.isna(k_put) else None, scope=args.oi_check)

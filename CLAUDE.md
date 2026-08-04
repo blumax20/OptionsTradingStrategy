@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** July 31, 2026 (Fix FE: populate `ba_pct` after hours so the FC liquidity gate actually filters illiquid opens at 5 PM. Root cause — only `reqMarketDataType(2)` (FROZEN) returns after-hours option bid/ask; type-4 gives OI but `bid/ask=-1`, and the listener's old type-3 fallback never fired (−1 ≠ None). Listener + LiquidityFilter enrichment now do a frozen(2) bid/ask re-fetch when there's no usable ask; new 16:45 backstop task `IB_AH_Enrich_1645` (`DCM --afterhours-enrich`) snaps missing strikes then enriches today's CSV before the 17:00 placement; `populate_missing_strikes` now qualifies strikes per-expiry (HSBC 106.42→105/110, not the heuristic 107.5). Verified on 26_07_31: SHEL recovered (tight→place), LNC/RPM/HSBC skip wide. OI/IV column consolidation deferred. listener/LiquidityFilter/DCM committed; .cmd + task deploy-only. Prior: Fix FD accurate attempts logging + Health report.)
+**Last Updated:** August 3, 2026 (Fix FF: two fixes from the SCHW/ACM investigation. (1) The 3 PM preclose was cancelling patient take-profit risk-exit `mid` orders (ACM 1.90, SCHW 0.83) and re-pricing them with aggressive `join` (→0.50/0.40) — a big loss of gain. New `_tp_risk_exit_symbols_today()` (reads today's attempts CSV for `close_reason` containing "TP") lets `_pre_close_market_conversion` **skip** those TP orders, leaving the good morning limit to ride to 4 PM; day-before CLOSE signals / mismatches / credit-inverted still force-close aggressively, and a re-enabled stop-loss (Fix ER) is NOT skipped. (2) The RTH OR-gate `oi_below_threshold` skip now appends ba% via new `_ba_desc()` — `oi_below_threshold:ba=38.0/63.8` (wide) vs `ba=blank/blank` (no quote) — so a genuinely wide spread is distinguishable from a missing quote. DCM+PlaceAnOrder committed. Prior: Fix FE: populate `ba_pct` after hours so the FC liquidity gate actually filters illiquid opens at 5 PM. Root cause — only `reqMarketDataType(2)` (FROZEN) returns after-hours option bid/ask; type-4 gives OI but `bid/ask=-1`, and the listener's old type-3 fallback never fired (−1 ≠ None). Listener + LiquidityFilter enrichment now do a frozen(2) bid/ask re-fetch when there's no usable ask; new 16:45 backstop task `IB_AH_Enrich_1645` (`DCM --afterhours-enrich`) snaps missing strikes then enriches today's CSV before the 17:00 placement; `populate_missing_strikes` now qualifies strikes per-expiry (HSBC 106.42→105/110, not the heuristic 107.5). Verified on 26_07_31: SHEL recovered (tight→place), LNC/RPM/HSBC skip wide. OI/IV column consolidation deferred. listener/LiquidityFilter/DCM committed; .cmd + task deploy-only. Prior: Fix FD accurate attempts logging + Health report.)
 
 ---
 
@@ -5527,3 +5527,32 @@ There is no separate Fix FB — all of it ships here as FC.
 - **Deferred follow-up:** enrichment still appends `oi_atm/oi_oth/iv_oth` at the end of the CSV instead of overwriting the listener's existing `open_interest_*`/`iv_otm` columns. Consolidating those is a separate change (touches `_find_csv_oi`/`_lookup_oi`/Health readers) — not in Fix FE.
 
 **Verification:** `python -m py_compile listener.py LiquidityFilter.py DailyCycleManagement.py` OK. Frozen(2) probe confirms after-hours bid/ask; `_qualified_strikes_for_expiry` unit-tested (HSBC 105/110, SHEL 92.5/95, RPM 105/110); full `--afterhours-enrich` replay on `26_07_31` snaps HSBC→105/110 and fills `ba_pct` for all valid opens. `IB_AH_Enrich_1645` registered (Ready, daily 16:45, PT15M limit).
+
+---
+
+### Fix FF: 3 PM Preclose Skips Take-Profit Risk-Exit Orders + ba% in RTH OI-Skip Reason (Aug 3)
+**Status:** IMPLEMENTED
+
+Two small fixes from the 2026-08-03 SCHW/ACM investigation.
+
+**Part 1 — Preclose no longer converts patient TP orders to aggressive join.**
+
+*Incident:* Two take-profit risk exits (ACM 72.5/75C, SCHW 104/105C) were placed in the morning at patient `mid` prices (**1.90**, **0.83**) and sat unfilled all day — correct for a TP (a gain, no urgency). At 3 PM the preclose **cancelled** them and re-placed with aggressive **`join`** (`--allow-market-fallback`), crashing the limits to **0.50** / **0.40**, which then filled — a large avoidable loss of potential gain.
+
+*Root cause* (confirmed in `26_08_03/attempts_26_08_03.csv`): morning risk exits use `--use-live-close mid` (Fix DZ; comment literally says *"preclose converts to join"*). `_pre_close_market_conversion` sets `close_candidates = set(work_syms)` — pulling **every** working SELL-BAG-LMT into the aggressive close path regardless of origin. TP orders (neither a CLOSE signal nor an orientation mismatch) were logged as `non_candidates` but never removed from `close_candidates`, so they were still force-closed via `_submit_close_shared(context="preclose")` → cancel + `join`.
+
+*Fix* (`DailyCycleManagement.py`):
+- New helper `_tp_risk_exit_symbols_today() -> set[str]` (near `_would_be_same_day_close`): reads today's attempts CSV, returns symbols with any `close`/`force_close` row whose `close_reason` contains `"TP"`. **TP-specific** so a re-enabled stop-loss (Fix ER) is NOT skipped — a stop-loss is urgent and must still convert to join. Fail-safe: `set()` on any error (nothing skipped, current behavior preserved).
+- In `_pre_close_market_conversion`, after the candidate loop: `skip_tp = [s for s in sorted(set(work_syms) & tp_syms) if s in set(non_candidates)]`; `close_candidates.discard(s)` for each; log + `_attempt(close,skipped,preclose_skip_tp_risk_exit)`. A working close is skipped only when it is BOTH a `non_candidate` (no CLOSE signal, no mismatch) AND a TP order per today's CSV. The credit/inverted scan runs afterward unchanged and re-adds any symbol it independently flags.
+
+Result: a patient TP order rides to 4 PM at the good price, expires DAY if unfilled, and the position carries overnight for the next morning's risk-exit re-try. Day-before CLOSE signals (`_latest_signal_is_close=True`), orientation mismatches, and credit/inverted verticals still get the aggressive 3 PM force-close unchanged.
+
+**Part 2 — `oi_below_threshold` skip reason now shows ba%.**
+
+*Context:* During RTH the OI gate is an OR gate (Fix FC): place if BOTH legs OI ≥ 100 **OR** BOTH legs ba% ≤ 30. On skip, the bare `oi_below_threshold` reason hid whether the ba% OR-branch failed because the spread was genuinely **wide** (> 30%) or because ba% was **blank**. `_ba_ok(fail_open=False)` fails closed on a missing ba%, so a low-OI symbol with no quote logged identically to a truly wide one (today: RPM was truly wide, GLNCY/PROSY were blank ADRs — indistinguishable).
+
+*Fix* (`PlaceAnOrder.py`): new `_ba_desc(row, right)` returns a compact `"atm/otm"` ba% string (`"38.0/63.8"`, `"blank/blank"`; None/NaN → `"blank"`). All four `oi_below_threshold` sites now record `f"oi_below_threshold:ba={_ba_desc(row, 'C'|'P')}"`. Keeps `oi_below_threshold` as a **prefix** (matches Fix EK-a's `low_oi_both_legs:atm=...` convention); no schema change; no exact-match consumers exist. Logging-only — the placed/skipped decision is unchanged.
+
+Result: `RPM open_call,skipped,oi_below_threshold:ba=38.0/63.8` (wide) vs `GLNCY open_call,skipped,oi_below_threshold:ba=blank/blank` (no quote) — instantly distinguishable. (Both-legs-≤30 never reaches the skip; the OR gate rescues it first.)
+
+**Verification:** `python -m py_compile DailyCycleManagement.py PlaceAnOrder.py` OK. `_tp_risk_exit_symbols_today()` on `26_08_03/attempts_26_08_03.csv` → `{ACM, SCHW}`. `_ba_desc` on `26_07_31` rows → RPM `38.0/63.8`, GLNCY/PROSY `blank/blank`. Next 3 PM preclose with an unfilled TP: `close,skipped,preclose_skip_tp_risk_exit` (morning order left working) instead of the `cancel_close`→`preclose_fallback_live_join`→`force_close` sequence; a genuine day-before CLOSE still shows the aggressive path.
