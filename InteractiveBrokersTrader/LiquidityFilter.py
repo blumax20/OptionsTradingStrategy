@@ -434,6 +434,11 @@ def populate_missing_strikes(day_dir: str,
 
     # Find rows with missing strikes or current_price
     rows_needing_strikes = []
+    needing_idx = set()
+    # Fix FG: open rows whose signal-relevant OTM strike is PRESENT but may be invalid for the
+    # chosen expiry (e.g. WBD 25.5P written from the pooled cross-expiry strike list). Validated
+    # against IB after connect; invalid ones are added to rows_needing_strikes for re-snapping.
+    otm_check_candidates = []
     for i, row in enumerate(rows):
         atm_val = row.get(atm_col, "")
         price_val = row.get(price_col, "")
@@ -450,20 +455,33 @@ def populate_missing_strikes(day_dir: str,
         otm_put_missing  = not otm_put_val  or str(otm_put_val).strip()  == "" or _parse_float(otm_put_val)  is None
         otm_missing = otm_call_missing and otm_put_missing
 
+        symbol = str(row.get(sym_col, "")).strip().upper()
+        exp = str(row.get(exp_col, "")).strip()
+        stype = str(row.get(stype_col, "")).strip().upper() if stype_col else ""
+
         if atm_missing or price_missing or otm_missing:
-            symbol = str(row.get(sym_col, "")).strip().upper()
-            exp = str(row.get(exp_col, "")).strip()
-            stype = str(row.get(stype_col, "")).strip().upper() if stype_col else ""
             if symbol and exp:
                 rows_needing_strikes.append((i, symbol, exp, stype))
+                needing_idx.add(i)
+            continue
 
-    if not rows_needing_strikes:
+        # Fix FG: present-but-possibly-invalid OTM on an OPEN row → queue for IB validation.
+        if symbol and exp and stype in ("CALL_OPEN", "PUT_OPEN"):
+            if stype == "CALL_OPEN":
+                otm_v, right = _parse_float(otm_call_val), "C"
+            else:
+                otm_v, right = _parse_float(otm_put_val), "P"
+            if otm_v is not None:
+                otm_check_candidates.append((i, symbol, exp, stype, otm_v, right))
+
+    if not rows_needing_strikes and not otm_check_candidates:
         if logger:
             logger("populate_missing_strikes: no rows with missing strikes")
         return 0
 
     if logger:
-        logger(f"populate_missing_strikes: {len(rows_needing_strikes)} rows need strikes")
+        logger(f"populate_missing_strikes: {len(rows_needing_strikes)} rows need strikes; "
+               f"{len(otm_check_candidates)} open row(s) to validate (Fix FG)")
 
     # Connect to IB and fetch strikes
     if IB is None:
@@ -475,6 +493,28 @@ def populate_missing_strikes(day_dir: str,
     updates = 0
     try:
         ib.connect(ib_host, ib_port, clientId=client_id, timeout=10)
+
+        # Fix FG: validate present OTM strikes on open rows against their expiry. A strike that
+        # doesn't qualify (e.g. WBD 25.5P for the Sep monthly, sourced from the pooled
+        # cross-expiry strike list) is queued for re-snapping by _get_atm_and_otm_strikes().
+        for idx, symbol, exp, stype, otm_v, right in otm_check_candidates:
+            if idx in needing_idx:
+                continue
+            try:
+                _o = Option(symbol, exp, float(otm_v), right, "SMART", "100", "USD")
+                _ok = bool(ib.qualifyContracts(_o))
+            except Exception:
+                _ok = False
+            if not _ok:
+                rows_needing_strikes.append((idx, symbol, exp, stype))
+                needing_idx.add(idx)
+                if logger:
+                    logger(f"[{symbol}] Fix FG: OTM {right} {otm_v} not valid for {exp} — re-snapping")
+
+        if not rows_needing_strikes:
+            if logger:
+                logger("populate_missing_strikes: no rows needed strikes after Fix FG validation")
+            return 0
 
         # Group by symbol to avoid redundant lookups
         symbol_data = {}  # symbol -> (atm, otm_call, otm_put, current_price)

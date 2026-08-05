@@ -264,6 +264,39 @@ def _qualify_with_fallback(ib: IB, symbol: str, expiry: str, strike: float, righ
         raise last_exc
     raise RuntimeError(f"Could not qualify {symbol} {right} {strike} {expiry}")
 
+def _snap_otm_to_expiry(ib: IB, symbol: str, expiry: str, start: float, right: str,
+                        direction: str, strikes_all: list[float],
+                        tradingClass: str | None, multiplier: str | None,
+                        max_steps: int = 6) -> float:
+    """Fix FG: `strikes_all` is pooled across ALL expiries, so an OTM strike picked from it
+    (e.g. WBD 25.5 from a weekly) may not exist for the chosen monthly expiry. Walk the pool
+    from `start` in `direction` ('below'/'above'), qualifying each candidate against `expiry`,
+    and return the first strike that qualifies. If `start` itself qualifies (the common case),
+    return it unchanged. Returns `start` if nothing nearby qualifies (caller handles as before).
+    """
+    try:
+        _qualify_with_fallback(ib, symbol, expiry, start, right, tradingClass, multiplier)
+        return start  # already valid for this expiry — no snap
+    except Exception:
+        pass
+    if direction == "below":
+        cands = [s for s in strikes_all if s < start]
+        cands.sort(reverse=True)  # nearest-below first
+    else:
+        cands = [s for s in strikes_all if s > start]
+        cands.sort()              # nearest-above first
+    for cand in cands[:max_steps]:
+        try:
+            _qualify_with_fallback(ib, symbol, expiry, cand, right, tradingClass, multiplier)
+            logger.info("[%s] Fix FG: OTM %s %.1f not valid for %s — snapped to %.1f",
+                        symbol, right, start, expiry, cand)
+            return cand
+        except Exception:
+            continue
+    logger.warning("[%s] Fix FG: OTM %s %.1f not valid for %s and no nearby strike qualifies",
+                   symbol, right, start, expiry)
+    return start
+
 # --- Normalize incoming symbols (strip exchange prefixes, timeframes, trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     """
@@ -1074,6 +1107,10 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
                     logger.warning("[%s] Fix EB: ATM %.1f not valid for %s and no nearby strike qualifies",
                                    symbol, atm_strike, expiry_str)
             otm_strike = _next_higher_existing(strikes_all, atm_strike)
+            # Fix FG: the pooled strikes_all can hand back an OTM call that only exists on a
+            # near-term weekly (e.g. WBD 28.5C). Snap up to a strike valid for the chosen expiry.
+            otm_strike = _snap_otm_to_expiry(ib, symbol, expiry_str, otm_strike, 'C',
+                                             'above', strikes_all, preferred_tc, multiplier)
 
         # Qualify and request option mkt data for both call legs (ATM long, OTM short)
         stage = "qualify_options"
@@ -1141,6 +1178,11 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             put_otm_strike = position_info['otm_strike']
         elif strikes_all:
             put_otm_strike = _next_lower_existing(strikes_all, atm_strike)
+            # Fix FG: strikes_all is pooled across all expiries, so the next-lower strike may be
+            # a weekly-only half-dollar (e.g. WBD 25.5) that does not exist for the chosen
+            # monthly expiry. Snap down to a strike that qualifies for this expiry (25.5 -> 25.0).
+            put_otm_strike = _snap_otm_to_expiry(ib, symbol, expiry_str, put_otm_strike, 'P',
+                                                 'below', strikes_all, preferred_tc, multiplier)
         else:
             put_otm_strike = max(atm_strike - 1, 0.01)
         put_legs_info = []
