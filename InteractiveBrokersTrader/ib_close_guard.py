@@ -35,66 +35,45 @@ def has_working_auto_close(symbol: str,
         return False
 
     try:
-        # Must request all open orders first to see orders from other client IDs
-        ib.reqAllOpenOrders()
-        ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
-        trades = ib.openTrades() or []
         working_states: Set[str] = {
             "presubmitted", "submitted", "pendingsubmit", "apipending"
         }
 
-        for tr in trades:
-            c = getattr(tr, "contract", None)
-            o = getattr(tr, "order", None)
-            s = getattr(tr, "orderStatus", None)
-            if not (c and o and s):
-                continue
+        def _scan(trades) -> bool:
+            for tr in trades:
+                c = getattr(tr, "contract", None)
+                o = getattr(tr, "order", None)
+                s = getattr(tr, "orderStatus", None)
+                if not (c and o and s):
+                    continue
+                if (getattr(c, "symbol", "") or "").upper() != sym_u:
+                    continue
+                # Fix AB6: Only SELL orders are closes; BUY = OPEN and must not block.
+                if (getattr(o, "action", "") or "").upper() != "SELL":
+                    continue
+                # SELL BAG = combo close (Fix AB6). Individual OPT SELL = worthless-leg
+                # close path (Fix AV1). Both count as a working close for this symbol.
+                if getattr(c, "secType", "") not in ("BAG", "OPT"):
+                    continue
+                st = (getattr(s, "status", "") or "").lower()
+                if st in ("filled", "cancelled", "apicancelled"):
+                    continue
+                # GTC/DAY orders with outsideRth go Inactive after hours but are still working.
+                tif = (getattr(o, "tif", "") or "").upper()
+                if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
+                    return True
+            return False
 
-            # Only look at option combos (verticals etc.).
-            if getattr(c, "secType", "") != "BAG":
-                continue
-
-            if (getattr(c, "symbol", "") or "").upper() != sym_u:
-                continue
-
-            # Fix AB6: Only SELL BAG orders are closes (debit spread unwind).
-            # BUY BAG = OPEN order; should NOT block close placement.
-            act = (getattr(o, "action", "") or "").upper()
-            if act != "SELL":
-                continue
-
-            st = (getattr(s, "status", "") or "").lower()
-            if st in ("filled", "cancelled", "apicancelled"):
-                continue
-
-            # GTC but "inactive" after-hours should still count as working/held.
-            # DAY orders with outsideRth also go Inactive after hours (Fix AB5/AB6).
-            tif = (getattr(o, "tif", "") or "").upper()
-            if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
+        # Fix FH: poll reqAllOpenOrders a few times over ~5s, returning the instant a working
+        # close is found. A single 1.5s sleep can miss orders IB hasn't finished syncing to
+        # this fresh connection right after an IB Gateway restart — that lag let a duplicate
+        # close slip through (EIX/NI, Aug 5). A symbol that already has a close returns fast;
+        # only a symbol with no existing close pays the extra polling.
+        for dwell in (1.5, 1.5, 1.0, 1.0):
+            ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+            ib.sleep(dwell)
+            if _scan(ib.openTrades() or []):
                 return True
-
-        # Fix AV1: individual OPT SELL orders indicate the long leg is being closed
-        # (placed by the worthless-leg path). Neither the BAG check above nor the reconcile
-        # guard detects these, so a new BAG SELL gets placed alongside the individual legs.
-        after_hours = True  # conservative: always treat individual SELL as working
-        for tr in trades:
-            c = getattr(tr, "contract", None)
-            o = getattr(tr, "order", None)
-            s = getattr(tr, "orderStatus", None)
-            if not (c and o and s):
-                continue
-            if getattr(c, "secType", "") != "OPT":
-                continue
-            if (getattr(c, "symbol", "") or "").upper() != sym_u:
-                continue
-            if (getattr(o, "action", "") or "").upper() != "SELL":
-                continue
-            st = (getattr(s, "status", "") or "").lower()
-            tif = (getattr(o, "tif", "") or "").upper()
-            if (st in working_states) or (st == "inactive" and tif in ("GTC", "DAY")):
-                LOG.debug("has_working_auto_close: individual OPT SELL working for %s (%s)", sym_u, st)
-                return True
-
         return False
     finally:
         try:

@@ -2054,9 +2054,6 @@ class DailyCycleManagementMixin:
             return False
 
         try:
-            ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
-            ib.sleep(1.5)  # Fix AP: was 0.5 — allow more time for IB to propagate cross-clientId Inactive+DAY orders
-            trades = ib.openTrades() or []
             up = (sym or "").upper()
             # states that indicate an order is still alive/working
             working_states = {"presubmitted", "submitted", "pendingsubmit", "apipending"}
@@ -2072,58 +2069,46 @@ class DailyCycleManagementMixin:
             except Exception:
                 pass
 
-            for tr in trades:
-                c = getattr(tr, "contract", None)
-                o = getattr(tr, "order", None)
-                s = getattr(tr, "orderStatus", None)
-                if not c or not o or not s:
-                    continue
-                if getattr(c, "secType", "") != "BAG":
-                    continue
-                if (getattr(c, "symbol", "") or "").upper() != up:
-                    continue
-                if (getattr(o, "action", "") or "").upper() != "SELL":
-                    continue
-
-                st = (getattr(s, "status", "") or "").lower()
-                if st in ("filled", "cancelled", "apicancelled"):
-                    continue
-
-                # Consider inactive orders as "working/held" after hours
-                # (both GTC and DAY orders pause when market is closed)
-                is_gtc = (getattr(o, "tif", "") or "").upper() == "GTC"
-                if st in working_states:
-                    return True
-                if st == "inactive":
-                    # GTC is always working when inactive
-                    if is_gtc:
+            def _scan(trades) -> bool:
+                for tr in trades:
+                    c = getattr(tr, "contract", None)
+                    o = getattr(tr, "order", None)
+                    s = getattr(tr, "orderStatus", None)
+                    if not c or not o or not s:
+                        continue
+                    if (getattr(c, "symbol", "") or "").upper() != up:
+                        continue
+                    if (getattr(o, "action", "") or "").upper() != "SELL":
+                        continue
+                    # SELL BAG = combo close; individual OPT SELL = worthless-leg close (Fix AV1).
+                    sec = getattr(c, "secType", "")
+                    if sec not in ("BAG", "OPT"):
+                        continue
+                    st = (getattr(s, "status", "") or "").lower()
+                    if st in ("filled", "cancelled", "apicancelled"):
+                        continue
+                    tif = (getattr(o, "tif", "") or "").upper()
+                    if st in working_states:
                         return True
-                    # DAY orders are also working after hours (they'll activate at market open)
-                    if is_after_hours:
-                        return True
+                    if st == "inactive":
+                        # BAG: GTC always working; DAY working after hours (activates at open).
+                        # OPT: GTC/DAY working only after hours (Fix AV1).
+                        if sec == "BAG":
+                            if tif == "GTC" or is_after_hours:
+                                return True
+                        else:  # OPT
+                            if tif in ("GTC", "DAY") and is_after_hours:
+                                return True
+                return False
 
-            # Fix AV1: also detect individual OPT SELL orders — placed by the worthless-leg path.
-            # These are not BAG orders so the loop above misses them, causing reconcile to place
-            # a duplicate BAG SELL alongside the already-working individual SELL leg.
-            for tr in trades:
-                c = getattr(tr, "contract", None)
-                o = getattr(tr, "order", None)
-                s = getattr(tr, "orderStatus", None)
-                if not c or not o or not s:
-                    continue
-                if getattr(c, "secType", "") != "OPT":
-                    continue
-                if (getattr(c, "symbol", "") or "").upper() != up:
-                    continue
-                if (getattr(o, "action", "") or "").upper() != "SELL":
-                    continue
-                st = (getattr(s, "status", "") or "").lower()
-                tif = (getattr(o, "tif", "") or "").upper()
-                if st in working_states:
+            # Fix FH: poll reqAllOpenOrders a few times over ~5s, returning the instant a working
+            # close is found. A single 1.5s sleep can miss orders IB hasn't finished syncing to
+            # this fresh connection right after an IB Gateway restart (EIX/NI duplicate, Aug 5).
+            for dwell in (1.5, 1.5, 1.0, 1.0):
+                ib.reqAllOpenOrders()  # Fix U1: see orders from ALL client IDs
+                ib.sleep(dwell)
+                if _scan(ib.openTrades() or []):
                     return True
-                if st == "inactive" and tif in ("GTC", "DAY") and is_after_hours:
-                    return True
-
             return False
         finally:
             try:
@@ -2945,6 +2930,21 @@ class DailyCycleManagementMixin:
                 latest-CSV STK-flatten recovery pass. The scheduled 5 PM cycle passes
                 False so it only flattens from TODAY's CSV signals.
         """
+        # Fix FH: seed the already-closing set from live working SELL closes so no downstream
+        # path re-places a close for a symbol that already has one. Covers menu 4 (which calls
+        # this directly, skipping the reconcile) and hardens against post-restart order-sync lag
+        # (EIX/NI got duplicate closes when a manual menu run fired right after a gateway restart).
+        try:
+            if not hasattr(self, "_submitted_close_syms"):
+                self._submitted_close_syms = set()
+            _fh_working = self._working_close_limit_symbols()
+            if _fh_working:
+                self._submitted_close_syms |= _fh_working
+                LOG.info("Fix FH: seeded %d symbol(s) with working closes into skip set: %s",
+                         len(_fh_working), ", ".join(sorted(_fh_working)))
+        except Exception as e:
+            LOG.warning("Fix FH: seeding submitted-close set failed (continuing): %s", e)
+
         # Fix EO: signal-driven STK-residual flatten. Runs BEFORE OPT logic so the
         # MKT SELLs don't race with OPT-close paths. Assignment/exercise leaves 100
         # STK shares behind after the OPT leg clears; the OPT-only close paths never
@@ -3423,6 +3423,10 @@ class DailyCycleManagementMixin:
                     self._submitted_close_syms = set()
                 if sym in self._submitted_close_syms or self._has_working_close_order(sym):
                     LOG.info("Reconcile: skipping CLOSE for %s (already submitted/working).", sym)
+                    # Fix FH: record the already-working symbol so downstream in-cycle close
+                    # paths (delegate stages, credit sweep) also skip it without re-detecting
+                    # via a fresh IB connection (which can miss it right after a gateway restart).
+                    self._submitted_close_syms.add(sym)
                     try:
                         _AttemptLogger.write(symbol=sym, action="close", status="skipped",
                                             reason="working_close_order", exp="", right="", source="dcm-reconcile")
