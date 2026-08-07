@@ -600,6 +600,25 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
             # Clean up primary subscription
             try: ib.cancelMktData(opt)
             except Exception: pass
+            # Fix FJ: OI has no fallback like ba/iv. Tick 101 (Option Open Interest) is a
+            # one-shot daily-snapshot tick on a separate data path from the streaming greeks
+            # (106) and quotes; under socket contention it can be dropped while iv/ba arrive
+            # (SCHW 2026-08-07 at the contended RTH open: iv=0.234 + ba=17.4 present, OI nan).
+            # Re-snapshot OI once on type-4 — delayed-frozen carries the OI daily snapshot;
+            # frozen type-2 does not — so this stays on the primary market-data type (no switch).
+            if oi is None:
+                try:
+                    t2 = ib.reqMktData(opt, "100,101,106,588", False, False)
+                    ib.sleep(poll_seconds)
+                    for attr in (_primary, "optionOpenInterest", "openInterest", "optOpenInterest"):
+                        val = getattr(t2, attr, None)
+                        if isinstance(val, (int, float)) and not (val != val) and val > 0:
+                            oi = int(val)
+                            break
+                    try: ib.cancelMktData(opt)
+                    except Exception: pass
+                except Exception:
+                    pass
             # Fix FE/FI: after hours the primary type (live/delayed-frozen) returns bid/ask=-1
             # and often no modelGreeks, so ba and iv are None even though OI populates. Frozen
             # (type 2) serves the last regular-session quote/greeks (the true pre-close values).

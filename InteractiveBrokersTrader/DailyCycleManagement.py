@@ -39,6 +39,13 @@ RISK_EXITS_ENABLED = True
 # of IB's portfolio-mark spread value, the live read is treated as unreliable
 # (socket contention) and the reliable portfolio/account mark is used instead.
 RISK_EXIT_SANITY_FRAC = 0.6
+# Fix FJ upper bound: if the live spread value is ABOVE this multiple of the portfolio
+# mark, the live read is likewise unreliable (a thin/wide leg quote whose mid overshoots
+# the true value) and the portfolio mark is used instead. A too-high live spread fabricated
+# a false take-profit (GILD 2026-08-07: live=1.04 vs portfolio=0.41 on a $1-wide spread,
+# tp=True on a spread actually below entry). Rejecting it at the trigger prevents the
+# ~20s window where the separate PlaceAnOrder pricing pass could fill at the true price.
+RISK_EXIT_SANITY_HIGH_FRAC = 1.4
 
 # Fix ER: independently disable the stop-loss branch of risk exits while keeping
 # take-profit. When False, a stop-loss condition is logged (stop=True(act=False))
@@ -3887,18 +3894,26 @@ class DailyCycleManagementMixin:
                     curr_port = (max(0.0, port_ml - port_ms)
                                  if (port_ml is not None and port_ms is not None) else None)
 
-                    # Trust the portfolio mark when live is missing OR implausibly below it.
+                    # Trust the portfolio mark when live is missing OR implausibly far from it
+                    # (below RISK_EXIT_SANITY_FRAC or, Fix FJ, above RISK_EXIT_SANITY_HIGH_FRAC of
+                    # the portfolio mark). A thin/wide leg quote can push the live spread mid either
+                    # way: low-side garbage caused a false STOP (PBR 2026-07-21); high-side garbage
+                    # caused a false TP (GILD 2026-08-07). The account-update marks (Fix AG1) stay
+                    # reliable. Only applied when we HAVE a portfolio anchor for both legs.
                     if curr_port is not None and (
-                        curr_live is None or curr_live < RISK_EXIT_SANITY_FRAC * curr_port
+                        curr_live is None
+                        or curr_live < RISK_EXIT_SANITY_FRAC * curr_port
+                        or curr_live > RISK_EXIT_SANITY_HIGH_FRAC * curr_port
                     ):
                         curr, _price_src = curr_port, "portfolio"
                         if curr_live is not None:
                             LOG.warning(
                                 "Risk exits: %s %s %.0f/%.0f REJECTED live curr=%.2f "
-                                "(< %.0f%% of portfolio %.2f) -- reqMktData unreliable "
-                                "(socket contention); using portfolio mark",
+                                "(outside [%.0f%%, %.0f%%] of portfolio %.2f) -- reqMktData "
+                                "unreliable (thin/wide leg quote); using portfolio mark",
                                 sym, right, strike_low, strike_high, curr_live,
-                                RISK_EXIT_SANITY_FRAC * 100, curr_port,
+                                RISK_EXIT_SANITY_FRAC * 100, RISK_EXIT_SANITY_HIGH_FRAC * 100,
+                                curr_port,
                             )
                     elif curr_live is not None:
                         curr, _price_src = curr_live, "live"
