@@ -4,7 +4,7 @@
 
 This document summarizes the architecture of the Interactive Brokers options trading system and the bug fixes implemented to prevent unwanted market orders.
 
-**Last Updated:** August 6, 2026 (Fix FH: prevent duplicate close orders from manual starts/restarts. EIX and NI each got 2 extra SELL close orders when a manual menu run (PushButtonStart / `--after-hours`) fired right after an IB Gateway 2FA restart. Root cause: the close guards (`has_working_auto_close` in ib_close_guard.py + `_has_working_close_order` in DCM) do `reqAllOpenOrders()` then sleep **1.5s once** — too short for IB to sync existing orders to the fresh guard connection right after a gateway restart, so the guard returned False and PlaceAnOrder placed a duplicate. Part A: both guards now **poll `reqAllOpenOrders` up to ~5s (1.5/1.5/1.0/1.0), early-exiting the instant a working close is found** — a symbol that already has a close returns fast; only symbols with no existing close pay the extra polling. Part B: the reconcile now records already-working skips into `_submitted_close_syms`, and `_after_hours_batch_placement` seeds that set from `_working_close_limit_symbols()` at the start (covers menu 4, which skips the reconcile). ib_close_guard + DCM committed. Prior: Fix FG: snap an invalid OTM strike to the chosen expiry. WBD PUT_OPEN (exp 20260918) was written as `otm_strike_put=25.5` — a half-dollar strike that exists only on WBD's weeklies, not the Sep monthly (IB `Error 200`). The leg couldn't be quoted → OTM ba% blank → open skipped (`oi_below_threshold:ba=139.5/blank`), and the 10:00 retry re-used 25.5 and failed again. Root cause: `_collect_secdef` pools strikes across ALL expiries; the put OTM `_next_lower_existing(strikes_all, atm)` picked 25.5, and the put-leg qualify loop only set `option=None` on failure (never snapped `put_otm_strike`) — Fix EB validated the ATM only. Two-part fix: (1) listener new `_snap_otm_to_expiry()` walks the pool in the correct direction (below for puts, above for calls), qualifying each candidate against the chosen expiry; applied to both OTM legs (25.5→25.0). (2) `populate_missing_strikes` now also validates PRESENT OTM strikes on open rows against their expiry (one qualify per open row) and re-snaps invalid ones via `_get_atm_and_otm_strikes` (Fix CP-A only fired on EMPTY OTM). listener+LiquidityFilter committed; needs OptionsListener restart. Prior: Fix FF: two fixes from the SCHW/ACM investigation. (1) The 3 PM preclose was cancelling patient take-profit risk-exit `mid` orders (ACM 1.90, SCHW 0.83) and re-pricing them with aggressive `join` (→0.50/0.40) — a big loss of gain. New `_tp_risk_exit_symbols_today()` (reads today's attempts CSV for `close_reason` containing "TP") lets `_pre_close_market_conversion` **skip** those TP orders, leaving the good morning limit to ride to 4 PM; day-before CLOSE signals / mismatches / credit-inverted still force-close aggressively, and a re-enabled stop-loss (Fix ER) is NOT skipped. (2) The RTH OR-gate `oi_below_threshold` skip now appends ba% via new `_ba_desc()` — `oi_below_threshold:ba=38.0/63.8` (wide) vs `ba=blank/blank` (no quote) — so a genuinely wide spread is distinguishable from a missing quote. DCM+PlaceAnOrder committed. Prior: Fix FE: populate `ba_pct` after hours so the FC liquidity gate actually filters illiquid opens at 5 PM. Root cause — only `reqMarketDataType(2)` (FROZEN) returns after-hours option bid/ask; type-4 gives OI but `bid/ask=-1`, and the listener's old type-3 fallback never fired (−1 ≠ None). Listener + LiquidityFilter enrichment now do a frozen(2) bid/ask re-fetch when there's no usable ask; new 16:45 backstop task `IB_AH_Enrich_1645` (`DCM --afterhours-enrich`) snaps missing strikes then enriches today's CSV before the 17:00 placement; `populate_missing_strikes` now qualifies strikes per-expiry (HSBC 106.42→105/110, not the heuristic 107.5). Verified on 26_07_31: SHEL recovered (tight→place), LNC/RPM/HSBC skip wide. OI/IV column consolidation deferred. listener/LiquidityFilter/DCM committed; .cmd + task deploy-only. Prior: Fix FD accurate attempts logging + Health report.)
+**Last Updated:** August 6, 2026 (Fix FI: consolidate the spread-CSV OI/IV columns onto one canonical set AND use real per-leg IV for theo pricing. Problem 1 — the enrichment appended dead parallel columns `oi_atm`/`oi_oth`/`iv_oth` that drifted out of sync with the canonical `open_interest_*`/`iv_atm`/`iv_otm` the readers use. Problem 2 — theo debit prices were computed once at signal time with a flat **0.25** vol on both legs (6/9 rows one evening) because after-hours IV rarely arrives; the enrichment DID capture per-leg IV at 16:45 but wrote it to the dead `iv_oth` which never fed the theo. Data check: signal-time `iv_atm` vs enrichment IV agree to a **median 0.0047** vol across 49 rows/8 days (flat 0.25 is off ~9.4 vol pts); the only noisy outliers are illiquid ADRs already skipped by the FC ba% gate. Fix: (1) **new `theo_pricing.py`** (pure `_bs_price`/`_theo_spread_debits`, skew-aware + Fix Y2/CY clamps) imported by LiquidityFilter only — listener untouched, no restart. (2) `enrich_combined_csv` now writes **only canonical** columns (OI→`open_interest_{atm,otm}_{call,put}`, short-leg IV→`iv_otm` not `iv_oth`), **strips** the dead `oi_atm`/`oi_oth`/`iv_oth` from any old CSV on next pass, and after the leg fills **recomputes** the `*_debit_theo_*` for the row's side using the captured per-leg IV (only when ≥1 real IV, uses the row's stored `current_price`+`days_to_exp`). (3) **frozen(2) IV re-fetch** added to `_fetch` (alongside the Fix FE bid/ask frozen block) with a `0.03≤iv≤2.0` plausibility clamp — raises after-hours IV coverage using last-regular-session greeks. (4) CLOSE rows: instead of skipping (side unknown), resolve the **one held side** via `ib.positions()` (position still open until the 17:00 close) and recompute only that side — `enrich_combined_csv` gained an optional `ib=` param, passed by `enrich_if_rth` and the `__main__`/16:45 path. (5) DCM `_find_csv_oi` + `_lookup_oi` alias lists now read **canonical only** (dead `oi_atm`/`oi_oth` removed; put-proxy-from-call kept) — gate decisions unchanged (verified: only 1 threshold-crossing OI mismatch in 10 days, and it re-fetches). **CRITICAL:** the `attempts_*.csv` has its OWN `oi_atm`/`oi_otm`/`threshold` columns (Fix EZ) — a separate file/schema, left untouched. theo_pricing/LiquidityFilter/DCM committed; listener/PlaceAnOrder/Health unchanged. Prior: Fix FH: prevent duplicate close orders from manual starts/restarts. EIX and NI each got 2 extra SELL close orders when a manual menu run (PushButtonStart / `--after-hours`) fired right after an IB Gateway 2FA restart. Root cause: the close guards (`has_working_auto_close` in ib_close_guard.py + `_has_working_close_order` in DCM) do `reqAllOpenOrders()` then sleep **1.5s once** — too short for IB to sync existing orders to the fresh guard connection right after a gateway restart, so the guard returned False and PlaceAnOrder placed a duplicate. Part A: both guards now **poll `reqAllOpenOrders` up to ~5s (1.5/1.5/1.0/1.0), early-exiting the instant a working close is found** — a symbol that already has a close returns fast; only symbols with no existing close pay the extra polling. Part B: the reconcile now records already-working skips into `_submitted_close_syms`, and `_after_hours_batch_placement` seeds that set from `_working_close_limit_symbols()` at the start (covers menu 4, which skips the reconcile). ib_close_guard + DCM committed. Prior: Fix FG: snap an invalid OTM strike to the chosen expiry. WBD PUT_OPEN (exp 20260918) was written as `otm_strike_put=25.5` — a half-dollar strike that exists only on WBD's weeklies, not the Sep monthly (IB `Error 200`). The leg couldn't be quoted → OTM ba% blank → open skipped (`oi_below_threshold:ba=139.5/blank`), and the 10:00 retry re-used 25.5 and failed again. Root cause: `_collect_secdef` pools strikes across ALL expiries; the put OTM `_next_lower_existing(strikes_all, atm)` picked 25.5, and the put-leg qualify loop only set `option=None` on failure (never snapped `put_otm_strike`) — Fix EB validated the ATM only. Two-part fix: (1) listener new `_snap_otm_to_expiry()` walks the pool in the correct direction (below for puts, above for calls), qualifying each candidate against the chosen expiry; applied to both OTM legs (25.5→25.0). (2) `populate_missing_strikes` now also validates PRESENT OTM strikes on open rows against their expiry (one qualify per open row) and re-snaps invalid ones via `_get_atm_and_otm_strikes` (Fix CP-A only fired on EMPTY OTM). listener+LiquidityFilter committed; needs OptionsListener restart. Prior: Fix FF: two fixes from the SCHW/ACM investigation. (1) The 3 PM preclose was cancelling patient take-profit risk-exit `mid` orders (ACM 1.90, SCHW 0.83) and re-pricing them with aggressive `join` (→0.50/0.40) — a big loss of gain. New `_tp_risk_exit_symbols_today()` (reads today's attempts CSV for `close_reason` containing "TP") lets `_pre_close_market_conversion` **skip** those TP orders, leaving the good morning limit to ride to 4 PM; day-before CLOSE signals / mismatches / credit-inverted still force-close aggressively, and a re-enabled stop-loss (Fix ER) is NOT skipped. (2) The RTH OR-gate `oi_below_threshold` skip now appends ba% via new `_ba_desc()` — `oi_below_threshold:ba=38.0/63.8` (wide) vs `ba=blank/blank` (no quote) — so a genuinely wide spread is distinguishable from a missing quote. DCM+PlaceAnOrder committed. Prior: Fix FE: populate `ba_pct` after hours so the FC liquidity gate actually filters illiquid opens at 5 PM. Root cause — only `reqMarketDataType(2)` (FROZEN) returns after-hours option bid/ask; type-4 gives OI but `bid/ask=-1`, and the listener's old type-3 fallback never fired (−1 ≠ None). Listener + LiquidityFilter enrichment now do a frozen(2) bid/ask re-fetch when there's no usable ask; new 16:45 backstop task `IB_AH_Enrich_1645` (`DCM --afterhours-enrich`) snaps missing strikes then enriches today's CSV before the 17:00 placement; `populate_missing_strikes` now qualifies strikes per-expiry (HSBC 106.42→105/110, not the heuristic 107.5). Verified on 26_07_31: SHEL recovered (tight→place), LNC/RPM/HSBC skip wide. OI/IV column consolidation deferred. listener/LiquidityFilter/DCM committed; .cmd + task deploy-only. Prior: Fix FD accurate attempts logging + Health report.)
 
 ---
 
@@ -5610,3 +5610,91 @@ Logs `[WBD] Fix FG: OTM P 25.5 not valid for 20260918 — snapped to 25.0`.
 - No schema/task/service changes; both files are live-trading Python.
 
 **Verification:** `python -m py_compile ib_close_guard.py DailyCycleManagement.py` OK. Next manual start/restart (menu 2 or 4) that runs while a working close exists: `ib_cycle.log` shows `Fix FH: seeded N symbol(s) with working closes into skip set: ...` and the close guard finds the existing order within the ~5s poll → `close,skipped,existing_working_close` (or `working_close_order`) instead of a duplicate `close_*,placed,success`. The EIX/NI scenario (manual run right after a gateway restart) no longer double-places.
+
+---
+
+### Fix FI: Consolidate Spread-CSV OI/IV Columns + Real Per-Leg IV in Theo Pricing (Aug 6)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/theo_pricing.py` (NEW); `InteractiveBrokersTrader/LiquidityFilter.py` (`enrich_combined_csv`, `_ib_fetcher_factory._fetch`, new `_held_option_sides`, callers `enrich_if_rth`/`__main__`); `InteractiveBrokersTrader/DailyCycleManagement.py` (`_find_csv_oi` ~L4335, `_lookup_oi` ~L4722).
+
+**Two problems in `combined_listener_spreads.csv`:**
+
+1. **Dead parallel columns.** The listener header already carries the canonical set —
+`iv_atm`, `iv_otm`, `open_interest_{atm,otm}_{call,put}` — but the enrichment appended a second,
+inconsistent set (`oi_atm`, `oi_oth`, `iv_oth`, cols 36-38). They drifted out of sync (one CSV:
+EIX had OI in both `open_interest_atm_call=88` and `oi_atm=88`, NI in neither, EHC only canonical;
+`iv_otm` was **always empty**, IV split across `iv_atm`/`iv_oth`). Readers disagreed on which to
+trust: the DCM low-OI cancel (`_find_csv_oi`/`_lookup_oi`) preferred the dead `oi_atm`/`oi_oth`,
+while `_oi_ok()` read canonical.
+
+2. **Theo ignored real IV.** `*_debit_theo_*` is computed once at signal time and after hours
+mostly has no IV, so it priced with a flat **0.25** vol on both legs (6/9 rows one evening); the
+enrichment captured per-leg IV at 16:45 (Fix FE frozen) but wrote it to the dead `iv_oth`, which
+never fed the theo. `iv_otm` (Fix P skew) never engaged.
+
+**Data-quality proof (justifies trusting captured IV):** across 49 rows / 8 days the signal-time
+`iv_atm` (~16:01, ATM leg) and the independent enrichment IV (16:45, OTM leg) agree to a **median
+0.0047** vol; flat 0.25 is off **~9.4 vol pts**. The only noisy outliers (SAN/PUK/VIV/STRC) are
+illiquid ADRs with 166-200% bid-ask — already skipped by the Fix FC ba% gate before they trade.
+
+**⚠️ Two different CSVs — not crossed:** the **attempts** CSV (`attempts_*.csv`) has its OWN
+`oi_atm`/`oi_otm`/`threshold` columns (Fix EZ: PlaceAnOrder `ATTEMPT_FIELDS`; DCM `_AttemptLogger`
+/ `_live_oi`). That is a logging schema for a different file — **left entirely untouched.** Only
+the spread CSV's dead `oi_atm`/`oi_oth`/`iv_oth` are consolidated.
+
+**Fix — five parts:**
+
+**FI-1 (`theo_pricing.py`, NEW):** pure `_norm_cdf`/`_bs_price`/`_theo_spread_debits` (copied from
+listener.py — skew-aware, Fix Y2 `>=0` + Fix CY `<=0.75*W` clamps), imported by LiquidityFilter
+only. The listener can't be imported (`util.startLoop()`+`IB()` at module load) and is **left
+untouched** → no listener change, no restart.
+
+**FI-2 (LiquidityFilter `enrich_combined_csv` — writer to canonical):** `need_cols` drops
+`oi_atm`/`oi_oth`/`iv_oth` (keeps `iv_atm`/`iv_otm`/`open_interest_*`/`ba_pct_*`); on read it
+**strips** the dead cols from `cols` so any old CSV is cleaned on the next write. The fetch trigger
+keys off canonical (`open_interest_atm_{call|put}` + `iv_atm`/`iv_otm`); ATM OI → the right-aware
+`open_interest_atm_{call|put}`, short-leg IV → **`iv_otm`** (was `iv_oth`), OTM OI →
+`open_interest_otm_{call|put}`. Fix AO Part-3 put-proxy (call OI → put cols) kept. The
+"always-fresh" property of the old `oi_atm` column is preserved because after hours `iv_*` is
+empty → the leg is fetched → canonical is overwritten with the fresh value.
+
+**FI-3 (theo recompute):** after the leg fills, when `current_price`+`atm_strike`+`days_to_exp`
+are present and **>=1 real IV** was captured, recompute the row's side theo:
+`sigma_atm = iv_atm or iv_otm or 0.25`, `sigma_otm = iv_otm or iv_atm or 0.25`, `T = days_to_exp/365`,
+`_theo_spread_debits(...)` → overwrite `{call|put}_debit_theo_{1,2_5,5}` (only the side matching
+`right`). Uses the row's stored signal-time `current_price` — never refetches the stock. Fix CY/Y2
+clamps still bound the output.
+
+**FI-4 (frozen IV re-fetch, `_fetch`):** extended the Fix FE frozen block — when the type-4
+`modelGreeks.impliedVol` is missing, `reqMarketDataType(2)` re-fetches greeks (last regular-session
+= true pre-close IV) alongside the bid/ask. New `_clean_iv()` clamps to `0.03<=iv<=2.0`. No extra
+calls when type-4 already returned IV.
+
+**FI-5 (CLOSE rows — resolve the one held side):** `enrich_combined_csv` gained an optional `ib=`
+param (passed by `enrich_if_rth` and the `__main__`/16:45 path; `None` for offline). Instead of
+`elif right=="CLOSE": continue`, it resolves the held side via new `_held_option_sides(ib)` (one
+`ib.positions()` call, cached; position is still open until the 17:00 close) and recomputes only
+that side. Both sides held (rare roll) → both; no position / `ib is None` → keep the `continue`.
+This also gives CLOSE rows the OI/ba enrichment they never got (harmless — FC gates are OPEN-only).
+
+**FI-6 (DCM readers → canonical only):** `_find_csv_oi` and `_lookup_oi` alias lists drop
+`oi_atm`/`oi_oth` (and stale `atm_oi`/`oi1`/`oi2`); canonical `open_interest_*` right-aware with
+put-proxy-from-call fallback. Gate decisions unchanged — the values are the same daily OI, and the
+one threshold-crossing mismatch found in 10 days of history (GILD OTM 103 vs 3) had empty `iv_otm`,
+so the new code re-fetches and overwrites canonical with the fresh 103.
+
+**What this does NOT change:** listener (no restart), PlaceAnOrder `_oi_ok` (already canonical),
+the attempts-CSV schema, the FC ba%/OI OPEN-gates, preclose/reconcile/risk-exit/roll/STK-flatten.
+At 9:45/10:30 RTH the `*_limit_*` columns are overwritten with live prices (Fix N) and PlaceAnOrder
+prefers `limit` over `theo`, so the recompute is load-bearing mainly for the **5 PM after-hours**
+batch.
+
+**Verification:** `python -m py_compile theo_pricing.py LiquidityFilter.py DailyCycleManagement.py`
+OK. Gate-equivalence over 10 days: 1 threshold-crossing OI mismatch (re-fetched). Dry-run against a
+copy of `26_08_06` CSV: canonical OI/IV written, `iv_otm` populated, per-side theo recomputed,
+CLOSE rows resolved to the correct held side (EHC→C, ITT→P, MET→C), dead cols stripped (39→36),
+idempotent on re-run. Theo unit: skew `_theo_spread_debits(...,0.35,sigma_otm=0.33)` differs from
+flat 0.25 and stays within `[0, 0.75*W]`. Next 16:45 live: single canonical OI/IV set (no dead
+cols), more legs carry IV (frozen), `*_debit_theo_*` reflect real IV, 17:00 open/close limits move
+off flat 0.25 for liquid names.

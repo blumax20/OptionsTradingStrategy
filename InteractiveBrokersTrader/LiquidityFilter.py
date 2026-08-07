@@ -3,6 +3,7 @@ import csv
 from typing import Optional, Tuple
 from math import isnan
 from ib_config import IB_HOST, IB_PORT
+from theo_pricing import _theo_spread_debits  # Fix FI: recompute theo with real per-leg IV
 try:
     from ib_insync import Contract
 except Exception:
@@ -584,27 +585,34 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
                 if isinstance(val, (int, float)) and not (val != val) and val > 0:
                     oi = int(val)
                     break
-            iv = None
-            greeks = getattr(t, "modelGreeks", None)
-            if greeks and hasattr(greeks, "impliedVol"):
-                iv_val = greeks.impliedVol
-                # Fix EM-2: reject 0/negative IV — IV of 0 is unphysical
-                if isinstance(iv_val, (int, float)) and not (iv_val != iv_val) and iv_val > 0:
-                    iv = float(iv_val)
+            def _clean_iv(_g):
+                # Fix EM-2: reject 0/negative IV — IV of 0 is unphysical.
+                # Fix FI: also reject implausible IV (band 0.03..2.0) so an illiquid
+                # garbage tick can't feed the theo recompute.
+                if _g and hasattr(_g, "impliedVol"):
+                    _v = _g.impliedVol
+                    if isinstance(_v, (int, float)) and not (_v != _v) and 0.03 <= _v <= 2.0:
+                        return float(_v)
+                return None
+            iv = _clean_iv(getattr(t, "modelGreeks", None))
             # Fix FC: compute live bid-ask % from the same ticker (top-of-book always delivered)
             ba = _ba_pct(getattr(t, "bid", None), getattr(t, "ask", None))
             # Clean up primary subscription
             try: ib.cancelMktData(opt)
             except Exception: pass
-            # Fix FE: after hours the primary type (live/delayed-frozen) returns bid/ask=-1,
-            # so ba is None even though OI populates. Frozen (type 2) serves the last
-            # regular-session bid/ask. Re-fetch bid/ask only, then restore delayed-frozen.
-            if ba is None:
+            # Fix FE/FI: after hours the primary type (live/delayed-frozen) returns bid/ask=-1
+            # and often no modelGreeks, so ba and iv are None even though OI populates. Frozen
+            # (type 2) serves the last regular-session quote/greeks (the true pre-close values).
+            # Re-fetch bid/ask + IV when either is missing, then restore delayed-frozen.
+            if ba is None or iv is None:
                 try:
                     ib.reqMarketDataType(2)
                     tf = ib.reqMktData(opt, "", False, False)
                     ib.sleep(poll_seconds)
-                    ba = _ba_pct(getattr(tf, "bid", None), getattr(tf, "ask", None))
+                    if ba is None:
+                        ba = _ba_pct(getattr(tf, "bid", None), getattr(tf, "ask", None))
+                    if iv is None:  # Fix FI: frozen greeks = pre-close IV
+                        iv = _clean_iv(getattr(tf, "modelGreeks", None))
                     try: ib.cancelMktData(opt)
                     except Exception: pass
                 except Exception:
@@ -617,20 +625,57 @@ def _ib_fetcher_factory(ib: "IB", poll_seconds: float = 3.0):  # Fix BL: was 1.5
             return (None, None, None)
     return _fetch
 
-def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
-    """
-    Populate/refresh OI and IV columns in combined_listener_spreads.csv.
+def _held_option_sides(ib):
+    """Fix FI: {SYMBOL: set('C'/'P')} for currently held (non-zero) OPT positions.
+    Used to resolve which side a generic CLOSE row is closing (the position is still
+    held until the 17:00 close, so ib.positions() at the 16:45 enrichment is correct)."""
+    out: dict = {}
+    if ib is None:
+        return out
+    try:
+        for p in ib.positions():
+            c = getattr(p, "contract", None)
+            if not c or getattr(c, "secType", "") != "OPT":
+                continue
+            if not getattr(p, "position", 0):
+                continue
+            s = (getattr(c, "symbol", "") or "").upper()
+            r = (getattr(c, "right", "") or "").upper()[:1]
+            if s and r in ("C", "P"):
+                out.setdefault(s, set()).add(r)
+    except Exception:
+        pass
+    return out
 
-    - Adds columns: oi_atm, oi_oth, iv_atm, iv_oth (if missing).
-    - For each row, if any of those values are missing/blank/NaN,
-      calls `fetcher(symbol, right, exp, strike)` to obtain (oi, iv)
-      for the corresponding leg and fills them in.
-    - Writes back to the same CSV (keeps a .bak once).
+
+def enrich_combined_csv(day_dir: str, fetcher=None, logger=None, ib=None):
+    """
+    Populate/refresh the canonical OI/IV columns in combined_listener_spreads.csv and
+    recompute the theo debit prices with the fetched per-leg IV (Fix FI).
+
+    Fix FI consolidates the OI/IV columns onto the single canonical set the readers use:
+      OI  -> open_interest_{atm,otm}_{call,put}   (what _oi_ok / _find_csv_oi read)
+      IV  -> iv_atm (long leg), iv_otm (short leg)
+    The old parallel dead columns (oi_atm, oi_oth, iv_oth) are no longer written.
+
+    For each row, if a canonical value is missing/blank/NaN/0, calls
+    `fetcher(symbol, right, exp, strike)` -> (oi, iv, ba) for the leg and fills it in;
+    then, when >=1 real IV was captured, overwrites the row's *_debit_theo_* columns
+    (the side matching `right`) using Black-Scholes with those IVs. Writes back to the
+    same CSV (keeps a .bak once).
     """
     fetch = fetcher or _default_fetcher
     csv_path, cols, rows = _read_combined_csv(day_dir)
     if not rows:
         return False
+
+    # Fix FI: retire the dead parallel columns. Removing them from `cols` drops them on the
+    # next write (DictWriter extrasaction="ignore"), so old CSVs get cleaned automatically.
+    _stripped = False
+    for _dead in ("oi_atm", "oi_oth", "iv_oth"):
+        if _dead in cols:
+            cols.remove(_dead)
+            _stripped = True
 
     # Normalize column keys present in source
     lc = {c.lower(): c for c in cols}
@@ -642,18 +687,24 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
     oth = lc.get("oth") or lc.get("k_oth") or lc.get("strike_short") or lc.get("strike2")
     oth_call = lc.get("otm_strike_call")
     oth_put = lc.get("otm_strike_put")
+    cur = lc.get("current_price")
+    dte = lc.get("days_to_exp")
 
     if not all([sym, rgt, exp, atm]) or (not oth and not oth_call and not oth_put):
         if logger: logger("enrich_csv: missing key columns in combined_listener_spreads.csv")
         return False
 
-    # Ensure targets exist
-    # Fix FC: add the 4 ba% columns so pre-Fix-FC prev-day CSVs get them on enrichment.
-    need_cols = ["oi_atm", "oi_oth", "iv_atm", "iv_oth",
+    # Fix FI: ensure only the canonical OI/IV targets exist (no more oi_atm/oi_oth/iv_oth).
+    # Fix FC: the 4 ba% columns so pre-Fix-FC prev-day CSVs get them on enrichment.
+    need_cols = ["iv_atm", "iv_otm",
+                 "open_interest_atm_call", "open_interest_otm_call",
+                 "open_interest_atm_put", "open_interest_otm_put",
                  "ba_pct_atm_call", "ba_pct_otm_call", "ba_pct_atm_put", "ba_pct_otm_put"]
     _ensure_cols(cols, need_cols)
 
     updates = 0
+    # Fix FI: resolve the held side for generic CLOSE rows (lazily, one positions() call).
+    held_right = None  # None => not fetched yet
 
     def _need(v):
         if v is None: return True
@@ -666,111 +717,127 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None):
         except Exception:
             return False
 
+    def _fnum(v):
+        try:
+            fv = float(v)
+            return None if fv != fv else fv
+        except Exception:
+            return None
+
     for row in rows:
         try:
             symbol = str(row[sym]).strip()
             # Convert signal_type to right if needed
-            right = str(row[rgt]).strip().upper()
-            if right in ("CALL_OPEN", "CALL_CLOSE"):
-                right = "C"
-            elif right in ("PUT_OPEN", "PUT_CLOSE"):
-                right = "P"
-            elif right == "CLOSE":
-                # For generic CLOSE signals, skip - we don't know call vs put
+            rraw = str(row[rgt]).strip().upper()
+            if rraw in ("CALL_OPEN", "CALL_CLOSE"):
+                sides = ["C"]
+            elif rraw in ("PUT_OPEN", "PUT_CLOSE"):
+                sides = ["P"]
+            elif rraw == "CLOSE":
+                # Fix FI: generic CLOSE — resolve the held side(s) from live positions.
+                if held_right is None:
+                    held_right = _held_option_sides(ib)
+                _hs = held_right.get(symbol.upper())
+                if not _hs:
+                    # No position (already flat) or offline -> keep prior behavior (skip).
+                    continue
+                sides = sorted(_hs)  # one side normally; both only on a rare roll
+            else:
                 continue
             expiry = str(row[exp]).strip()
             k1 = float(row[atm])
-            # Get OTM strike from appropriate column based on right
-            if oth:
-                k2 = float(row[oth])
-            elif right == "C" and oth_call:
-                k2 = float(row[oth_call]) if row.get(oth_call) else None
-            elif right == "P" and oth_put:
-                k2 = float(row[oth_put]) if row.get(oth_put) else None
-            else:
-                k2 = None
         except Exception:
             continue
 
-        # ATM leg fill
-        if _need(row.get("oi_atm")) or _need(row.get("iv_atm")):
-            oi1, iv1, ba1 = fetch(symbol, right, expiry, k1)
-            # Fix FC: overwrite the ATM ba% with the fresh RTH value (replaces the stale
-            # wide after-hours value the listener wrote at 5 PM). Not _need-gated.
-            if ba1 is not None:
-                _ba_col_atm = "ba_pct_atm_call" if right == "C" else "ba_pct_atm_put"
-                if _ba_col_atm in cols:
-                    row[_ba_col_atm] = ba1
-                    updates += 1
-            # Fix EM-2: skip write when fetch returns 0 (defense in depth with fetcher guard)
-            if oi1 is not None and oi1 > 0:
-                row["oi_atm"] = int(oi1)
-                updates += 1
-                # Fix AO Part 2: also backfill open_interest_atm_put — the column _oi_ok() reads
-                if right == "P":
-                    _col_put_atm = "open_interest_atm_put"
-                    if _col_put_atm in cols and _need(row.get(_col_put_atm)):
-                        row[_col_put_atm] = int(oi1)
-                        updates += 1
-                # Fix DW: symmetric extension of Fix AO for CALL rows — open_interest_atm_call is what _oi_ok() reads
-                if right == "C":
-                    _col_call_atm = "open_interest_atm_call"
-                    if _col_call_atm in cols and _need(row.get(_col_call_atm)):
-                        row[_col_call_atm] = int(oi1)
-                        updates += 1
-            if iv1 is not None and iv1 > 0:  # Fix EM-2
-                row["iv_atm"] = float(iv1)
-                updates += 1
+        for right in sides:
+            try:
+                if oth:
+                    k2 = float(row[oth])
+                elif right == "C" and oth_call:
+                    k2 = float(row[oth_call]) if row.get(oth_call) else None
+                elif right == "P" and oth_put:
+                    k2 = float(row[oth_put]) if row.get(oth_put) else None
+                else:
+                    k2 = None
+            except Exception:
+                k2 = None
 
-        # OTH leg fill (only if we have a valid OTM strike)
-        if k2 is not None and (_need(row.get("oi_oth")) or _need(row.get("iv_oth"))):
-            oi2, iv2, ba2 = fetch(symbol, right, expiry, k2)
-            # Fix FC: overwrite the OTM ba% with the fresh RTH value. Not _need-gated.
-            if ba2 is not None:
-                _ba_col_oth = "ba_pct_otm_call" if right == "C" else "ba_pct_otm_put"
-                if _ba_col_oth in cols:
-                    row[_ba_col_oth] = ba2
-                    updates += 1
-            # Fix EM-2: skip write when fetch returns 0
-            if oi2 is not None and oi2 > 0:
-                row["oi_oth"] = int(oi2)
-                updates += 1
-                # Fix AO Part 2: also backfill open_interest_otm_put — the column _oi_ok() reads
-                if right == "P":
-                    _col_put_oth = "open_interest_otm_put"
-                    if _col_put_oth in cols and _need(row.get(_col_put_oth)):
-                        row[_col_put_oth] = int(oi2)
-                        updates += 1
-                # Fix DW: symmetric extension of Fix AO for CALL rows — open_interest_otm_call is what _oi_ok() reads
-                if right == "C":
-                    _col_call_oth = "open_interest_otm_call"
-                    if _col_call_oth in cols and _need(row.get(_col_call_oth)):
-                        row[_col_call_oth] = int(oi2)
-                        updates += 1
-            if iv2 is not None and iv2 > 0:  # Fix EM-2
-                row["iv_oth"] = float(iv2)
-                updates += 1
+            _oi_atm_col = "open_interest_atm_call" if right == "C" else "open_interest_atm_put"
+            _oi_oth_col = "open_interest_otm_call" if right == "C" else "open_interest_otm_put"
 
-        # Fix AO Part 3: For PUT_OPEN rows, use call OI as proxy for put OI when IB doesn't
-        # return put OI via reqMktData. Call and put OI on the same stock are correlated.
-        # LXP (OTM call OI=2) will still fail _oi_ok(); BCE (call OI=1231) will correctly pass.
-        if right == "P":
-            _col_put_atm = "open_interest_atm_put"
-            _col_call_atm = "open_interest_atm_call"
-            if _col_put_atm in cols and _need(row.get(_col_put_atm)):
-                _call_oi_atm = row.get(_col_call_atm)
-                if not _need(_call_oi_atm):
-                    row[_col_put_atm] = _call_oi_atm
+            # ATM leg fill -> canonical open_interest_atm_{call|put} + iv_atm
+            if _need(row.get(_oi_atm_col)) or _need(row.get("iv_atm")):
+                oi1, iv1, ba1 = fetch(symbol, right, expiry, k1)
+                # Fix FC: overwrite the ATM ba% with the fresh RTH value. Not _need-gated.
+                if ba1 is not None:
+                    _ba_col_atm = "ba_pct_atm_call" if right == "C" else "ba_pct_atm_put"
+                    if _ba_col_atm in cols:
+                        row[_ba_col_atm] = ba1
+                        updates += 1
+                # Fix EM-2: skip write when fetch returns 0
+                if oi1 is not None and oi1 > 0 and _oi_atm_col in cols:
+                    row[_oi_atm_col] = int(oi1)
                     updates += 1
-            _col_put_oth = "open_interest_otm_put"
-            _col_call_oth = "open_interest_otm_call"
-            if _col_put_oth in cols and _need(row.get(_col_put_oth)):
-                _call_oi_oth = row.get(_col_call_oth)
-                if not _need(_call_oi_oth):
-                    row[_col_put_oth] = _call_oi_oth
+                if iv1 is not None and iv1 > 0:  # Fix EM-2
+                    row["iv_atm"] = float(iv1)
                     updates += 1
 
-    if updates:
+            # OTH leg fill (only if we have a valid OTM strike) -> canonical + iv_otm
+            if k2 is not None and (_need(row.get(_oi_oth_col)) or _need(row.get("iv_otm"))):
+                oi2, iv2, ba2 = fetch(symbol, right, expiry, k2)
+                # Fix FC: overwrite the OTM ba% with the fresh RTH value. Not _need-gated.
+                if ba2 is not None:
+                    _ba_col_oth = "ba_pct_otm_call" if right == "C" else "ba_pct_otm_put"
+                    if _ba_col_oth in cols:
+                        row[_ba_col_oth] = ba2
+                        updates += 1
+                # Fix EM-2: skip write when fetch returns 0
+                if oi2 is not None and oi2 > 0 and _oi_oth_col in cols:
+                    row[_oi_oth_col] = int(oi2)
+                    updates += 1
+                if iv2 is not None and iv2 > 0:  # Fix EM-2 -> iv_otm (short leg), Fix FI
+                    row["iv_otm"] = float(iv2)
+                    updates += 1
+
+            # Fix AO Part 3: For PUT rows, use call OI as proxy for put OI when IB doesn't
+            # return put OI via reqMktData. Call and put OI on the same stock are correlated.
+            if right == "P":
+                if _need(row.get("open_interest_atm_put")):
+                    _call_oi_atm = row.get("open_interest_atm_call")
+                    if not _need(_call_oi_atm):
+                        row["open_interest_atm_put"] = _call_oi_atm
+                        updates += 1
+                if _need(row.get("open_interest_otm_put")):
+                    _call_oi_oth = row.get("open_interest_otm_call")
+                    if not _need(_call_oi_oth):
+                        row["open_interest_otm_put"] = _call_oi_oth
+                        updates += 1
+
+            # Fix FI: recompute the side's theo debits with the real per-leg IV.
+            _iv_a = _fnum(row.get("iv_atm"))
+            _iv_o = _fnum(row.get("iv_otm"))
+            if (_iv_a and _iv_a > 0) or (_iv_o and _iv_o > 0):
+                _S = _fnum(row.get(cur)) if cur else None
+                _atm_v = _fnum(row.get(atm))
+                _T = None
+                _d = _fnum(row.get(dte)) if dte else None
+                if _d is not None and _d > 0:
+                    _T = _d / 365.0
+                if _S and _S > 0 and _atm_v and _atm_v > 0 and _T:
+                    sigma_atm = _iv_a if (_iv_a and _iv_a > 0) else _iv_o
+                    sigma_otm = _iv_o if (_iv_o and _iv_o > 0) else _iv_a
+                    try:
+                        theo = _theo_spread_debits(_S, _atm_v, _T, sigma_atm, sigma_otm=sigma_otm)
+                        _pref = "call" if right == "C" else "put"
+                        for _w in ("1", "2_5", "5"):
+                            _col = f"{_pref}_debit_theo_{_w}"
+                            if _col in cols:
+                                row[_col] = theo.get(f"{_pref}_debit_theo_{_w}")
+                                updates += 1
+                    except Exception as _te:
+                        if logger: logger(f"enrich_csv: theo recompute error {symbol} {right}: {_te}")
+
+    if updates or _stripped:
         _write_combined_csv(csv_path, cols, rows)
     if logger: logger(f"enrich_csv: updated={updates}")
     return updates > 0
@@ -931,7 +998,7 @@ def enrich_if_rth(day_dir: str,
         except Exception:
             pass
         fetcher = _ib_fetcher_factory(ib)
-        changed = enrich_combined_csv(day_dir, fetcher=fetcher, logger=logger)
+        changed = enrich_combined_csv(day_dir, fetcher=fetcher, logger=logger, ib=ib)  # Fix FI: ib for CLOSE held-side
 
         # Fix N: Also update limit columns with live spread prices
         if update_prices:
@@ -1067,7 +1134,7 @@ if __name__ == "__main__":
                 except Exception:
                     pass
                 fetcher = _ib_fetcher_factory(ib)
-                changed = enrich_combined_csv(args.day_dir, fetcher=fetcher, logger=_log)
+                changed = enrich_combined_csv(args.day_dir, fetcher=fetcher, logger=_log, ib=ib)  # Fix FI: ib for CLOSE held-side
             finally:
                 try: ib.disconnect()
                 except Exception: pass

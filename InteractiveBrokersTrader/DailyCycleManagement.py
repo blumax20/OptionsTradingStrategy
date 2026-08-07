@@ -4330,8 +4330,9 @@ class DailyCycleManagementMixin:
             sym_u = (symbol or "").strip().upper()
             r_u = (right or "").strip().upper()
 
-            # Build right-aware aliases so listener CSV columns (atm_strike, otm_strike_call/put,
-            # open_interest_atm_call/put) match without requiring prior enrichment to rename them.
+            # Fix FI: read the canonical OI columns only. The old parallel oi_atm/oi_oth
+            # (and atm_oi/oi1/oi2) dead columns are no longer written by enrichment; canonical
+            # open_interest_*_{call,put} carry the same values, so gate decisions are unchanged.
             if r_u == 'C':
                 cand_keys = {
                     "symbol":     ("symbol",),
@@ -4339,20 +4340,20 @@ class DailyCycleManagementMixin:
                     "exp":        ("expiration", "exp", "lastTradeDateOrContractMonth"),
                     "atm_strike": ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike"),
                     "oth_strike": ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike"),
-                    "oi_atm":     ("oi_atm", "atm_oi", "oi_call_atm", "open_interest_atm_call", "open_interest_atm", "oi1"),
-                    "oi_oth":     ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                    "oi_atm":     ("open_interest_atm_call",),
+                    "oi_oth":     ("open_interest_otm_call",),
                     "ba_atm":     ("ba_pct_atm_call",),   # Fix FC
                     "ba_oth":     ("ba_pct_otm_call",),   # Fix FC
                 }
-            else:  # PUT
+            else:  # PUT — put OI first, call OI as proxy fallback (Fix BA/AO)
                 cand_keys = {
                     "symbol":     ("symbol",),
                     "right":      ("right", "signal_right"),
                     "exp":        ("expiration", "exp", "lastTradeDateOrContractMonth"),
                     "atm_strike": ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "high_strike", "upper_strike"),
                     "oth_strike": ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike"),
-                    "oi_atm":     ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1"),
-                    "oi_oth":     ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2"),
+                    "oi_atm":     ("open_interest_atm_put", "open_interest_atm_call"),
+                    "oi_oth":     ("open_interest_otm_put", "open_interest_otm_call"),
                     "ba_atm":     ("ba_pct_atm_put",),   # Fix FC
                     "ba_oth":     ("ba_pct_otm_put",),   # Fix FC
                 }
@@ -4718,16 +4719,17 @@ class DailyCycleManagementMixin:
         def _lookup_oi(sym: str, right: str, exp: str, k_atm: float, k_oth: float):
             sym_u = sym.upper()
             r_u = right.upper()
+            # Fix FI: canonical OI columns only (dead oi_atm/oi_oth no longer written).
             if r_u == 'C':
-                keys_atm = ("oi_atm", "atm_oi", "oi_call_atm", "open_interest_atm_call", "open_interest_atm", "oi1")
-                keys_oth = ("oi_oth", "oth_oi", "oi_call_oth", "open_interest_otm_call", "open_interest_oth", "oi2")
+                keys_atm = ("open_interest_atm_call",)
+                keys_oth = ("open_interest_otm_call",)
                 keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "low_strike", "lower_strike")
                 keys_oth_strike = ("otm_strike_call", "oth", "k_oth", "strike_oth", "s_oth", "high_strike", "upper_strike")
                 keys_ba_atm = ("ba_pct_atm_call",)   # Fix FC
                 keys_ba_oth = ("ba_pct_otm_call",)   # Fix FC
-            else:
-                keys_atm = ("oi_atm", "atm_oi", "oi_put_atm", "open_interest_atm_put", "open_interest_atm_call", "open_interest_atm", "oi1")
-                keys_oth = ("oi_oth", "oth_oi", "oi_put_oth", "open_interest_otm_put", "open_interest_otm_call", "open_interest_oth", "oi2")
+            else:  # PUT — put OI first, call OI as proxy fallback (Fix BA/AO)
+                keys_atm = ("open_interest_atm_put", "open_interest_atm_call")
+                keys_oth = ("open_interest_otm_put", "open_interest_otm_call")
                 keys_atm_strike = ("atm_strike", "atm", "k_atm", "strike_atm", "s_atm", "high_strike", "upper_strike")
                 keys_oth_strike = ("otm_strike_put", "oth", "k_oth", "strike_oth", "s_oth", "low_strike", "lower_strike")
                 keys_ba_atm = ("ba_pct_atm_put",)   # Fix FC
