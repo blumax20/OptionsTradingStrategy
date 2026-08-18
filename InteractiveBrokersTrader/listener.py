@@ -297,6 +297,52 @@ def _snap_otm_to_expiry(ib: IB, symbol: str, expiry: str, start: float, right: s
                    symbol, right, start, expiry)
     return start
 
+def _expiry_adjacent_width(ib: IB, symbol: str, expiry: str, price: float, side: str,
+                           strikes_all: list[float], tradingClass: str | None,
+                           multiplier: str | None) -> float | None:
+    """Fix CX (Part B): width of the narrowest same-side spread available for `expiry`
+    (|ATM - adjacent OTM|), snapping BOTH strikes to strikes that actually exist for that
+    expiry. Used to steer expiry selection away from coarse-strike far monthlies (e.g. AXP
+    Oct = $10 strikes) toward a comparable-DTE expiry with finer strikes. `side` = 'P' (OTM
+    below) or 'C' (OTM above). Returns None if nothing qualifies.
+    """
+    if not strikes_all or price is None:
+        return None
+    try:
+        _atm0 = _closest_existing(strikes_all, price)
+    except Exception:
+        return None
+    # Snap ATM to a strike valid for this expiry (strike existence is right-independent).
+    atm = None
+    try:
+        _qualify_with_fallback(ib, symbol, expiry, _atm0, 'C', tradingClass, multiplier)
+        atm = _atm0
+    except Exception:
+        for _cand in (_nearest_valid_strike(strikes_all, _atm0, prefer="above"),
+                      _nearest_valid_strike(strikes_all, _atm0, prefer="below")):
+            if _cand is None:
+                continue
+            try:
+                _qualify_with_fallback(ib, symbol, expiry, _cand, 'C', tradingClass, multiplier)
+                atm = _cand
+                break
+            except Exception:
+                continue
+    if atm is None:
+        return None
+    # Adjacent OTM in the signal direction, snapped to this expiry.
+    if side == 'P':
+        otm0 = _next_lower_existing(strikes_all, atm)
+        otm = _snap_otm_to_expiry(ib, symbol, expiry, otm0, 'P', 'below', strikes_all, tradingClass, multiplier)
+    else:
+        otm0 = _next_higher_existing(strikes_all, atm)
+        otm = _snap_otm_to_expiry(ib, symbol, expiry, otm0, 'C', 'above', strikes_all, tradingClass, multiplier)
+    try:
+        w = abs(float(atm) - float(otm))
+    except Exception:
+        return None
+    return w if w > 0 else None
+
 # --- Normalize incoming symbols (strip exchange prefixes, timeframes, trailing punctuation) ---
 def _clean_symbol(raw: str | None) -> str | None:
     """
@@ -402,6 +448,10 @@ VERSION = "listener-2025-09-12d"
 # Expiration selection preferences
 TARGET_DTE = 60     # Fix FC: target days to expiration (was 30)
 MIN_DTE = 42        # Fix FC: require at least 42 days for new positions (was 21)
+MAX_SPREAD_WIDTH = 5.0  # Fix CX: prefer an expiry whose adjacent strikes keep the spread <= this.
+                        # Far monthlies on high-priced names (e.g. AXP Oct = $10 strikes) otherwise
+                        # force a $10-wide spread (2x risk + the $10 pricing bucket). When a
+                        # comparable-DTE expiry has finer strikes, pick it instead.
 
 # === Black–Scholes helpers and NaN guard ===
 def _is_nan(x) -> bool:
@@ -434,7 +484,7 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool =
 
 def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
                         sigma_otm: float | None = None,
-                        r: float = 0.045, widths=(1.0, 2.5, 5.0)) -> Dict[str, float]:
+                        r: float = 0.045, widths=(1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:
     """Calculate theoretical debit spread prices using Black-Scholes.
 
     Args:
@@ -675,9 +725,11 @@ def _append_csv_row(row: dict):
         "call_debit_limit_1","put_debit_limit_1",
         "call_debit_limit_2_5","put_debit_limit_2_5",
         "call_debit_limit_5","put_debit_limit_5",
+        "call_debit_limit_10","put_debit_limit_10",    # Fix CX: $10 width bucket
         "call_debit_theo_1","put_debit_theo_1",
         "call_debit_theo_2_5","put_debit_theo_2_5",
         "call_debit_theo_5","put_debit_theo_5",
+        "call_debit_theo_10","put_debit_theo_10",       # Fix CX: $10 width bucket
         "open_interest_atm_call","open_interest_otm_call",
         "open_interest_atm_put","open_interest_otm_put",
         "ba_pct_atm_call","ba_pct_otm_call","ba_pct_atm_put","ba_pct_otm_put",
@@ -758,7 +810,7 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         # Fix Y2a: prefer iv_otm over hardcoded 0.25 when iv_atm is missing
         sigma_atm = sigma_otm if (sigma_otm is not None and not _is_nan(sigma_otm)) else 0.25
 
-    theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None}
+    theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None,"call_debit_theo_10": None,"put_debit_theo_10": None}  # Fix CX: $10 bucket
     if not _is_nan(S) and not _is_nan(atm) and (days_to_exp is not None and days_to_exp > 0):
         try:
             theo = _theo_spread_debits(float(S), float(atm), float(T), float(sigma_atm), sigma_otm=sigma_otm)
@@ -787,12 +839,16 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         "put_debit_limit_2_5": None,
         "call_debit_limit_5": None,
         "put_debit_limit_5": None,
+        "call_debit_limit_10": None,   # Fix CX: $10 bucket (populated by LiquidityFilter enrichment)
+        "put_debit_limit_10": None,
         "call_debit_theo_1": (theo or {}).get("call_debit_theo_1"),
         "put_debit_theo_1":  (theo or {}).get("put_debit_theo_1"),
         "call_debit_theo_2_5": (theo or {}).get("call_debit_theo_2_5"),
         "put_debit_theo_2_5":  (theo or {}).get("put_debit_theo_2_5"),
         "call_debit_theo_5": (theo or {}).get("call_debit_theo_5"),
         "put_debit_theo_5":  (theo or {}).get("put_debit_theo_5"),
+        "call_debit_theo_10": (theo or {}).get("call_debit_theo_10"),   # Fix CX: $10 bucket
+        "put_debit_theo_10":  (theo or {}).get("put_debit_theo_10"),
         "open_interest_atm_call": result.get("open_interest_atm"),
         "open_interest_otm_call": result.get("open_interest_otm"),
         "open_interest_atm_put": result.get("open_interest_atm_put"),
@@ -1054,7 +1110,26 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             else:
                 valid = [(d, dte) for (d, dte) in exps if dte >= MIN_DTE]
                 if valid:
-                    expiry_str = min(valid, key=lambda t: abs(t[1] - TARGET_DTE))[0]
+                    _valid_sorted = sorted(valid, key=lambda t: abs(t[1] - TARGET_DTE))
+                    # Fix CX (Part B): among the DTE-closest valid expiries, prefer one whose
+                    # adjacent strikes keep the spread <= MAX_SPREAD_WIDTH. The DTE-closest is
+                    # checked first, so a normal $5-strike name breaks on the first candidate
+                    # (no behavior change); only a coarse-strike far monthly (e.g. AXP Oct=$10)
+                    # walks to the next candidate. OPEN signals only.
+                    _cx_side = 'P' if signal_type == "PUT_OPEN" else 'C'
+                    _cx_chosen = None
+                    if strikes_all and current_price is not None and signal_type in ("CALL_OPEN", "PUT_OPEN"):
+                        for _cx_exp, _cx_dte in _valid_sorted[:3]:
+                            _cx_w = _expiry_adjacent_width(ib, symbol, _cx_exp, current_price,
+                                                           _cx_side, strikes_all, preferred_tc, multiplier)
+                            if _cx_w is not None and _cx_w <= MAX_SPREAD_WIDTH + 1e-9:
+                                _cx_chosen = _cx_exp
+                                if _cx_exp != _valid_sorted[0][0]:
+                                    logger.info("[%s] Fix CX: preferring exp %s (dte=%d, width=%.1f) over %s "
+                                                "to keep spread <= $%.1f", symbol, _cx_exp, _cx_dte, _cx_w,
+                                                _valid_sorted[0][0], MAX_SPREAD_WIDTH)
+                                break
+                    expiry_str = _cx_chosen if _cx_chosen else _valid_sorted[0][0]
                 else:
                     expiry_str = min(exps, key=lambda t: abs(t[1] - TARGET_DTE))[0]
         else:

@@ -1606,8 +1606,15 @@ class DailyCycleManagementMixin:
                     return None
                 row = rows.iloc[-1]  # Use latest row for symbol
                 # Fix V: nearest-neighbor bucket selection (matches PlaceAnOrder._width_bucket)
-                _buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0)]
-                bucket, _ = min(_buckets, key=lambda t: abs(width - t[1]))
+                # Fix CX: buckets now include "10"; a width NOT within 0.6 of any bucket
+                # (e.g. $7.5, $15) returns None so the caller defers to live/portfolio pricing
+                # instead of mis-snapping a wide spread to a narrower bucket (AXP $10-as-$5 undersell).
+                _buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0), ("10", 10.0)]
+                bucket, _bval = min(_buckets, key=lambda t: abs(width - t[1]))
+                if abs(width - _bval) > 0.6:
+                    LOG.info("direct-close: width=%.2f not within 0.6 of any bucket (nearest %s); "
+                             "no CSV theo — defer to live pricing", width, bucket)
+                    return None
                 # Try limit columns first, then theo
                 prefix = "call_debit" if right.upper().startswith("C") else "put_debit"
                 LOG.debug("[%s] _get_theo_limit: right=%s, width=%s, bucket=%s, prefix=%s", up, right, width, bucket, prefix)

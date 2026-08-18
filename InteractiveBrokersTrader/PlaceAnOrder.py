@@ -717,15 +717,27 @@ def _spread_width_from_strikes(atm: float | None, oth: float | None) -> float | 
     except Exception:
         return None
 
+_WIDTH_BUCKET_TOL = 0.6  # Fix CX: max |width - bucket| before we refuse to snap (deters $7.5/$15 mispricing)
+
 def _width_bucket(width: float | None) -> str | None:
     """
     Map a numeric width to the nearest known bucket label used by CSV columns:
-    returns one of {"1","2_5","5"} or None if width is invalid.
+    returns one of {"1","2_5","5","10"} or None if width is invalid.
+
+    Fix CX: buckets are 1/2.5/5/10. A width that is NOT within _WIDTH_BUCKET_TOL of any
+    bucket (e.g. $7.5, $15) returns None instead of snapping to the nearest — the caller
+    then defers to live/portfolio pricing (close) or skips (open) rather than pricing a
+    wide spread with a narrower bucket's value (the AXP $10-priced-as-$5 undersell).
+    ($0.50 stays within tol of "1", preserving Fix V.)
     """
     if width is None:
         return None
-    buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0)]
-    lab, _ = min(buckets, key=lambda t: abs(width - t[1]))
+    buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0), ("10", 10.0)]
+    lab, val = min(buckets, key=lambda t: abs(width - t[1]))
+    if abs(width - val) > _WIDTH_BUCKET_TOL:
+        logger.warning(f"[width-bucket] width={width} not within {_WIDTH_BUCKET_TOL} of any bucket "
+                       f"(nearest {lab}={val}); returning None -> defer to live pricing / skip")
+        return None
     return lab
 
 def _limit_key_prefix(right: str, kind: str) -> str:
@@ -744,9 +756,10 @@ def _width_aligned_value(row: pd.Series, right: str, kind: str, width_bucket: st
     to the other widths by proximity (nearest 1/2.5/5).
     """
     prefix = _limit_key_prefix(right, kind)
-    order = ["1","2_5","5"]
-    order.sort(key=lambda x: abs((1.0 if x=="1" else 2.5 if x=="2_5" else 5.0) -
-                                 (1.0 if width_bucket=="1" else 2.5 if width_bucket=="2_5" else 5.0)))
+    # Fix CX: dict lookup incl "10" (the old conditional-chain lambda didn't know about "10").
+    _bv = {"1": 1.0, "2_5": 2.5, "5": 5.0, "10": 10.0}
+    order = ["1","2_5","5","10"]
+    order.sort(key=lambda x: abs(_bv.get(x, 1.0) - _bv.get(width_bucket, 1.0)))
     for lab in order:
         col = f"{prefix}_{lab}"
         if col in row and row[col] is not None:
@@ -4197,13 +4210,13 @@ def run_from_csv():
                         wb = _width_bucket(w_call_open)
                         # Build ordered list: limit columns first, then theo columns as fallback
                         ordered_limit = [f"call_debit_limit_{wb}"] if wb else []
-                        for alt in ("1","2_5","5"):
+                        for alt in ("1","2_5","5","10"):  # Fix CX: $10 bucket
                             col = f"call_debit_limit_{alt}"
                             if col not in ordered_limit:
                                 ordered_limit.append(col)
 
                         ordered_theo = [f"call_debit_theo_{wb}"] if wb else []
-                        for alt in ("1","2_5","5"):
+                        for alt in ("1","2_5","5","10"):  # Fix CX: $10 bucket
                             col = f"call_debit_theo_{alt}"
                             if col not in ordered_theo:
                                 ordered_theo.append(col)
@@ -4371,13 +4384,13 @@ def run_from_csv():
                         wb = _width_bucket(w_put_open)
                         # Build ordered list: limit columns first, then theo columns as fallback
                         ordered_limit = [f"put_debit_limit_{wb}"] if wb else []
-                        for alt in ("1","2_5","5"):
+                        for alt in ("1","2_5","5","10"):  # Fix CX: $10 bucket
                             col = f"put_debit_limit_{alt}"
                             if col not in ordered_limit:
                                 ordered_limit.append(col)
 
                         ordered_theo = [f"put_debit_theo_{wb}"] if wb else []
-                        for alt in ("1","2_5","5"):
+                        for alt in ("1","2_5","5","10"):  # Fix CX: $10 bucket
                             col = f"put_debit_theo_{alt}"
                             if col not in ordered_theo:
                                 ordered_theo.append(col)

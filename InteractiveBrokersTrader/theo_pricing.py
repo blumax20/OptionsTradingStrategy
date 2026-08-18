@@ -31,7 +31,7 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool =
 
 def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
                         sigma_otm: float | None = None,
-                        r: float = 0.045, widths=(1.0, 2.5, 5.0)) -> Dict[str, float]:
+                        r: float = 0.045, widths=(1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:
     """Calculate theoretical debit spread prices using Black-Scholes.
 
     Args:

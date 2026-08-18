@@ -848,7 +848,7 @@ def enrich_combined_csv(day_dir: str, fetcher=None, logger=None, ib=None):
                     try:
                         theo = _theo_spread_debits(_S, _atm_v, _T, sigma_atm, sigma_otm=sigma_otm)
                         _pref = "call" if right == "C" else "put"
-                        for _w in ("1", "2_5", "5"):
+                        for _w in ("1", "2_5", "5", "10"):  # Fix CX: $10 bucket
                             _col = f"{_pref}_debit_theo_{_w}"
                             if _col in cols:
                                 row[_col] = theo.get(f"{_pref}_debit_theo_{_w}")
@@ -947,7 +947,8 @@ def enrich_live_spread_prices(day_dir: str, ib=None, logger=None) -> int:
     # Ensure limit columns exist
     limit_cols = ['call_debit_limit_1', 'put_debit_limit_1',
                   'call_debit_limit_2_5', 'put_debit_limit_2_5',
-                  'call_debit_limit_5', 'put_debit_limit_5']
+                  'call_debit_limit_5', 'put_debit_limit_5',
+                  'call_debit_limit_10', 'put_debit_limit_10']  # Fix CX: $10 bucket
     _ensure_cols(cols, limit_cols)
 
     updates = 0
@@ -963,7 +964,7 @@ def enrich_live_spread_prices(day_dir: str, ib=None, logger=None) -> int:
             logger(f"[{symbol}] Fetching live spread prices for exp={exp}, atm={atm}")
 
         # Fetch live prices for each width
-        for width, suffix in [(1.0, '1'), (2.5, '2_5'), (5.0, '5')]:
+        for width, suffix in [(1.0, '1'), (2.5, '2_5'), (5.0, '5'), (10.0, '10')]:  # Fix CX: $10 bucket
             # CALL spread
             call_live = _fetch_live_spread_price(ib, symbol, exp, atm, width, 'C')
             if call_live is not None:
