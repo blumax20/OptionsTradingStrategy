@@ -1110,7 +1110,13 @@ def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None)
             else:
                 valid = [(d, dte) for (d, dte) in exps if dte >= MIN_DTE]
                 if valid:
-                    _valid_sorted = sorted(valid, key=lambda t: abs(t[1] - TARGET_DTE))
+                    # Fix CX (DTE cap): TARGET_DTE is a nearest-target, not a cap — a 73-DTE month
+                    # can beat a 45-DTE one (|73-60|=13 < |45-60|=15), the AXP coarse-strike case.
+                    # Prefer expiries AT OR BELOW TARGET_DTE; only reach past 60 when nothing in
+                    # [MIN_DTE, TARGET_DTE] exists. Still >= MIN_DTE (42), consistent with Fix FC.
+                    _le_target = [x for x in valid if x[1] <= TARGET_DTE]
+                    _dte_pool = _le_target if _le_target else valid
+                    _valid_sorted = sorted(_dte_pool, key=lambda t: abs(t[1] - TARGET_DTE))
                     # Fix CX (Part B): among the DTE-closest valid expiries, prefer one whose
                     # adjacent strikes keep the spread <= MAX_SPREAD_WIDTH. The DTE-closest is
                     # checked first, so a normal $5-strike name breaks on the first candidate

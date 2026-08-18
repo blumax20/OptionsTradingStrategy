@@ -206,13 +206,33 @@ while ($true) {
         }
 
         4 {
-            if (Test-Path $StopScript) {
-                Run-And-Log -Title "Stop"  -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StopScript }
-                Write-Host "Waiting 5 seconds for services to fully stop..." -ForegroundColor DarkCyan
-                Start-Sleep -Seconds 5
-            }
-            if (Test-Path $StartScript) {
-                Run-And-Log -Title "Start" -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StartScript }
+            Write-Host ""
+            Write-Host "  1) Restart full system (stop + start all services; runs daily cycle)"
+            Write-Host "  2) Restart listener only (reload listener.py; NO orders placed)"
+            $sub = Read-Host "  Choose (1 or 2)"
+            switch ($sub.Trim()) {
+                '1' {
+                    if (Test-Path $StopScript) {
+                        Run-And-Log -Title "Stop"  -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StopScript }
+                        Write-Host "Waiting 5 seconds for services to fully stop..." -ForegroundColor DarkCyan
+                        Start-Sleep -Seconds 5
+                    }
+                    if (Test-Path $StartScript) {
+                        Run-And-Log -Title "Start" -Action { powershell -NoProfile -ExecutionPolicy Bypass -File $StartScript }
+                    }
+                }
+                '2' {
+                    $restartListenerCmd = "C:\OptionsHistory\bin\RestartListener.cmd"
+                    if (Test-Path $restartListenerCmd) {
+                        Write-Host "Restarting OptionsListener only (reloads listener.py; no orders placed)..." -ForegroundColor Cyan
+                        & cmd.exe /c $restartListenerCmd
+                    } else {
+                        Write-Host "RestartListener.cmd not found at $restartListenerCmd" -ForegroundColor Red
+                    }
+                }
+                Default {
+                    Write-Host "Invalid selection." -ForegroundColor Yellow
+                }
             }
             Pause-Enter
         }
