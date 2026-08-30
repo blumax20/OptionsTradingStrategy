@@ -5954,3 +5954,46 @@ IBGateway is down.
 sum +$438; 141 OPEN signals -> 57 spreads placed -> 33 filled (58% fill rate), 24 expired
 unfilled; est win rate 48%, profit factor 0.67 (5 spreads riding to worthless expiration cost
 ~-$453 est); 23 margin-blocked opens (E201); 136 liquidity-gate skips.
+
+---
+
+### Fix FK: Salvage Exit — Close Near-Expiry OTM Losers Instead of Riding to Worthless Expiration (Aug 30)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/DailyCycleManagement.py` — module constants
+`SALVAGE_EXIT_ENABLED = True` / `SALVAGE_DTE_MAX = 10` (~line 56); salvage decision inside
+`_rth_risk_exits._process_vertical()` next to the Fix ER stop/TP block (~line 3950).
+
+**Issue:** August 2026 leaked an estimated **~$453** to spreads that rode to worthless expiration
+(HQY -$158, HAS -$109, SON -$100, FE -$49, VOD -$39 — found by `MonthlyReview.py`). All were OTM
+debit spreads that still had residual value weeks before expiry, but nothing closed them: TP never
+fires on a loser, stop-loss is disabled (Fix ER), and the CLOSE-signal/preclose paths only act on
+signals. LIN P 480/475 (exp 20260918, 2% OTM, ~$140 residual vs $232 entry) was queued up to
+repeat the pattern in September.
+
+**Fix:** In `_process_vertical()`, alongside `stop_hit`/`tp_hit`, compute:
+```python
+salvage_hit = (SALVAGE_EXIT_ENABLED and 0 <= dte <= SALVAGE_DTE_MAX
+               and curr < entry and curr < 0.5 * width)
+```
+- **DTE** from the long leg's contract directly (`lastTradeDateOrContractMonth`; the age-check
+  `exp_str` is only assigned in the no-execution-history branch — cannot be reused). 6-char
+  "YYYYMM" exps skip salvage (can't compute DTE).
+- **`curr < 0.5*width` is the OTM proxy**: near expiry the spread price has converged toward
+  intrinsic, so below half-width = market prices it to finish OTM. An ITM spread
+  (curr >= half width) is left to converge toward full width / TP even if below entry.
+- Close reason `SALVAGE(dte=N<=10, below entry, OTM)` — deliberately contains no "TP" so the
+  3 PM preclose (Fix FF) still aggressively re-prices an unfilled salvage order to join: at
+  <=10 DTE the order SHOULD fill, unlike patient TP orders.
+- Independent of `RISK_EXIT_STOP_LOSS_ENABLED` (stays False): salvage is a time-based recovery,
+  not a loss-percentage stop. `RISK_EXITS_ENABLED` master switch still gates everything.
+- Fix EP log line extended with `salvage=%s(dte=%s)`. All existing guards (Fix EF same-day fill
+  gate, Fix Z4 working-close dedup, Fix EP/FJ price sanity band) apply unchanged since salvage
+  reuses the same code path; `curr` is the sanity-checked live/portfolio value.
+
+**Predicate verified:** LIN@dte18 no-fire / LIN@dte10 fires; ITM winner near expiry no-fire;
+ITM-below-entry (converging) no-fire; worthless OTM dte=3 fires; already-expired (dte<0) no-fire.
+
+**Impact:** OTM losers get closed at mid via risk exits (9:48/10:30) starting 10 days before
+expiration, recovering residual value; preclose escalates unfilled salvage orders same day.
+Expected first live trigger: LIN 480/475P around Sep 8 (dte=10) if still OTM and below entry.

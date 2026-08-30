@@ -53,6 +53,19 @@ RISK_EXIT_SANITY_HIGH_FRAC = 1.4
 # must remain True for take-profit to run.
 RISK_EXIT_STOP_LOSS_ENABLED = False
 
+# Fix FK: salvage exit — close spreads that are near expiration, below entry, and
+# priced to finish OTM, instead of letting them ride to worthless expiration
+# (Aug 2026 leaked ~$453 that way: HQY/HAS/SON/FE/VOD all expired at $0 with
+# residual value still on the table weeks earlier). Triggers when DTE <=
+# SALVAGE_DTE_MAX AND curr < entry AND curr < 0.5*width. The half-width test is
+# the OTM proxy: near expiry the spread price has largely converged to intrinsic,
+# so below half-width means the market prices it as likely to finish OTM; an ITM
+# spread (curr >= 0.5*width) is left to converge toward full width / TP.
+# Independent of RISK_EXIT_STOP_LOSS_ENABLED (this is a time-based recovery, not
+# a loss-percentage stop). Set False to disable.
+SALVAGE_EXIT_ENABLED = True
+SALVAGE_DTE_MAX = 10
+
 # Fix EQ: Strike-aware roll master switch. When True, the after-hours cycle detects a
 # still-held same-side spread whose strikes no longer match the latest same-side OPEN
 # signal (i.e. a prior CLOSE never filled) and rolls it: guaranteed MKT close of the OLD
@@ -3945,18 +3958,45 @@ class DailyCycleManagementMixin:
                 # the log; stop_act is what actually triggers a close.
                 stop_act = stop_hit and RISK_EXIT_STOP_LOSS_ENABLED
 
+                # Fix FK: salvage exit — near-expiry, below-entry, priced-to-finish-OTM.
+                # Recovers residual value instead of riding to worthless expiration.
+                salvage_hit = False
+                salvage_dte = None
+                # exp from the leg contract directly (exp_str above is only assigned in
+                # the no-execution-history branch of the age check).
+                _sv_exp_str = getattr(long_leg.get("contract"), "lastTradeDateOrContractMonth", "") or ""
+                if SALVAGE_EXIT_ENABLED and len(_sv_exp_str) >= 8:
+                    try:
+                        _sv_exp = datetime.strptime(_sv_exp_str[:8], "%Y%m%d").date()
+                        salvage_dte = (_sv_exp - now.date()).days
+                        if (0 <= salvage_dte <= SALVAGE_DTE_MAX
+                                and curr < entry
+                                and curr < 0.5 * width):
+                            salvage_hit = True
+                    except Exception:
+                        pass
+
                 # Fix EP: full pricing breakdown so any future mispricing is diagnosable in one line.
                 LOG.info("Risk exits: %s %s %.0f/%.0f entry=%.2f curr=%.2f(%s) live=%s port=%s "
-                         "legs live[L=%s S=%s] port[L=%s S=%s] width=%.2f stop=%s(act=%s) tp=%s",
+                         "legs live[L=%s S=%s] port[L=%s S=%s] width=%.2f stop=%s(act=%s) tp=%s "
+                         "salvage=%s(dte=%s)",
                          sym, right, strike_low, strike_high, entry, curr, _price_src,
                          curr_live, curr_port, live_ml, live_ms, port_ml, port_ms,
-                         width, stop_hit, stop_act, tp_hit)
+                         width, stop_hit, stop_act, tp_hit, salvage_hit, salvage_dte)
 
-                if not (stop_act or tp_hit):
+                if not (stop_act or tp_hit or salvage_hit):
                     return
 
                 # Build the same human-readable reason used in DailyCycle.log
-                reason = "STOP(>=%.0f%% loss)" % (loss_frac*100) if stop_act else "TP(>=%.0f%% max profit)" % (gain_frac*100)
+                if stop_act:
+                    reason = "STOP(>=%.0f%% loss)" % (loss_frac*100)
+                elif tp_hit:
+                    reason = "TP(>=%.0f%% max profit)" % (gain_frac*100)
+                else:
+                    # Fix FK. Note: reason deliberately contains no "TP" so the 3 PM
+                    # preclose (Fix FF) will still aggressively re-price an unfilled
+                    # salvage order — at <=10 DTE we WANT this order to fill.
+                    reason = "SALVAGE(dte=%d<=%d, below entry, OTM)" % (salvage_dte, SALVAGE_DTE_MAX)
 
                 # Also append to DCM attempts CSV so we can see that this CLOSE is TP/SL-driven
                 try:
