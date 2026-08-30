@@ -5915,3 +5915,42 @@ Parts A/B were committed (`d520a54`):
 (via `_ensure_cols`) with `theo_10` absent — values are correct (AXP `limit_10=6.20`), only the
 column *position* differs; readers look up by name so nothing downstream is affected. Not
 retrofitting old CSVs (user's call). `PushButtonMenu.ps1` committed; listener restart is operational.
+
+---
+
+### Tool: MonthlyReview.py — Monthly Performance & Efficiency Report (Aug 30)
+**Status:** IMPLEMENTED
+
+**Location:** `MonthlyReview.py` (NEW, repo root); `PushButtonMenu.ps1` menu **8-9**.
+
+Read-only reporting tool: `python MonthlyReview.py [--month 26_08] [--live] [--out]`. Never
+places, cancels, or modifies anything. `--out` writes to
+`C:\OptionsHistory\logs\monthly_review_<YY_MM>.txt`; `--live` (clientId 960) adds the
+opportunity-cost section via read-only `reqHistoricalData` and degrades to a SKIPPED note when
+IBGateway is down.
+
+**Sections / metric definitions:**
+- **A. Performance** — daily Realized/Unrealized/DayTotal/YTD-chg from the last health report of
+  each day (mixed UTF-16LE/UTF-8 encodings handled). **The month NetLiq delta (YTD-chg end minus
+  prior-month end) is THE performance number.** Never sum "Day Total" across days (Unrealized is
+  cumulative) and never sum the health report's "Last 20 Orders Closed (est.)" rows (attempts-
+  based — unfilled close attempts repeat; ISRG once appeared 12x ≈ -$1.7K phantom loss).
+- **B. Trade ledger (fill-confirmed)** — spreads reconstructed from Current Positions snapshots:
+  appearing = open filled; disappearing = close filled; disappearing on/after its expiration and
+  leaving no STK residue = expired worthless (exit $0). Entry = avgCost(long)-avgCost(short);
+  exit = last submitted close limit near the disappearance (ESTIMATE — true fills need IB Flex).
+  Win rate / avg win / avg loss / profit factor, all labeled estimated.
+- **C. Execution funnel** — OPEN signals -> symbols attempted -> unique spreads placed -> filled
+  (confirmed via snapshots) -> placed-but-expired-unfilled, plus skip reasons in 4 categories:
+  liquidity_gate (wide_spread_after_hours, oi_below_threshold), account_blocked
+  (bs_rejected_bag_e201 = margin), not_priceable (no chain/limit), by_design (same-side held,
+  close pending). Close-side efficiency = close orders submitted vs confirmed closes (surfaces
+  UL-style grind loops: 26 attempts -> 1 close).
+- **D. Opportunity cost (`--live`, rough)** — for never-executed opens (skipped by real gates or
+  placed-but-unfilled): intrinsic payoff at today's underlying price minus signal-time
+  theo/limit debit, summed by miss category. Directional sanity check only.
+
+**August 2026 baseline results:** NetLiq +$274 (+16.9%), peak +$1,122/trough at entry; realized
+sum +$438; 141 OPEN signals -> 57 spreads placed -> 33 filled (58% fill rate), 24 expired
+unfilled; est win rate 48%, profit factor 0.67 (5 spreads riding to worthless expiration cost
+~-$453 est); 23 margin-blocked opens (E201); 136 liquidity-gate skips.

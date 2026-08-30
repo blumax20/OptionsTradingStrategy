@@ -1,4 +1,4 @@
-# PushButtonMenu.ps1 — master control menu (PS 5.1 safe)
+﻿# PushButtonMenu.ps1 — master control menu (PS 5.1 safe)
 
 # ---- Paths ----
 $Root         = "C:\Users\Administrator\code\OptionsTradingStrategy"
@@ -135,6 +135,7 @@ function Show-Menu {
     Write-Host "8)  Place today's orders (from CSV)"
     Write-Host "9)  Exit"
     Write-Host "10) Reboot system"
+    Write-Host "11) Verify trading mode (paper/live consistency)"
     Write-Host "============================="
 }
 
@@ -147,7 +148,7 @@ if (-not (Get-Variable -Name __TranscriptOn -Scope Script -ErrorAction SilentlyC
 
 while ($true) {
     Show-Menu
-    $choice = Read-Host "Choose an option (1-10)"
+    $choice = Read-Host "Choose an option (1-11)"
 
     switch ($choice) {
 
@@ -377,7 +378,8 @@ while ($true) {
             Write-Host "  6) OI cleanup + risk exits retry (Fix CN/CO) -- cancel low-OI orders, then run risk exits"
             Write-Host "  7) Place skipped OPEN orders from prior day (10 AM retry -- Fix CP/CQ)"
             Write-Host "  8) FORCE-EXECUTE pending BAG orders with JOIN pricing (RTH only -- Fix EN)"
-            $flow = Read-Host "Select [1-8]"
+            Write-Host "  9) Monthly performance review (read-only report; MonthlyReview.py)"
+            $flow = Read-Host "Select [1-9]"
 
             $argList = @("`"$DCMSrc`"")
             $skipGenericLaunch = $false
@@ -420,6 +422,23 @@ while ($true) {
                         Default { $sideArg = 'both' }
                     }
                     $argList += @("--force-execute-pending", $sideArg)
+                }
+                '9' {
+                    # Monthly performance & efficiency review (read-only; no orders).
+                    $skipGenericLaunch = $true
+                    $Review = "C:\Users\Administrator\code\OptionsTradingStrategy\MonthlyReview.py"
+                    if (-not (Test-Path $Review)) {
+                        Write-Host ("MonthlyReview.py not found: {0}" -f $Review) -ForegroundColor Yellow
+                        Pause-Enter; break
+                    }
+                    $mon = Read-Host "Month as YY_MM (blank = current month)"
+                    $liveAns = Read-Host "Include opportunity-cost section (needs IBGateway up)? (y/N)"
+                    $rvArgs = @($Review, "--out")
+                    if (-not [string]::IsNullOrWhiteSpace($mon)) { $rvArgs += @("--month", $mon) }
+                    if ($liveAns -and $liveAns.ToLower().StartsWith('y')) { $rvArgs += "--live" }
+                    Write-Host ("Running MonthlyReview {0} ..." -f ($rvArgs -join ' ')) -ForegroundColor Cyan
+                    & $PyExe $rvArgs
+                    Pause-Enter
                 }
                 Default {
                     Write-Host "Invalid selection." -ForegroundColor Yellow
@@ -613,6 +632,20 @@ while ($true) {
             Start-Sleep -Seconds 1
             Restart-Computer -Force
 
+        }
+
+        11 {
+            # Verify every location agrees with ib_config.py
+            Write-Host ""
+            Write-Host "--- Verifying trading mode consistency ---" -ForegroundColor Cyan
+            & $PyExe $SwitchScript verify
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "All locations agree." -ForegroundColor Green
+            } else {
+                Write-Host "Drift detected - see the DRIFT rows above." -ForegroundColor Yellow
+            }
+            Write-Host ""
+            Read-Host "Press Enter to return to the menu" | Out-Null
         }
 
         Default {
