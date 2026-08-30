@@ -288,7 +288,54 @@ def match_close_limit(attempts, key, close_ts):
     return best[1] if best else None
 
 
-def section_ledger(out, ledger, snapshots, attempts, month_start_ts):
+def find_entry_ts(attempts_hist, key):
+    """Earliest successful open placement matching this spread. Returns 'YYYY-MM-DD...' or None."""
+    sym, right, exp, lk, sk = key
+    best = None
+    for r in attempts_hist:
+        if r.get("symbol") != sym or r.get("action") not in OPEN_ACTIONS:
+            continue
+        if r.get("status") not in ("placed", "submitted"):
+            continue
+        if "success" not in (r.get("reason") or ""):
+            continue
+        if (r.get("exp") or "").strip() != exp:
+            continue
+        rl = money(r.get("longK"))
+        if rl is None or lk is None or abs(rl - lk) > 0.01:
+            continue
+        ts = r.get("ts") or ""
+        if ts and (best is None or ts < best):
+            best = ts
+    return best
+
+
+def entry_dte(attempts_hist, key):
+    """Days-to-expiration at entry, from the matched open placement. None if unknown."""
+    ts = find_entry_ts(attempts_hist, key)
+    if not ts:
+        return None
+    try:
+        d0 = datetime.strptime(ts[:10], "%Y-%m-%d")
+        dx = datetime.strptime(key[2], "%Y%m%d")
+        return (dx - d0).days
+    except ValueError:
+        return None
+
+
+def dte_bucket(dte):
+    if dte is None:
+        return "unknown"
+    if dte < 30:
+        return "<30d"
+    if dte <= 45:
+        return "30-45d"
+    if dte <= 60:
+        return "46-60d"
+    return ">60d"
+
+
+def section_ledger(out, ledger, snapshots, attempts, month_start_ts, attempts_hist):
     out.append("=== B. TRADE LEDGER (fill-confirmed via position snapshots) ===")
     out.append("")
     baseline_keys = set(snapshots[0][1].keys()) if snapshots else set()
@@ -309,6 +356,7 @@ def section_ledger(out, ledger, snapshots, attempts, month_start_ts):
 
     out.append("-- Closed this month ({}) --".format(len(closed)))
     wins, losses = [], []
+    by_dte = defaultdict(list)
     for key, e, cost in sorted(closed, key=lambda x: x[1]["closed_after"]):
         close_day = e["closed_after"].split("_")[0]
         expired = close_day >= key[2]  # disappeared on/after expiration date
@@ -319,12 +367,15 @@ def section_ledger(out, ledger, snapshots, attempts, month_start_ts):
         else:
             exit_lim, tag = match_close_limit(attempts, key, e["closed_after"]), ""
         pl = (exit_lim * 100 - cost) if exit_lim is not None else None
+        dte = entry_dte(attempts_hist, key)
         if pl is not None:
             (wins if pl >= 0 else losses).append(pl)
-        out.append("  {}  entry={}  exit_lim={}  est P/L={}{}".format(
+            by_dte[dte_bucket(dte)].append(pl)
+        out.append("  {}  entry={}  exit_lim={}  est P/L={}  dte@entry={}{}".format(
             label(key), fmt(cost, 0).strip(),
             "{:.2f}".format(exit_lim) if exit_lim is not None else "?",
-            fmt(pl, 0).strip(), tag))
+            fmt(pl, 0).strip(),
+            dte if dte is not None else "?", tag))
     if wins or losses:
         n = len(wins) + len(losses)
         out.append("")
@@ -335,6 +386,19 @@ def section_ledger(out, ledger, snapshots, attempts, month_start_ts):
         gw, gl = sum(wins), -sum(losses)
         if gl > 0:
             out.append("  est profit factor: {:.2f}".format(gw / gl))
+    out.append("")
+
+    out.append("-- Closed-trade results by DTE at entry --")
+    for b in ("<30d", "30-45d", "46-60d", ">60d", "unknown"):
+        pls = by_dte.get(b)
+        if not pls:
+            continue
+        w = sum(1 for p in pls if p >= 0)
+        out.append("  {:8s} n={:2d}  wins={:2d} ({:.0f}%)  total={}  avg={}".format(
+            b, len(pls), w, 100.0 * w / len(pls),
+            fmt(sum(pls), 0).strip(), fmt(sum(pls) / len(pls), 0).strip()))
+    out.append("  (dte@entry from the matched open placement in attempts CSVs; 'unknown' =")
+    out.append("   opened before the attempts lookback or closed without a matching open row)")
     out.append("")
 
     out.append("-- Opened this month ({}) --".format(len(opened)))
@@ -450,12 +514,39 @@ def bucket_for_width(width):
     return None
 
 
-def section_opportunity(out, signals, attempts, unfilled, ledger, live):
+def connect_ib(out):
+    """Connect read-only to IB (clientId 960). Returns ib or None (with a note)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "InteractiveBrokersTrader"))
+    try:
+        from ib_insync import IB  # noqa
+        from ib_config import IB_HOST, IB_PORT  # noqa
+        ib = IB()
+        ib.connect(IB_HOST, IB_PORT, clientId=960, timeout=15)
+        return ib
+    except Exception as e:
+        out.append("NOTE: could not connect to IB ({}: {}) - live sections skipped.".format(
+            type(e).__name__, e))
+        out.append("")
+        return None
+
+
+def daily_close(ib, symbol, duration="2 D"):
+    """Daily TRADES bars for a stock; returns {YYYYMMDD: close} (empty on failure)."""
+    from ib_insync import Stock  # noqa
+    try:
+        c = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))[0]
+        bars = ib.reqHistoricalData(c, "", duration, "1 day", "TRADES", True)
+        return {b.date.strftime("%Y%m%d"): b.close for b in bars}
+    except Exception:
+        return {}
+
+
+def section_opportunity(out, signals, attempts, unfilled, ledger, ib):
     out.append("=== D. OPPORTUNITY COST OF NON-EXECUTED OPENS (rough) ===")
     out.append("")
-    if not live:
-        out.append("SKIPPED: requires --live (IB connection) for current underlying prices.")
-        out.append("Re-run with --live when IBGateway is up.")
+    if ib is None:
+        out.append("SKIPPED: requires --live with IBGateway up (current underlying prices).")
         out.append("")
         return
 
@@ -513,31 +604,12 @@ def section_opportunity(out, signals, attempts, unfilled, ledger, live):
         out.append("")
         return
 
-    # live prices
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "InteractiveBrokersTrader"))
-    from ib_insync import IB, Stock  # noqa
-    from ib_config import IB_HOST, IB_PORT  # noqa
-    ib = IB()
-    try:
-        ib.connect(IB_HOST, IB_PORT, clientId=960, timeout=15)
-    except Exception as e:
-        out.append("SKIPPED: could not connect to IB ({}: {}). Start IBGateway and re-run --live.".format(
-            type(e).__name__, e))
-        out.append("")
-        return
+    # live prices via the shared connection
     prices = {}
-    try:
-        for sym in sorted(set(k[0] for k in cands)):
-            try:
-                c = ib.qualifyContracts(Stock(sym, "SMART", "USD"))[0]
-                bars = ib.reqHistoricalData(c, "", "2 D", "1 day", "TRADES", True)
-                if bars:
-                    prices[sym] = bars[-1].close
-            except Exception:
-                pass
-    finally:
-        ib.disconnect()
+    for sym in sorted(set(k[0] for k in cands)):
+        px = daily_close(ib, sym)
+        if px:
+            prices[sym] = px[max(px)]
 
     totals = defaultdict(float)
     counts = defaultdict(int)
@@ -567,6 +639,68 @@ def section_opportunity(out, signals, attempts, unfilled, ledger, live):
     out.append("")
 
 
+def section_alpha_beta(out, daily, baseline_pl, ib):
+    out.append("=== E. ALPHA / BETA vs SPY ===")
+    out.append("")
+    if ib is None:
+        out.append("SKIPPED: requires --live with IBGateway up (SPY price history).")
+        out.append("")
+        return
+    import json
+    try:
+        with open(os.path.join(OH, "ytd_baseline.json")) as f:
+            base = float(json.load(f)["netliq"])
+    except Exception as e:
+        out.append("SKIPPED: could not read ytd_baseline.json ({}).".format(e))
+        out.append("")
+        return
+
+    series = []
+    if baseline_pl:
+        series.append((baseline_pl[0], base + baseline_pl[1]))
+    for day, _r, _u, _d, ytd in daily:
+        if ytd is not None:
+            series.append((day, base + ytd))
+
+    spy = daily_close(ib, "SPY", "90 D")
+    pts = [(d, nl) for d, nl in series if d in spy and nl]
+    if len(pts) < 6:
+        out.append("SKIPPED: not enough overlapping account/SPY days ({}).".format(len(pts)))
+        out.append("")
+        return
+
+    ra, rm = [], []
+    for (d1, n1), (d2, n2) in zip(pts, pts[1:]):
+        ra.append(n2 / n1 - 1.0)
+        rm.append(spy[d2] / spy[d1] - 1.0)
+    n = len(ra)
+    mean_a, mean_m = sum(ra) / n, sum(rm) / n
+    cov = sum((a - mean_a) * (m - mean_m) for a, m in zip(ra, rm)) / n
+    var_m = sum((m - mean_m) ** 2 for m in rm) / n
+    sd_a = (sum((a - mean_a) ** 2 for a in ra) / n) ** 0.5
+    sd_m = var_m ** 0.5
+    beta = cov / var_m if var_m > 0 else None
+    corr = cov / (sd_a * sd_m) if sd_a > 0 and sd_m > 0 else None
+    r_acct = pts[-1][1] / pts[0][1] - 1.0
+    r_spy = spy[pts[-1][0]] / spy[pts[0][0]] - 1.0
+
+    out.append("period                 : {} -> {} ({} daily returns)".format(
+        pts[0][0], pts[-1][0], n))
+    out.append("account return         : {:+.2f}%".format(100 * r_acct))
+    out.append("SPY return             : {:+.2f}%".format(100 * r_spy))
+    if beta is not None:
+        alpha = r_acct - beta * r_spy
+        out.append("beta vs SPY            : {:+.2f}".format(beta))
+        out.append("correlation            : {:+.2f}".format(corr if corr is not None else 0))
+        out.append("alpha (period, CAPM)   : {:+.2f}%  (= acct return - beta * SPY return)".format(
+            100 * alpha))
+    out.append("daily vol (acct / SPY) : {:.2f}% / {:.2f}%".format(100 * sd_a, 100 * sd_m))
+    out.append("")
+    out.append("NOTE: ~20 daily points -> beta/alpha are noisy estimates; treat direction,")
+    out.append("not decimals, as the signal. NetLiq from health reports; rf assumed 0.")
+    out.append("")
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -586,9 +720,19 @@ def main():
     month_yyyymm = "20" + month.replace("_", "")
     month_label = datetime.strptime(month_yyyymm, "%Y%m").strftime("%B %Y")
 
+    def prev_month(m):
+        y, mm = int(m[:2]), int(m[3:])
+        mm -= 1
+        if mm == 0:
+            y, mm = y - 1, 12
+        return "{:02d}_{:02d}".format(y, mm)
+
     daily, snapshots, baseline_pl = load_health(month_yyyymm)
     attempts = load_attempts(month)
     signals = load_signals(month)
+    # entry-DTE lookups need opens placed before the review month
+    attempts_hist = (attempts + load_attempts(prev_month(month))
+                     + load_attempts(prev_month(prev_month(month))))
 
     out = []
     out.append("==== MONTHLY REVIEW {} (generated {}) ====".format(
@@ -603,13 +747,20 @@ def main():
     ledger = build_ledger(snapshots)
     month_start_ts = month_yyyymm + "01_000000"
     if snapshots:
-        section_ledger(out, ledger, snapshots, attempts, month_start_ts)
+        section_ledger(out, ledger, snapshots, attempts, month_start_ts, attempts_hist)
     else:
         out.append("No usable position snapshots found - skipping trade ledger.")
         out.append("")
 
     unfilled = section_funnel(out, signals, attempts, ledger, month)
-    section_opportunity(out, signals, attempts, unfilled, ledger, args.live)
+
+    ib = connect_ib(out) if args.live else None
+    try:
+        section_opportunity(out, signals, attempts, unfilled, ledger, ib)
+        section_alpha_beta(out, daily, baseline_pl, ib)
+    finally:
+        if ib is not None:
+            ib.disconnect()
 
     report = "\n".join(out)
     print(report)
