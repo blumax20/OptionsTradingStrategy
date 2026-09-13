@@ -361,6 +361,12 @@ def _clean_symbol(raw: str | None) -> str | None:
     # Keep part after a colon (drop exchange prefix like 'BATS:')
     if ':' in s:
         s = s.split(':', 1)[1].strip()
+    # Fix FL: IB spells class shares with a space ('PBR A', 'BRK B'). Convert to the dotted
+    # form FIRST so it reaches the quarantine gate in get_option_data instead of being
+    # truncated to the base ticker by the split below (which would trade a different company).
+    # Timeframe junk like 'EQH 1D' is unaffected -- '1D' is not [A-Z]{1,2}.
+    if re.match(r'^[A-Z]{1,5} [A-Z]{1,2}$', s):
+        s = s.replace(' ', '.')
     # Trim whitespace tokens like '1D' if present
     if ' ' in s:
         s = s.split()[0].strip()
@@ -933,6 +939,24 @@ def _no_usable_ask(vals: dict) -> bool:
 def get_option_data(symbol: str, width: int = 5, signal_type: str | None = None):
     # Normalize any malformed symbol (e.g., 'NWSA.', 'BATS:EQH, 1D')
     symbol = _clean_symbol(symbol)
+    # Fix FL: quarantine dotted class-share tickers (PBR.A, BRK.B). IB spells these with a
+    # space ('PBR A') and they are a DIFFERENT underlying from the base ticker -- different
+    # conId, price and option chain. Trading the base ticker instead is silently wrong, so
+    # refuse the signal outright. This is the single choke point for every signal route;
+    # all of them treat a truthy "_error" as "return 200, write no CSV row", which means no
+    # row for PlaceAnOrder/DCM to act on and therefore no order.
+    if symbol and '.' in symbol:
+        logger.warning(
+            "Fix FL: quarantined class-share ticker %r (signal_type=%s) -- not traded; "
+            "base ticker would be a different underlying", symbol, signal_type,
+        )
+        _log_reject(symbol, f"quarantined_class_share (signal_type={signal_type})")
+        return {
+            "_error": True,
+            "stage": "quarantined_class_share",
+            "detail": f"class-share ticker {symbol} is not tradeable by this system",
+            "symbol": symbol,
+        }
     ib = IB_SHARED
     stage = "connect"
     # Ensure connected and set market data type (do not early-return; we can always price theo if later pieces fail)
@@ -1528,22 +1552,25 @@ def _wait_for_fields(ticker, fields=("bid","ask","last","close"), timeout_ms=300
     return vals, waited
 
 # --- Extract a ticker from free‑form alert text (very permissive but biased to ALLCAPS tickers) ---
-_TICKER_RE = re.compile(r"\b([A-Z]{1,5})(?:\.[A-Z])?\b")
+# Fix FL: the class-share suffix must live INSIDE the capturing group. It used to be a
+# non-capturing '(?:\.[A-Z])?', so 'FILLED ON PBR.A' matched in full but group(1) was just
+# 'PBR' -- every PBR.A signal was silently traded as PBR (a different underlying).
+_TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b")
 
 def _extract_ticker_from_text(text: str | None) -> str | None:
     if not text or not isinstance(text, str):
         return None
     s = text.strip().upper()
     # fast-path: "... filled on TICKER. New strategy position is -1"
-    m_on = re.search(r"\bFILLED\s+ON\s+([A-Z]{1,5})(?:\.[A-Z])?\b", s)
+    m_on = re.search(r"\bFILLED\s+ON\s+([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b", s)
     if m_on:
         tick = _clean_symbol(m_on.group(1))
         if tick:
             return tick
     # common patterns: "on PAYX", "ticker PAYX", "symbol PAYX"
-    for pat in (r"\bon\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
-                r"\bticker\s+([A-Z]{1,5})(?:\.[A-Z])?\b",
-                r"\bsymbol\s+([A-Z]{1,5})(?:\.[A-Z])?\b"):
+    for pat in (r"\bon\s+([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b",
+                r"\bticker\s+([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b",
+                r"\bsymbol\s+([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b"):
         m = re.search(pat, s)
         if m:
             return _clean_symbol(m.group(1))

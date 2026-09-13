@@ -5997,3 +5997,77 @@ ITM-below-entry (converging) no-fire; worthless OTM dte=3 fires; already-expired
 **Impact:** OTM losers get closed at mid via risk exits (9:48/10:30) starting 10 days before
 expiration, recovering residual value; preclose escalates unfilled salvage orders same day.
 Expected first live trigger: LIN 480/475P around Sep 8 (dte=10) if still OTM and below entry.
+
+---
+
+### Fix FL: Quarantine Dotted Class-Share Tickers — PBR.A Was Silently Traded as PBR (Sep 13)
+**Status:** IMPLEMENTED (listener.py only; needs an OptionsListener restart — menu 4-2)
+
+**Location:** `InteractiveBrokersTrader/listener.py` — `_TICKER_RE` + `_extract_ticker_from_text`
+(4 regex sites, ~L1650-1668); `_clean_symbol` space-form normalization (~L364); quarantine gate at
+the top of `get_option_data` (~L1061), reusing the previously dead `_log_reject` helper (~L769).
+
+**Incident:** TradingView alerts for **PBR.A** were ingested as `symbol=PBR`. Every PBR.A signal since
+2026-08-21 opened, closed, rolled and risk-managed options on **PBR** — a different company's ADR.
+Verified live against IB: `PBR` conId 10828168, tradingClass `PBR`, last **$21.12**, 19 expiries
+(weeklies), 27 strikes $0.50 apart in 15-30; `PBR A` conId 14487364, tradingClass `PBRA`, last
+**$19.10**, 10 expiries (monthly/quarterly only), 6 strikes $2.50 apart. `Stock('PBR.A')` and
+`Stock('PBRA')` both fail IB lookup — IB's form is **`PBR A`** (space), same as `BRK B`. No option on
+a class-share underlying has ever been requested by this system.
+
+**Blast radius:** 16 `PBR` + 16 `PBR.A` alerts, all written `symbol=PBR`. `PBR.A` is the only dotted
+ticker in the entire 930-alert history (8 occurrences, 2026-08-21 to 2026-09-11).
+
+Because both streams collapse to one key, two independent strategies shared one position slot and
+latest-signal-wins arbitrated between them: `2026-09-01 16:03:56` CALL_OPEN (PBR.A) cancelled by
+`16:04:06` CLOSE (PBR) 10s later; `2026-09-02 16:05:39` CALL_OPEN (PBR) then `16:06:06` CLOSE (PBR.A).
+On `2026-09-10 17:00:16` the reconcile closed a PBR.A-originated position under `reason=close_signal`
+driven by a PBR row. The held `PBR 20261023 20.5C/21.0C` spread (opened 2026-09-03 at $0.42) came
+from a **PBR.A** buy signal. The Fix DV dedup key `(symbol, signal_type)` also collides after
+collapse, so one stream can silently swallow the other's signal (HTTP 200, no CSV row) — a logged
+`dedup PBR CALL_OPEN (40s since last)` drop exists in the history.
+
+**Root cause — two independent defects:**
+
+**FL-1** — the class suffix was matched into a **non-capturing** group while the code kept only
+`group(1)`. `re.search(r"\bFILLED\s+ON\s+([A-Z]{1,5})(?:\.[A-Z])?\b", s)` on `FILLED ON PBR.A`
+matches in full but yields `group(1)='PBR'`; `.A` is consumed and discarded. Repeated at all four
+symbol patterns (`_TICKER_RE`, the `FILLED ON` fast path, and the `on`/`ticker`/`symbol` patterns).
+Not the character class stopping at the dot, and not `_clean_symbol`'s trailing-punctuation strip.
+
+**FL-2** — `_clean_symbol`'s `if ' ' in s: s = s.split()[0]` (there to trim `EQH 1D`) also collapses
+`"PBR A"` to `"PBR"`, so both spellings of a class share were lossy via different paths.
+`PlaceAnOrder.py:117` has an identical twin (inert once the listener quarantines — no dotted symbol
+can reach a CSV).
+
+**Fix — three edits:**
+1. Suffix moved inside the capturing group at all four sites: `([A-Z]{1,5}(?:\.[A-Z]{1,2})?)`.
+2. `_clean_symbol` converts the IB space form to the dotted form **before** the space-split:
+   `if re.match(r'^[A-Z]{1,5} [A-Z]{1,2}$', s): s = s.replace(' ', '.')` — so `PBR A`/`BRK B` reach
+   the same gate instead of being truncated. `EQH 1D` is unaffected (`1D` is not `[A-Z]{1,2}`).
+3. Quarantine gate at the top of `get_option_data`, right after `symbol = _clean_symbol(symbol)`:
+   any symbol containing a dot logs a `Fix FL: quarantined` WARNING, records via `_log_reject` to
+   `<day>/rejected_webhooks.csv`, and returns `{"_error": True, "stage": "quarantined_class_share"}`.
+   `get_option_data` is the single choke point for `/webhook`, `/signal`, `/signal/text`,
+   `/webhook_batch` and `/mdtest`; all of them treat a truthy `_error` as "return HTTP 200, write no
+   CSV row", so there is no row for PlaceAnOrder/DCM to act on and no order — on every route. The
+   Fix DV dedup key is only written after a successful CSV write, so a quarantined signal cannot
+   poison the dedup dict for the genuine `PBR` stream.
+
+`_log_reject` was pre-existing **dead code** (zero callers) writing `timestamp_ny,symbol,error` to
+`<day>/rejected_webhooks.csv`; reused rather than adding a parallel helper and a second audit file.
+`signal_type` is encoded in the `error` column.
+
+**What this does NOT do:** does not make `PBR.A` tradeable (signals become visible no-ops, not silent
+PBR trades — `PBR A`'s 12-strike monthly-only chain is too thin to trade well, and real support would
+need dot/space translation at every IB contract boundary across three files); does not touch
+PlaceAnOrder / DCM / ib_close_guard or any pricing, exit, roll, reconcile or liquidity logic (all
+downstream symbol matching is already exact `.upper()` equality and was correct in isolation — it was
+only ever fed a pre-collapsed key); does not touch the held PBR spread; does not retro-relabel
+historical CSV rows.
+
+**Verification:** `ast.parse` OK. Offline replay of the real alert history: `PBR` x8 and `PBR.A` x8
+(was `PBR` x16). `_clean_symbol` regression all pass — `BATS:EQH, 1D`->EQH, `NYSE:OXY`->OXY,
+`NWSA.`->NWSA, `EQH 1D`->EQH, `PBR.A.`->PBR.A, `PBR A`->PBR.A, `BRK B`->BRK.B, `NYSE:PBR.A`->PBR.A.
+Collateral-damage scan over all **930** alerts in history: the only symbol that becomes dotted is
+`PBR.A` (8) — every other ticker parses exactly as before.
