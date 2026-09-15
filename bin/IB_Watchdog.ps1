@@ -31,6 +31,15 @@
 #          clears the clientId registry but completes before the 6:07AM watchdog check, so
 #          FAIL/RESTART are never logged. The 6:22AM listener disconnect (IBC backend auth
 #          handshake) is a reliable indicator -- flag ensures prewarm runs on next OK.
+# Fix FM:  Hard /health fail with IBGateway port UP never calls BounceServices directly.
+#          2026-09-14: Fix EY escalated to BounceServices on the 2nd in-window hard-fail,
+#          killing a HEALTHY gateway mid-signal-burst (live 2FA blackout, 5 blank CSV rows).
+#          New behavior when port is UP: in the 16:00-16:30 window tolerate the first fail
+#          (burst saturation self-clears), then restart OptionsListener only (proven 9s
+#          recovery, no 2FA). BounceServices only when the port is DOWN, or when a
+#          listener-only restart fails OUTSIDE the close window. Inside the window a failed
+#          listener restart just defers -- a freshly restarted listener can re-saturate on
+#          retried webhooks and fail the 60s poll for the wrong reason.
 # Runs every 15 min via Task Scheduler (daily 6:07AM-8:07PM).
 # Checks IB Gateway port, listener /health, and CloudflareTunnel service.
 # Tunnel-only failure: restart just CloudflareTunnel (no BounceServices).
@@ -262,26 +271,55 @@ if (-not $needFullRestart) {
         Write-Log "FAIL: /health did not return HTTP 200 (Listener DOWN or unhealthy)"
         # Fix EY: Between 16:00-16:30 ET the close webhook burst can starve the
         # single-threaded listener so /health times out even though it is healthy.
-        # In that window, with the IBGateway port still UP, require 2 consecutive
-        # hard-fails before BounceServices (which kills IBGateway and forces a
-        # live-account 2FA). Outside the window, or if the port is DOWN, keep the
-        # original immediate behavior.
+        # Fix FM: with the IBGateway port still UP the gateway is fine (DS2 philosophy) --
+        # never BounceServices it for a listener health failure. In the close window,
+        # tolerate the first fail entirely (saturation self-clears; NSSM auto-restarts a
+        # truly crashed listener within seconds). On the 2nd consecutive in-window fail,
+        # or any out-of-window fail with port UP, restart OptionsListener only (proven
+        # 2026-09-14 16:54: 9s recovery, no 2FA). Escalate to BounceServices only when a
+        # listener-only restart fails OUTSIDE the window; inside the window a failed poll
+        # can just mean the restarted listener re-saturated on retried webhooks, so defer.
         $nowEy = Get-Date
         $inCloseWindow = ($nowEy.Hour -eq 16 -and $nowEy.Minute -lt 30)
-        if ($inCloseWindow -and $gw) {
+        if ($gw) {
             $eyRecent = $false
             if (Test-Path $HealthFailFlag) {
                 $eyAge = ((Get-Date) - (Get-Item $HealthFailFlag).LastWriteTime).TotalMinutes
                 if ($eyAge -lt 20) { $eyRecent = $true }
             }
-            if ($eyRecent) {
-                Write-Log "HARD-FAIL (2nd consecutive) in 16:00-16:30 window, port UP -- escalating to BounceServices"
-                Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
-                $needFullRestart = $true
-            } else {
+            if ($inCloseWindow -and -not $eyRecent) {
                 Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $HealthFailFlag -Encoding ASCII
                 Write-Log "HARD-FAIL: /health down in 16:00-16:30 window but port UP -- deferring one cycle (possible close-burst saturation)"
                 exit 0
+            }
+            Write-Log "HARD-FAIL: port $IB_GW_PORT UP -- restarting OptionsListener only (no IBGateway kill)"
+            try {
+                Start-Process -FilePath cmd.exe `
+                    -ArgumentList '/c', 'C:\OptionsHistory\bin\RestartListener.cmd' `
+                    -WorkingDirectory 'C:\OptionsHistory\bin' -Wait -NoNewWindow
+            } catch {
+                Write-Log "HARD-FAIL ERROR: RestartListener.cmd failed: $_"
+            }
+            $fmRecovered = $false
+            for ($fmI = 0; $fmI -lt 12; $fmI++) {
+                Start-Sleep -Seconds 5
+                try {
+                    $fmResp = Invoke-WebRequest -Uri $HealthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                    if ($fmResp.StatusCode -eq 200) { $fmRecovered = $true; break }
+                } catch {}
+            }
+            if ($fmRecovered) {
+                Write-Log "RECOVERED: listener healthy after RestartListener -- no 2FA needed"
+                Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
+                $httpOk = $true
+            } elseif ($inCloseWindow) {
+                Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $HealthFailFlag -Encoding ASCII
+                Write-Log "HARD-FAIL: listener still unhealthy after restart -- deferring (in close window; no BounceServices while port UP)"
+                exit 0
+            } else {
+                Write-Log "HARD-FAIL: listener still unhealthy after restart -- escalating to BounceServices"
+                Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue
+                $needFullRestart = $true
             }
         } else {
             Remove-Item $HealthFailFlag -ErrorAction SilentlyContinue

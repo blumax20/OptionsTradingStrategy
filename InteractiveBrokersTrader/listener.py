@@ -1666,7 +1666,13 @@ def webhook():
             "detail": msg
         }), 200
     _append_listener_result_to_csv(result, sig)
-    _RECENT_SIGNAL_TIMES[_dv_key] = _dv_now  # Fix DV: mark seen only after successful CSV write
+    # Fix FM-2: a theo-only row (IB was unreachable -- no price, no strikes) still
+    # preserves the signal for the reconcile, but must NOT claim the dedup key:
+    # the strategy/TradingView retry ~45-60s later deserves a chance to write a
+    # full row once IB is back (drop_duplicates keep="last" then prefers it).
+    # 2026-09-14: BCS's CLOSE retry was swallowed by the dedup after a blank row.
+    if not result.get("_theo_only"):
+        _RECENT_SIGNAL_TIMES[_dv_key] = _dv_now  # Fix DV: mark seen only after successful CSV write
     if sig:
         result.update({
             "signal_side": sig.get("signal_side"),

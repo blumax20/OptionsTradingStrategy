@@ -6071,3 +6071,68 @@ historical CSV rows.
 `NWSA.`->NWSA, `EQH 1D`->EQH, `PBR.A.`->PBR.A, `PBR A`->PBR.A, `BRK B`->BRK.B, `NYSE:PBR.A`->PBR.A.
 Collateral-damage scan over all **930** alerts in history: the only symbol that becomes dotted is
 `PBR.A` (8) — every other ticker parses exactly as before.
+
+---
+
+### Fix FM: Never BounceServices While the Gateway Port Is UP + Degraded-Row Dedup Skip + 17:00 CSV Self-Repair (Sep 15)
+**Status:** IMPLEMENTED (DCM + listener committed; both `IB_Watchdog.ps1` copies updated, repo synced byte-for-byte)
+
+**Incident (Mon 2026-09-14):** The 4 PM close-burst starved the single-threaded listener's `/health`
+at both the 16:07 and 16:22 watchdog checks. Fix EY's rule (defer once, then escalate) fired
+`BounceServices.cmd` at 16:22:11 — killing a **healthy** IBGateway (port 7496 was UP throughout) in
+the middle of the signal burst. On the live account the restart demanded 2FA; the user was in a
+meeting until ~16:45, so the gateway was dark ~16:23–16:50. Downstream of that one decision: 5
+signals (BCS, PUK, T, OTF, CWEN) hit `IB connect failed` and were written as **blank CSV rows** (no
+price/strikes, placeholder 60-DTE expiry); BCS's CLOSE retry webhook 45s later was swallowed by the
+Fix DV dedup (the blank row had claimed the key); the 16:45 `--afterhours-enrich` (Fix FE) died at
+exit 1 on the same outage with no retry; PUK's PUT_OPEN was skipped `no_viable_limit_or_conditions`
+at 17:00. BCS's close survived only because IB was back by 17:00 and the force-close live-mid
+fallback (Fix CE) priced it at $0.45 (vs $0.40 portfolio mark — a good price; the escalation chain
+`close_signal` → `_try_close_from_positions` no-CSV-limit fail → PlaceAnOrder force-close worked as
+designed, which is why the attempts CSV shows `force_close,placed,success` then
+`close,placed,close_signal_force_close_fallback` — ONE order, two log rows). The proof of the right
+remedy is in the same log: at 16:54 the SOFT-FAIL path did a **listener-only restart** — recovered
+in 9 seconds, no 2FA.
+
+**FM-1 (`C:\OptionsHistory\bin\IB_Watchdog.ps1` + repo `bin/IB_Watchdog.ps1`):** hard `/health`
+fail with port 7496 UP never calls BounceServices directly (extends the Fix DS2 philosophy — port
+UP means IBGateway is fine — from SOFT-FAILs to hard-fails). New flow: in the 16:00–16:30 window
+tolerate the first fail (saturation self-clears; NSSM auto-restarts a truly crashed listener); on
+the 2nd consecutive in-window fail, or any out-of-window fail with port UP, run
+`RestartListener.cmd` + 60s `/health` poll. Recovered → `RECOVERED`, continue as OK. Not recovered
+→ **in-window: defer** (a freshly restarted listener can re-saturate on retried webhooks and fail
+the poll for the wrong reason — never bounce inside the window while port is UP); **out-of-window:
+escalate to BounceServices** (last resort preserved). Port-DOWN behavior (2FA detection, prewarm,
+RESTART-IBG-ONLY) unchanged. Trade-off: a genuinely wedged listener during the window now escalates
+at ~16:37 instead of 16:22 (bounded ~15-30 min) vs the demonstrated cost of a live 2FA blackout +
+lost signal data. ASCII-only; parse-checked; deployed copy is authoritative, repo copy synced.
+
+**FM-2 (`listener.py`, webhook route ~L1793):** a `_theo_only` row (both such return sites are the
+fully-blank `current_price is None` case) still writes the CSV row — the signal record is
+load-bearing for the reconcile (it drove BCS's close decision) — but no longer claims the Fix DV
+dedup key: `if not result.get("_theo_only"): _RECENT_SIGNAL_TIMES[_dv_key] = _dv_now`. A retry
+webhook <60s later is reprocessed; a successful retry appends a richer row which
+`drop_duplicates(keep="last")` (PlaceAnOrder) and newest-row-wins (reconcile) already prefer; a
+failed retry appends another blank row (harmless). Deployed via OptionsListener restart.
+
+**FM-3 (`DailyCycleManagement.py`, `_after_hours_batch_placement` prelude ~L2975):** the 17:00
+batch now repairs today's CSV when the 16:45 enrichment missed. If any row has blank
+`current_price` AND `atm_strike`, re-run the same two steps the `--afterhours-enrich` handler uses:
+`_populate_missing_strikes_for_folder(today)` then `_run_liquidity_filter_for_folder(today,
+only_rth=False)`. Runs before the Fix EO STK-flatten and open/close delegation so everything
+downstream sees the repaired CSV. Normal days pay one CSV read and skip (log line absent). Primary
+beneficiary: OPEN rows (PUK-type places the same evening instead of waiting for the 10:00 Fix CP
+retry); CLOSE rows gain a usable theo for the direct path, with Fix AF1 strike-validation still
+guarding against a mispriced hypothetical row.
+
+**What this does NOT do:** no change to the close pricing chain (it worked); no listener
+threading/async rework (deferred in Fix EY, still deferred); no fix for the margin wall (Equity
+with Loan Value −$53.17 rejecting all opens with Error 201 — funding, not code); no change to
+port-DOWN watchdog paths or the cooldown.
+
+**Verification:** watchdog `Parser::ParseFile` clean, pure ASCII, deployed==repo (`cmp`);
+`py_compile` clean on listener + DCM; FM-3 detection dry-run flags 5 rows on `26_09_14` and 0 on
+`26_09_11`; listener restarted (health 200) so FM-2 is live; watchdog end-to-end smoke run on the
+healthy system logs `OK`. Live confirmation next `/health` hard-fail: watchdog.log shows
+`HARD-FAIL: port 7496 UP -- restarting OptionsListener only (no IBGateway kill)` then `RECOVERED`
+— and no `RESTART: calling BounceServices` while the port is up.

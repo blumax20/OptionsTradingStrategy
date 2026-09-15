@@ -2972,6 +2972,33 @@ class DailyCycleManagementMixin:
         except Exception as e:
             LOG.warning("Fix FH: seeding submitted-close set failed (continuing): %s", e)
 
+        # Fix FM-3: repair today's CSV when the 16:45 enrichment missed. On 2026-09-14 the
+        # listener wrote 5 blank rows (IB down mid-burst) and the 16:45 --afterhours-enrich
+        # died on the same outage with no retry, so the 17:00 batch priced from blanks
+        # (PUK's OPEN was skipped no_viable_limit_or_conditions). If any row still has no
+        # current_price/atm_strike, re-run the same two steps the 16:45 handler uses --
+        # strike snap (Fix CP-A/FG) then enrichment (Fix FE frozen bid/ask + FI theo).
+        # Normal days pay one CSV read and skip (no IB traffic).
+        try:
+            _fm_today = self._now_ny().strftime("%y_%m_%d")
+            _fm_csv = fr"C:\OptionsHistory\{_fm_today}\combined_listener_spreads.csv"
+            _fm_unpriced = 0
+            if os.path.exists(_fm_csv):
+                with open(_fm_csv, "r", encoding="utf-8", newline="") as _fm_f:
+                    for _fm_row in csv.DictReader(_fm_f):
+                        if (not (_fm_row.get("current_price") or "").strip()
+                                and not (_fm_row.get("atm_strike") or "").strip()):
+                            _fm_unpriced += 1
+            if _fm_unpriced:
+                LOG.info("Fix FM-3: %d unpriced row(s) in today's CSV -- re-running strike snap + enrichment", _fm_unpriced)
+                try:
+                    self._populate_missing_strikes_for_folder(_fm_today)
+                except Exception as _fm_ps_err:
+                    LOG.warning("Fix FM-3: strike population failed (%s); proceeding to enrich", _fm_ps_err)
+                self._run_liquidity_filter_for_folder(_fm_today, only_rth=False)
+        except Exception as e:
+            LOG.warning("Fix FM-3: CSV repair pass failed (continuing): %s", e)
+
         # Fix EO: signal-driven STK-residual flatten. Runs BEFORE OPT logic so the
         # MKT SELLs don't race with OPT-close paths. Assignment/exercise leaves 100
         # STK shares behind after the OPT leg clears; the OPT-only close paths never
