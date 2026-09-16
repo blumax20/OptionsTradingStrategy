@@ -1622,7 +1622,9 @@ class DailyCycleManagementMixin:
                 # Fix CX: buckets now include "10"; a width NOT within 0.6 of any bucket
                 # (e.g. $7.5, $15) returns None so the caller defers to live/portfolio pricing
                 # instead of mis-snapping a wide spread to a narrower bucket (AXP $10-as-$5 undersell).
-                _buckets = [("1", 1.0), ("2_5", 2.5), ("5", 5.0), ("10", 10.0)]
+                # Fix FN: added the "0_5" bucket — $0.50 used to snap to "1" and price a
+                # 0.5-wide spread with the $1-wide theo (PBR 20.5/21.0 closed at $0.54 > width).
+                _buckets = [("0_5", 0.5), ("1", 1.0), ("2_5", 2.5), ("5", 5.0), ("10", 10.0)]
                 bucket, _bval = min(_buckets, key=lambda t: abs(width - t[1]))
                 if abs(width - _bval) > 0.6:
                     LOG.info("direct-close: width=%.2f not within 0.6 of any bucket (nearest %s); "
@@ -1644,6 +1646,16 @@ class DailyCycleManagementMixin:
                                 if v > 0:
                                     # Apply 5% buffer for initial close (10% applied in preclose if unfilled)
                                     buffered = round(v * 0.95, 2)
+                                    # Fix FN: cap at the spread's own width — a debit spread can
+                                    # never be worth more than its max payoff, so a limit above
+                                    # the width is unfillable (mirrors Fix X4 in PlaceAnOrder's
+                                    # width_aligned_close_limit, which DCM's path never had).
+                                    if width and width > 0:
+                                        _capped = min(buffered, round(float(width), 2))
+                                        if _capped != buffered:
+                                            LOG.info("direct-close: Fix FN capped %s %s limit %.2f -> %.2f (width=%.2f)",
+                                                     up, right, buffered, _capped, float(width))
+                                        buffered = _capped
                                     LOG.info("direct-close: applying 5%% buffer for %s %s: raw=%.2f, buffered=%.2f (col %s)", up, right, v, buffered, col)
                                     return buffered
                         except Exception as ex:

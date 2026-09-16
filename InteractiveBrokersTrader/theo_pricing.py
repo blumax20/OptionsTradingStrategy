@@ -31,7 +31,7 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool =
 
 def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
                         sigma_otm: float | None = None,
-                        r: float = 0.045, widths=(1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:
+                        r: float = 0.045, widths=(0.5, 1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:  # Fix FN: $0.5 bucket
     """Calculate theoretical debit spread prices using Black-Scholes.
 
     Args:
@@ -47,7 +47,8 @@ def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
         call_short = _bs_price(S, atm + W, T, r, sigma_otm, call=True)
         put_long  = _bs_price(S, atm, T, r, sigma_atm, call=False)
         put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma_otm, call=False)
-        key = "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
+        # Fix FN: "0_5" for W=0.5 (str(int(0.5)) would give "0")
+        key = "0_5" if abs(W - 0.5) < 1e-9 else "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
         # Fix Y2b: clamp to >= 0 (debit spread value cannot be negative)
         # Fix CY: clamp to <= 0.75*W (no-arbitrage + conservative cap; skewed IV can exceed width)
         out[f"call_debit_theo_{key}"] = min(0.75 * W, max(0.0, float(call_long - call_short)))

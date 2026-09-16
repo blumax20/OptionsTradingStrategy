@@ -490,7 +490,7 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, call: bool =
 
 def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
                         sigma_otm: float | None = None,
-                        r: float = 0.045, widths=(1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:
+                        r: float = 0.045, widths=(0.5, 1.0, 2.5, 5.0, 10.0)) -> Dict[str, float]:  # Fix FN: $0.5 bucket
     """Calculate theoretical debit spread prices using Black-Scholes.
 
     Args:
@@ -506,7 +506,8 @@ def _theo_spread_debits(S: float, atm: float, T: float, sigma_atm: float,
         call_short = _bs_price(S, atm + W, T, r, sigma_otm, call=True)
         put_long  = _bs_price(S, atm, T, r, sigma_atm, call=False)
         put_short = _bs_price(S, max(atm - W, 0.01), T, r, sigma_otm, call=False)
-        key = "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
+        # Fix FN: "0_5" for W=0.5 (str(int(0.5)) would give "0")
+        key = "0_5" if abs(W - 0.5) < 1e-9 else "2_5" if abs(W - 2.5) < 1e-9 else str(int(W))
         # Fix Y2b: clamp to >= 0 (debit spread value cannot be negative)
         # Fix CY: clamp to <= 0.75*W (no-arbitrage + conservative cap; skewed IV can exceed width)
         out[f"call_debit_theo_{key}"] = min(0.75 * W, max(0.0, float(call_long - call_short)))
@@ -728,10 +729,12 @@ def _append_csv_row(row: dict):
         "timestamp_ny","symbol","current_price","expiration","days_to_exp",
         "atm_strike","otm_strike_call","otm_strike_put","iv_atm","iv_otm",
         "call_debit_limit","put_debit_limit",
+        "call_debit_limit_0_5","put_debit_limit_0_5",  # Fix FN: $0.50 width bucket
         "call_debit_limit_1","put_debit_limit_1",
         "call_debit_limit_2_5","put_debit_limit_2_5",
         "call_debit_limit_5","put_debit_limit_5",
         "call_debit_limit_10","put_debit_limit_10",    # Fix CX: $10 width bucket
+        "call_debit_theo_0_5","put_debit_theo_0_5",     # Fix FN: $0.50 width bucket
         "call_debit_theo_1","put_debit_theo_1",
         "call_debit_theo_2_5","put_debit_theo_2_5",
         "call_debit_theo_5","put_debit_theo_5",
@@ -742,8 +745,23 @@ def _append_csv_row(row: dict):
         "signal_side","signal_type","strategy_position","raw_message"
     ]
     write_header = not out_csv.exists()
+    # Fix FN: adopt the existing file's header when appending (same pattern as DCM's
+    # _AttemptLogger._write_row, Fix EZ). A schema change deployed mid-day would otherwise
+    # write rows in the NEW field order under the file's OLD header — misaligning every
+    # column after the insertion point. Columns the old header lacks are dropped for the
+    # rest of that day (extrasaction="ignore"); tomorrow's fresh CSV gets the full schema.
+    if not write_header:
+        try:
+            with out_csv.open("r", newline="") as _hf:
+                _existing = next(csv.reader(_hf), None)
+            if _existing and _existing != headers:
+                logger.info("[CSV] existing header has %d cols vs %d in schema; "
+                            "adopting file header for this append", len(_existing), len(headers))
+                headers = _existing
+        except Exception as _he:
+            logger.warning(f"[CSV] could not read existing header ({_he}); using schema order")
     with out_csv.open("a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
+        w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
         if write_header:
             w.writeheader()
         # round numeric values to 2 decimals
@@ -816,7 +834,7 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         # Fix Y2a: prefer iv_otm over hardcoded 0.25 when iv_atm is missing
         sigma_atm = sigma_otm if (sigma_otm is not None and not _is_nan(sigma_otm)) else 0.25
 
-    theo = {"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None,"call_debit_theo_10": None,"put_debit_theo_10": None}  # Fix CX: $10 bucket
+    theo = {"call_debit_theo_0_5": None,"put_debit_theo_0_5": None,"call_debit_theo_1": None,"put_debit_theo_1": None,"call_debit_theo_2_5": None,"put_debit_theo_2_5": None,"call_debit_theo_5": None,"put_debit_theo_5": None,"call_debit_theo_10": None,"put_debit_theo_10": None}  # Fix CX: $10 bucket; Fix FN: $0.5 bucket
     if not _is_nan(S) and not _is_nan(atm) and (days_to_exp is not None and days_to_exp > 0):
         try:
             theo = _theo_spread_debits(float(S), float(atm), float(T), float(sigma_atm), sigma_otm=sigma_otm)
@@ -839,6 +857,8 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         # Fix X5: Limit columns reserved for live market prices (populated by
         # LiquidityFilter at 9:35 AM).  Theo columns carry Black-Scholes values.
         # PlaceAnOrder falls back to theo when limit is empty (Fix B).
+        "call_debit_limit_0_5": None,  # Fix FN: $0.50 bucket (populated by LiquidityFilter enrichment)
+        "put_debit_limit_0_5": None,
         "call_debit_limit_1": None,
         "put_debit_limit_1": None,
         "call_debit_limit_2_5": None,
@@ -847,6 +867,8 @@ def _append_listener_result_to_csv(result: dict, signal_fields: Dict[str, object
         "put_debit_limit_5": None,
         "call_debit_limit_10": None,   # Fix CX: $10 bucket (populated by LiquidityFilter enrichment)
         "put_debit_limit_10": None,
+        "call_debit_theo_0_5": (theo or {}).get("call_debit_theo_0_5"),  # Fix FN: $0.50 bucket
+        "put_debit_theo_0_5":  (theo or {}).get("put_debit_theo_0_5"),
         "call_debit_theo_1": (theo or {}).get("call_debit_theo_1"),
         "put_debit_theo_1":  (theo or {}).get("put_debit_theo_1"),
         "call_debit_theo_2_5": (theo or {}).get("call_debit_theo_2_5"),

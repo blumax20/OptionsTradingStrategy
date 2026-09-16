@@ -6136,3 +6136,103 @@ port-DOWN watchdog paths or the cooldown.
 healthy system logs `OK`. Live confirmation next `/health` hard-fail: watchdog.log shows
 `HARD-FAIL: port 7496 UP -- restarting OptionsListener only (no IBGateway kill)` then `RECOVERED`
 — and no `RESTART: calling BounceServices` while the port is up.
+
+---
+
+### Fix FN: $0.50 Width Bucket + Width Cap in DCM `_get_theo_limit` (PBR 0.5-wide closed at $0.54) (Sep 15)
+**Status:** IMPLEMENTED (listener needs a restart — menu 4-2 — for the new CSV columns)
+
+**Location:** `InteractiveBrokersTrader/theo_pricing.py` (`_theo_spread_debits` widths + key gen);
+`InteractiveBrokersTrader/listener.py` (its own `_theo_spread_debits` copy ~L612/L628, CSV header
+~L850/L858, theo init dict ~L943, row assembly ~L966/L974, **plus header-adoption in the CSV
+writer** ~L866); `InteractiveBrokersTrader/LiquidityFilter.py` (`enrich_live_spread_prices` width
+loop + `limit_cols`, FI theo-recompute loop ~L851);
+`InteractiveBrokersTrader/PlaceAnOrder.py` (`_width_bucket` ~L735, `_width_aligned_value` ~L760,
+4 OPEN fallback loops); `InteractiveBrokersTrader/DailyCycleManagement.py` (`_get_theo_limit`
+~L1625 buckets + ~L1646 cap).
+
+**Incident:** The 2026-09-15 17:00 reconcile placed **PBR SELL LMT $0.54** (order 7240) to close
+the held **CALL 20.5/21.0, exp 20261023** — a **$0.50-wide** spread. $0.54 exceeds the spread's
+$0.50 max payoff, so the order is structurally unfillable (it rested dead). True value from the
+portfolio marks in the same log: long 20.5C $2.1369 − short 21.0C $1.8370 = **$0.2999**. Entry was
+$0.43 net debit, so the position is genuinely down — but the limit was priced ~80% above fair.
+
+**Root cause — two stacked defects:**
+
+1. **No $0.50 bucket.** The CSV theo/limit columns existed only for widths 1 / 2.5 / 5 / 10.
+   `_get_theo_limit(right='C', width=0.5)` nearest-bucket-snapped 0.5 → `"1"` (within
+   `_WIDTH_BUCKET_TOL=0.6` — deliberate since Fix V), so the 0.5-wide spread was priced with the
+   **$1-wide** theo. The strikes actually being priced were **20.5 / 21.5** (`_theo_spread_debits`
+   prices ATM and ATM+W with W=1.0), not the held 20.5/21.0. `call_debit_theo_1 = 0.5698` × the
+   0.95 buffer = **$0.54**. Note the listener had selected the strikes correctly — the CSV row
+   carries `atm_strike=20.5, otm_strike_call=21.0`; only the *pricing columns* had no 0.5 bucket.
+   Same bug class as Fix CX (AXP $10-wide priced with the $5 bucket), at the narrow end.
+2. **No width cap in DCM's `_get_theo_limit`.** PlaceAnOrder's `width_aligned_close_limit()`
+   caps at the spread width (Fix X4, `min(buffered, round(width,2))`), but the reconcile's direct
+   -close path never received that guard, so an over-bucket value passed through unbounded.
+
+Impact was not close-only: any $0.50-spaced name (PBR, PFE, T) builds 0.5-wide spreads whose OPEN
+limits were also drawn from the $1 bucket — a BUY limit could exceed the spread's max value (the
+SKT/Fix CY failure mode).
+
+**Part A — width cap in `_get_theo_limit` (the guard).** After the 5% buffer, cap at the actual
+spread width (mirrors Fix X4), with a log line when it binds:
+```python
+buffered = round(v * 0.95, 2)
+if width and width > 0:
+    _capped = min(buffered, round(float(width), 2))
+    if _capped != buffered:
+        LOG.info("direct-close: Fix FN capped %s %s limit %.2f -> %.2f (width=%.2f)", ...)
+    buffered = _capped
+```
+Applies to every reconcile direct-close regardless of bucket — a structural backstop against any
+future over-bucket value, not just the 0.5 case.
+
+**Part B — `0_5` bucket end-to-end** (mirrors Fix CX's `10` pattern):
+- `theo_pricing.py` + `listener.py`: `widths` `(1,2.5,5,10)` → `(0.5,1,2.5,5,10)`; key gen extended
+  to `"0_5" if abs(W-0.5)<1e-9 else "2_5" if ... else str(int(W))` (`str(int(0.5))` would produce
+  the bogus key `"0"`). For W=0.5 the priced legs are ATM / ATM±0.5 — **exactly** the held spread
+  on $0.50-spaced names. Fix CY's `0.75*W` cap then bounds theo_0_5 at 0.375.
+- `listener.py`: `call/put_debit_limit_0_5` + `call/put_debit_theo_0_5` added to the CSV header,
+  the theo init dict, and the row assembly (limit=None at signal time per Fix X5).
+- `LiquidityFilter.py`: `(0.5,'0_5')` added to the `enrich_live_spread_prices` width loop and the
+  two `_limit_0_5` columns to `limit_cols` (old CSVs gain them via `_ensure_cols`); FI theo-
+  recompute loop `("1","2_5","5","10")` → `("0_5",...)`.
+- `PlaceAnOrder.py`: `_width_bucket` buckets gain `("0_5",0.5)` so 0.5 snaps exactly instead of to
+  `"1"` (Fix V's PFE case becomes *more* correct, not regressed); `_width_aligned_value`'s `_bv`
+  dict and `order` list gain `"0_5"`; the 4 OPEN fallback loops try `"0_5"` first.
+- `DailyCycleManagement.py`: `_get_theo_limit` `_buckets` gains `("0_5", 0.5)`. The 0.6 tolerance
+  check is unchanged — 0.5 now hits its own bucket exactly, and 7.5/15 still return None.
+
+**Back-compat is automatic:** `_width_aligned_value`'s proximity fallback means a pre-restart CSV
+with no `*_0_5` columns falls through to `"1"` — today's behavior. And in DCM, a missing `_0_5`
+column makes `_get_theo_limit` return None, which defers the close to force-close live/portfolio
+pricing (Fix CE/AM) — strictly better than the $0.54.
+
+**Part C — listener CSV writer adopts the existing header (deploy safety).** The writer used
+`csv.DictWriter(fieldnames=headers)` but only emitted a header row when the file did not exist.
+A schema change deployed **mid-day** would therefore append rows in the NEW field order under the
+file's OLD header, shifting every column after the insertion point — a silent corruption that Fix
+CX's `_10` columns had already been exposed to. The writer now reads the existing header and
+adopts it for the append (`extrasaction="ignore"`), the same pattern as DCM's `_AttemptLogger.
+_write_row` (Fix EZ). Columns the old header lacks are dropped for the remainder of that day;
+the next day's fresh CSV gets the full schema. Logs `[CSV] existing header has N cols vs M in
+schema; adopting file header for this append`.
+
+**What this does NOT change:** the Fix CY `0.75*W` theo cap semantics (uniform across buckets);
+$1/$2.5/$5/$10 pricing (verified identical); the force-close pricing chain; preclose/risk-exit/
+roll/STK-flatten flows. Today's resting PBR order 7240 is left to tomorrow's 3 PM preclose, which
+cancels it and re-places at live join (PBR's latest signal is CLOSE, so it is a close candidate
+and is not TP-shielded by Fix FF).
+
+**Verification:** `py_compile` clean on all five files. `_theo_spread_debits(21.79, 20.5, 38/365,
+0.5023, 0.5013)` — the real PBR row — returns `call_debit_theo_0_5 = **0.3005**` (vs the $0.2999
+portfolio mark, and vs `theo_1 = 0.5698`); ×0.95 → **$0.29** instead of **$0.54**. No `"0"` key
+leaks. `_width_bucket`: 0.5→"0_5", 1→"1", 2.5→"2_5", 5→"5", 10→"10", 7.5→None, 15→None, None→None.
+`_get_theo_limit` simulated on today's actual PBR CSV row: pre-restart CSV → **None** (defers to
+live pricing, no unfillable order); with a synthetic `call_debit_theo_0_5=0.3005` → **0.29**; with
+a synthetic over-width 0.90 → **capped to 0.50** (Part A in isolation); 1/2.5/5/10 unchanged at
+0.54/1.15/1.72/2.03. Part C: mid-day schema-change append verified aligned (without it, row 2
+reads `a=4 b=99 c=5` — every column shifted). Live: after the listener restart, the next
+$0.50-spaced signal's CSV row carries a populated `*_debit_theo_0_5`, the 9:45 AM enrichment fills
+`*_debit_limit_0_5`, and any reconcile close of a 0.5-wide spread logs a limit ≤ $0.50.
