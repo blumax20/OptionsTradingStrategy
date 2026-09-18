@@ -6236,3 +6236,117 @@ a synthetic over-width 0.90 → **capped to 0.50** (Part A in isolation); 1/2.5/
 reads `a=4 b=99 c=5` — every column shifted). Live: after the listener restart, the next
 $0.50-spaced signal's CSV row carries a populated `*_debit_theo_0_5`, the 9:45 AM enrichment fills
 `*_debit_limit_0_5`, and any reconcile close of a 0.5-wide spread logs a limit ≤ $0.50.
+
+---
+
+### Fix FO: Daily 06:00 Gateway Restart Never Reaches the 2FA Prompt (`/Inline` Arg in the Wrong Position) (Sep 18)
+**Status:** IMPLEMENTED (config.ini + watchdog live; **wrapper staged as `run_gateway_service.cmd.new`, needs a service restart to deploy**)
+
+**Incident.** User: *"2FA wasn't working until I started the RDP this morning."* Repeated 2FA pushes
+are normally fine — a push expires after ~1 min and the newest one is answered. This time **no push
+arrived at all** for 2h15m on a live account, 75 minutes before the open.
+
+At `06:00:01` IBC's `AutoRestartTime=06:00 AM` tore the session down. From then until `08:15:26`
+NSSM cold-restarted IBGateway **103 times, every ~71 s** (Service Control Manager `paused`/`running`
+pairs). That period is `LoginDialogDisplayTimeout=60` + ~4 s JVM start: IBC waits 60 s for the login
+dialog, it never appears, IBC exits, NSSM restarts 7 s later (`AppExit Default=Restart`,
+`AppRestartDelay=5000`). Every cycle died at the *login dialog* stage — **before**
+`Second Factor Authentication initiated` — which is precisely why no push was ever sent. Confirmed
+independently by the Gateway's own per-session encrypted logs
+(`C:\Jts\pchfae...\ibgateway.<date>.<time>.ibgzenc`, one per **authenticated** session): **none
+exists anywhere in the 06:00 → 08:15 window**, and that day's IBC weekday log holds only the final
+08:15 session (~19 KB), i.e. the 103 failed cycles wrote nothing at all.
+
+**Chronic, and roughly a coin flip** — gap from the 06:00 teardown to the next authenticated session:
+09-12 **9 s** (2 cycles) | 09-13 7 h (**385**) | 09-14 31 m (44) | 09-15 28 m (35) |
+09-16 **95 s** (10) | 09-17 3 h (**146**) | 09-18 2 h 15 m (**103**).
+
+**Root cause (primary) — `/Inline` is passed as `%6`, not `%1`.** `StartGateway.bat` tests
+`if /I "%~1" == "/INLINE"`. The wrapper called
+`StartGateway.bat 1037 /TwsPath:... /Config:... /Mode:live /Inline`, so `%1` was `1037`, the test
+**failed**, and StartGateway took its `else` branch:
+`start "%TITLE%" "%IBC_PATH%\scripts\DisplayBannerAndLaunch.bat" %~1` — launching IBC **detached in a
+separate `cmd /K` window**. Proven live from the process tree:
+`nssm → cmd /c run_gateway_service.cmd → cmd /K DisplayBannerAndLaunch.bat 1037 → java.exe`
+(`/K` only ever comes from the `start` branch). Under NSSM (session 0, `AppNoConsole=1`) that
+detached window frequently never produces the login dialog. StartGateway.bat's own header says
+*"If you are using Task Scheduler to run this, you MUST supply the INLINE argument to ensure correct
+operation."* Every other argument is ignored — version and paths come from its own `set` block — and
+`%~1` reaches only `:SetScreenColors`, where `1037` matches neither `/COLOR` nor `/COLOR:` and is
+discarded. So `/Inline` alone is correct and sufficient.
+
+**Root cause (secondary) — the wrapper aborts the Gateway's own in-place restart.** `:HOLDLOOP`
+exited ~1 s after the API port vanished (`if not defined _alive goto END`). The in-place daily
+restart drops the port as its *first* act — SCM shows `paused` at `06:00:01`, the same second as
+IBC's `Restart in progress` — so the wrapper exited, NSSM restarted the service and killed the
+process tree, aborting that restart one second in. This is why the `autorestart` token is never
+regenerated (absent everywhere under `C:\Jts`; IBC logs
+`autorestart file not found: full authentication will be required` on every session), which is in
+turn why a full interactive login is needed at all.
+
+**Confirmation that nothing else is wrong:** an unrelated one-cycle restart at `10:06:50` the same
+day recovered by itself — dialog in **7.8 s**, `Second Factor Authentication initiated` at
+`10:07:09`, closed at `10:07:11` (**2 s, automatic via IB Key**), `Login has completed` `10:07:19`.
+When the dialog renders, everything downstream is automatic and fast.
+
+**Fix FO-1a (primary, `C:\IBC\run_gateway_service.cmd`):** call `StartGateway.bat /Inline` so IBC
+runs **inline in the service process** — no `start`, no detached `cmd /K`, no session-0 window
+creation.
+
+**Fix FO-1b (same file):** `:HOLDLOOP` now tolerates a `GRACE=180` s port outage before exiting,
+resetting its counter whenever the port returns, so the Gateway's in-place restart can finish and
+regenerate the token. Restructured into flat `:HOLD_ALIVE` / `:HOLD_WAIT` / `:HOLD_GONE` labels
+(no nested parens with delayed expansion). NSSM still recovers a genuine crash, 180 s later instead
+of instantly.
+
+**Fix FO-2 (`C:\IBC\config.ini`):** `LoginDialogDisplayTimeout` **60 → 300** so a slow dialog is not
+killed before IBC can initiate 2FA. Backup: `config.ini.bak-fixfo-<stamp>`.
+
+**Fix FO-3 (same wrapper):** snapshot the IBC weekday log to
+`C:\IBC\logs\sessions\<name>-<yyyyMMdd_HHmmss>.txt` before each launch, pruned to the newest 200.
+`DisplayBannerAndLaunch.bat` deletes that log whenever it predates today, so a restart loop destroys
+its own evidence — the only reason the last link (*why* the dialog does not render) is still
+unproven.
+
+**Fix FO-4 (`IB_Watchdog.ps1`, both copies, log-only per user):**
+- **(a) Flap detection** — count SCM transitions for IBGateway in the last 15 min; at `>= 6` log
+  `FLAP: IBGateway cycled N times in 15min -- cold-start loop, login dialog never appears so no 2FA
+  prompt is reached` and suppress the misleading `FAIL (2FA): ... login manually` (the watchdog
+  samples every 15 min while the service oscillates every 71 s, so it told the user to answer a
+  prompt that did not exist for 2h15m). Wrapped in try/catch → degrades to pre-FO behaviour.
+- **(b) Missing token** — Fix EE only handled a **0-byte** `autorestart`; absent-entirely was silent.
+  Now logs `NOTE: autorestart token absent under C:\Jts`. Detection only — the token must be
+  regenerated by the Gateway, never written by hand.
+- **(c) Unreachable Fix DS3 timer** — the Fix EB branch reset the 3-min countdown whenever the IBC
+  log was newer than the prewarm flag; during a flap IBC rewrites that log every ~71 s, so it is
+  *always* newer and `$flagAge -gt 3` could never fire (the `reset 3-min timer` spam on 09-17/18).
+  Now skipped while flapping; unchanged otherwise.
+- **(d)** Removed the lone em-dash on line 72 — the file had **3 non-ASCII bytes**, exactly the
+  PS 5.1 hazard Fix CV documented. Now pure ASCII.
+
+**What this does NOT change:** `AutoRestartTime` stays 06:00 (IBKR mandates a daily restart, Fix EE;
+06:00 leaves 3.5 h before the open). NSSM `AppExit`/`AppRestartDelay` untouched — the user wants
+restart attempts to keep coming, and the watchdog only runs 06:07-20:07 so NSSM must stay the
+overnight restarter. `TWOFA_TIMEOUT_ACTION=exit` in `StartGateway.bat` left as-is
+(documented-correct when an external mechanism restarts IBC). No Health banner or external alert
+(declined). No BounceServices behaviour change; the Fix EY/FM close-window path is untouched.
+
+**Deploy note.** `config.ini` and the watchdog are live now. The wrapper is staged as
+`C:\IBC\run_gateway_service.cmd.new` and **deliberately not swapped in**: `cmd.exe` is executing
+`run_gateway_service.cmd` continuously (its `:HOLDLOOP` re-reads the file every ~2 s), so editing it
+in place under a live `goto` loop can send cmd to a garbage offset and drop the Gateway. Deploy with
+the service stopped, when 2FA can be answered:
+`nssm stop IBGateway` → `copy /y run_gateway_service.cmd.new run_gateway_service.cmd` →
+`nssm start IBGateway`.
+
+**Verification.** Batch logic unit-tested in isolation (`C:\Temp\fotest`): snapshot copies only the
+newest IBC log with a correct zero-padded `STAMP`; grace holds at 178 s and fires at exactly 180 s;
+a simulated 4 s port blip logged `port returned after 4s grace`, reset the counter and **kept the
+wrapper alive**, then a permanent outage exited cleanly via `:END` → `wrapper end (success)`.
+Watchdog `ParseFile` OK (2256 tokens), pure ASCII, deployed == repo by sha256. Flap counter replayed
+against real event-log windows: 06:00-06:15 that day → **26, flapping=True**; healthy → 0/False.
+Token-absent check fires correctly. The real test is the next 06:00: expect either an
+`ibgateway.<date>.0600xx.ibgzenc` within ~60 s (token path restored, no 2FA), or a cold start that
+now reaches `Second Factor Authentication initiated` and sends a push; if it still fails,
+`watchdog.log` shows `FLAP:` and `C:\IBC\logs\sessions\` holds the per-cycle IBC logs that finally
+show what blocks the dialog.
