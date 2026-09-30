@@ -2,6 +2,7 @@ from ib_insync import IB, Option, LimitOrder, MarketOrder
 from ib_insync.contract import ComboLeg, Contract
 from ib_close_guard import has_working_auto_close
 from ib_config import IB_HOST, IB_PORT
+from theo_pricing import spread_pop  # POP Gate (Sep 2026)
 import logging
 from ib_insync import util as _ibutil
 import pandas as pd
@@ -411,7 +412,8 @@ ATTEMPT_FIELDS = [
     "order_type","order_action","qty","order_id","prev_status",
     "raw_theo","oi_atm","oi_otm","threshold",
     "close_reason",  # Fix Z5: TP/SL reason from DCM risk exits
-    "source","uid",  # Fix EZ: canonical superset shared with DCM _AttemptLogger (24 cols)
+    "pop",  # POP Gate (Sep 2026): model probability-of-profit at entry (blank when uncomputable)
+    "source","uid",  # Fix EZ: canonical superset shared with DCM _AttemptLogger (25 cols)
 ]
 
 # Fix Z5: Module-level close reason, set from --close-reason CLI arg
@@ -547,6 +549,56 @@ def _ba_desc(row: pd.Series, right: str) -> str:
             return "blank"
     return f"{_fmt(v1)}/{_fmt(v2)}"
 
+
+def _pop_at_entry(row: pd.Series, right: str, longK, limit) -> float | None:
+    """POP Gate (Sep 2026): model probability-of-profit for the spread about to be sent.
+
+    Uses the ACTUAL limit being submitted (not the CSV theo), which is why this is
+    evaluated at order time rather than signal time: POP depends on the debit paid.
+    S / T / sigma come from the signal row; sigma prefers iv_atm and falls back to
+    iv_otm (same precedence as _theo_spread_debits' sigma_atm).
+
+    Returns None when any input is missing or unusable -> the caller fails OPEN.
+    """
+    try:
+        S = pd.to_numeric(row.get("current_price"), errors="coerce")
+        dte = pd.to_numeric(row.get("days_to_exp"), errors="coerce")
+        iv = pd.to_numeric(row.get("iv_atm"), errors="coerce")
+        if iv is None or iv != iv or float(iv) <= 0:
+            iv = pd.to_numeric(row.get("iv_otm"), errors="coerce")
+        if S is None or S != S or dte is None or dte != dte or iv is None or iv != iv:
+            return None
+        if longK is None or limit is None:
+            return None
+        return spread_pop(float(S), float(longK), float(limit),
+                          float(dte) / 365.0, float(iv), right)
+    except Exception:
+        return None
+
+
+def _pop_ok(row: pd.Series, right: str, longK, limit, pop_min: float,
+            fail_open: bool = True) -> bool:
+    """POP Gate: True when model POP at entry >= pop_min.
+
+    fail_open=True (the default and the only caller today): an uncomputable POP
+    passes. Rationale from the Jul-Sep review -- 11 of 64 closed trades had no
+    computable POP, so failing closed would silently suppress ~17% of trading on a
+    data gap. Same reasoning as _ba_ok's after-hours fail-open.
+    """
+    pop = _pop_at_entry(row, right, longK, limit)
+    if pop is None:
+        return fail_open
+    return pop >= float(pop_min)
+
+
+def _pop_desc(row: pd.Series, right: str, longK, limit) -> str:
+    """Compact POP string for logging / the attempts CSV reason ("0.38", "blank")."""
+    pop = _pop_at_entry(row, right, longK, limit)
+    if pop is None:
+        return "blank"
+    return f"{pop:.2f}"
+
+
 def vprint(enabled: bool, msg: str):
     if enabled:
         logger.info(msg)
@@ -594,6 +646,10 @@ def parse_args():
                    help="Fix FB: when to enforce the bid-ask %% gate for OPEN orders: 'off', 'afterhours' (only when NOT 09:30-16:00 NY), or 'always'.")
     p.add_argument("--ba-pct-threshold", type=float, default=30.0,
                    help="Fix FB: skip an OPEN if either leg's bid-ask %% (of mid) is > this (<= places). Default 30.")
+    p.add_argument("--pop-check", choices=["off","on"], default="on",
+                   help="POP Gate: when to enforce the model probability-of-profit gate for OPEN orders: 'off' or 'on' (default).")
+    p.add_argument("--pop-min", type=float, default=0.40,
+                   help="POP Gate: skip an OPEN whose model POP at entry is < this (0-1 scale). Default 0.40.")
     p.add_argument("--fallback-individual-legs", action="store_true",
                    help="If combo close fails/rejects, fallback to closing individual legs with market value >= min-limit.")
     p.add_argument("--allow-market-fallback", action="store_true", default=False,
@@ -1145,6 +1201,7 @@ def place_debit_spread(
     order_type: str = "LMT",
     role: str | None = None,
     skip_close_guard: bool = False,  # Fix CI: bypass symbol-only guard for multi-expiration scenarios
+    pop: str | None = None,  # POP Gate (Sep 2026): model POP at entry, recorded on the attempts row
 ):
     """
     Place a vertical spread (combo BAG).
@@ -1380,6 +1437,7 @@ def place_debit_spread(
                     limit=actual_limit,
                     qty=int(quantity),
                     order_action=action.upper(),
+                    pop=(pop if pop is not None else ""),  # POP Gate (Sep 2026)
                 )
             except Exception as _bw_write_err:
                 logger.warning("Fix BW: record_attempt write failed for %s: %s", symbol, _bw_write_err)
@@ -4158,16 +4216,29 @@ def run_from_csv():
                         chosen_open_limit = enforce_min_limit(live_open_limit)
                     elif theo_call is not None:
                         chosen_open_limit = theo_call
+                # POP Gate (Sep 2026): evaluated here because it needs the ACTUAL
+                # limit about to be submitted, not the CSV theo. Fails OPEN when POP
+                # is uncomputable (missing price/DTE/IV) so a data gap never mass-skips.
+                if chosen_open_limit is not None and args.pop_check == "on":
+                    _pop_s = _pop_desc(row, 'C', atm, chosen_open_limit)
+                    if not _pop_ok(row, 'C', atm, chosen_open_limit, args.pop_min, fail_open=True):
+                        logger.info(f"[{symbol}] CALL_OPEN skipped: POP {_pop_s} < {args.pop_min}")
+                        record_attempt(symbol, "open_call", "skipped", f"pop_below_min:pop={_pop_s}",
+                                       exp=expiration, right='C', atm=float(atm), oth=float(k_call),
+                                       limit=chosen_open_limit, pop=_pop_s)
+                        chosen_open_limit = None
+                    else:
+                        vprint(args.verbose, f"[{symbol}] CALL_OPEN POP {_pop_s} >= {args.pop_min}; placing")
                 if chosen_open_limit is not None:
                     vprint(args.verbose, f"[{symbol}] CALL OPEN theo {atm}/{k_call} exp {expiration} @ {chosen_open_limit}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] CALL OPEN theo {symbol} {atm}/{k_call} exp {expiration} @ {chosen_open_limit} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyC); placed += 1
                         record_attempt(symbol, "open_call", "placed", "success",
-                                       exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit)
+                                       exp=expiration, atm=float(atm), oth=float(k_call), limit=chosen_open_limit, pop=_pop_desc(row, 'C', atm, chosen_open_limit))
                         OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                     else:
-                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
+                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity, pop=_pop_desc(row, 'C', atm, chosen_open_limit))
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyC); placed += 1; attempted = True
                             # Fix AA2: record_attempt already called inside place_debit_spread()
@@ -4177,7 +4248,7 @@ def run_from_csv():
                             new_exp = nearest_valid_expiration(ib, symbol, 'C', float(atm), expiration)
                             if new_exp and new_exp != expiration:
                                 vprint(args.verbose, f"[{symbol}] CALL OPEN retry with refreshed expiration {new_exp}")
-                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity)
+                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', chosen_open_limit, quantity=args.quantity, pop=_pop_desc(row, 'C', atm, chosen_open_limit))
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
                                     OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
@@ -4185,7 +4256,7 @@ def run_from_csv():
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
                                     if live is not None:
                                         live_limit = enforce_min_limit(live)
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', live_limit, quantity=args.quantity)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', live_limit, quantity=args.quantity, pop=_pop_desc(row, 'C', atm, live_limit))
                                         if tr is not None:
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol,'C',new_exp,float(atm),float(k_call))); placed += 1; attempted = True
                                             OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
@@ -4233,22 +4304,32 @@ def run_from_csv():
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue
+                            # POP Gate (Sep 2026): each candidate column is a different
+                            # debit, so POP is re-evaluated per candidate rather than once.
+                            if args.pop_check == "on":
+                                _pop_s = _pop_desc(row, 'C', atm, lv)
+                                if not _pop_ok(row, 'C', atm, lv, args.pop_min, fail_open=True):
+                                    logger.info(f"[{symbol}] CALL_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
+                                    record_attempt(symbol, "open_call", "skipped", f"pop_below_min:pop={_pop_s}",
+                                                   exp=expiration, right='C', atm=float(atm), oth=float(k_call),
+                                                   limit=lv, pop=_pop_s)
+                                    continue
                             logger.info(f"[{symbol}] CALL_OPEN using {kk}={lv}")
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] CALL OPEN fallback limit {symbol} {atm}/{k_call} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
                                 record_attempt(symbol, "open_call", "placed", "success",
-                                               exp=expiration, atm=float(atm), oth=float(k_call), limit=lv)
+                                               exp=expiration, atm=float(atm), oth=float(k_call), limit=lv, pop=_pop_desc(row, 'C', atm, lv))
                                 OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'C'))
                                 break
-                            tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', lv, quantity=args.quantity)
+                            tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_call), 'C', lv, quantity=args.quantity, pop=_pop_desc(row, 'C', atm, lv))
                             if tr is None:
                                 new_exp = nearest_valid_expiration(ib, symbol, 'C', float(atm), expiration)
                                 if new_exp:
                                     live = live_debit_limit(ib, symbol, new_exp, 'C', float(atm), float(k_call), timeout=3.0)
                                     lv2 = enforce_min_limit(live)
                                     if lv2 is not None:
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', lv2, quantity=args.quantity)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_call), 'C', lv2, quantity=args.quantity, pop=_pop_desc(row, 'C', atm, lv2))
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyC); placed += 1
                                 # Fix AA2: record_attempt already called inside place_debit_spread()
@@ -4331,16 +4412,29 @@ def run_from_csv():
                         chosen_open_limit = enforce_min_limit(live_open_limit)
                     elif theo_put is not None:
                         chosen_open_limit = theo_put
+                # POP Gate (Sep 2026): evaluated here because it needs the ACTUAL
+                # limit about to be submitted, not the CSV theo. Fails OPEN when POP
+                # is uncomputable (missing price/DTE/IV) so a data gap never mass-skips.
+                if chosen_open_limit is not None and args.pop_check == "on":
+                    _pop_s = _pop_desc(row, 'P', atm, chosen_open_limit)
+                    if not _pop_ok(row, 'P', atm, chosen_open_limit, args.pop_min, fail_open=True):
+                        logger.info(f"[{symbol}] PUT_OPEN skipped: POP {_pop_s} < {args.pop_min}")
+                        record_attempt(symbol, "open_put", "skipped", f"pop_below_min:pop={_pop_s}",
+                                       exp=expiration, right='P', atm=float(atm), oth=float(k_put),
+                                       limit=chosen_open_limit, pop=_pop_s)
+                        chosen_open_limit = None
+                    else:
+                        vprint(args.verbose, f"[{symbol}] PUT_OPEN POP {_pop_s} >= {args.pop_min}; placing")
                 if chosen_open_limit is not None:
                     vprint(args.verbose, f"[{symbol}] PUT OPEN theo {atm}/{k_put} exp {expiration} @ {chosen_open_limit}")
                     if args.dry_run:
                         vprint(args.verbose, f"[DRY-RUN] PUT OPEN theo {symbol} {atm}/{k_put} exp {expiration} @ {chosen_open_limit} x{args.quantity}")
                         attempted = True; OPEN_SEEN_KEYS.add(keyP); placed += 1
                         record_attempt(symbol, "open_put", "placed", "success",
-                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit)
+                                       exp=expiration, atm=float(atm), oth=float(k_put), limit=chosen_open_limit, pop=_pop_desc(row, 'P', atm, chosen_open_limit))
                         OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                     else:
-                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
+                        tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity, pop=_pop_desc(row, 'P', atm, chosen_open_limit))
                         if tr is not None:
                             OPEN_SEEN_KEYS.add(keyP); placed += 1; attempted = True
                             # Fix AA2: record_attempt already called inside place_debit_spread()
@@ -4349,7 +4443,7 @@ def run_from_csv():
                             new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                             if new_exp and new_exp != expiration:
                                 vprint(args.verbose, f"[{symbol}] PUT OPEN retry with refreshed expiration {new_exp}")
-                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity)
+                                tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', chosen_open_limit, quantity=args.quantity, pop=_pop_desc(row, 'P', atm, chosen_open_limit))
                                 if tr is not None:
                                     OPEN_SEEN_KEYS.add(_combo_key(symbol,'P',new_exp,float(atm),float(k_put))); placed += 1; attempted = True
                                     OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
@@ -4357,7 +4451,7 @@ def run_from_csv():
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     if live is not None:
                                         live_limit = enforce_min_limit(live)
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_limit, quantity=args.quantity)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', live_limit, quantity=args.quantity, pop=_pop_desc(row, 'P', atm, live_limit))
                                         if tr is not None:
                                             OPEN_SEEN_KEYS.add(_combo_key(symbol, 'P', new_exp, float(atm), float(k_put)))
                                             placed += 1
@@ -4407,22 +4501,32 @@ def run_from_csv():
                             lv = enforce_min_limit(row.get(kk))
                             if lv is None:
                                 continue
+                            # POP Gate (Sep 2026): each candidate column is a different
+                            # debit, so POP is re-evaluated per candidate rather than once.
+                            if args.pop_check == "on":
+                                _pop_s = _pop_desc(row, 'P', atm, lv)
+                                if not _pop_ok(row, 'P', atm, lv, args.pop_min, fail_open=True):
+                                    logger.info(f"[{symbol}] PUT_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
+                                    record_attempt(symbol, "open_put", "skipped", f"pop_below_min:pop={_pop_s}",
+                                                   exp=expiration, right='P', atm=float(atm), oth=float(k_put),
+                                                   limit=lv, pop=_pop_s)
+                                    continue
                             logger.info(f"[{symbol}] PUT_OPEN using {kk}={lv}")
                             if args.dry_run:
                                 vprint(args.verbose, f"[DRY-RUN] PUT OPEN fallback limit {symbol} {atm}/{k_put} exp {expiration} @ {lv} x{args.quantity}")
                                 OPEN_SEEN_KEYS.add(keyP); placed += 1
                                 record_attempt(symbol, "open_put", "placed", "success",
-                                               exp=expiration, atm=float(atm), oth=float(k_put), limit=lv)
+                                               exp=expiration, atm=float(atm), oth=float(k_put), limit=lv, pop=_pop_desc(row, 'P', atm, lv))
                                 OPEN_PLACED_THIS_RUN.add(_open_side_key(symbol, 'P'))
                                 break
-                            tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', lv, quantity=args.quantity)
+                            tr = place_debit_spread(ib, symbol, expiration, float(atm), float(k_put), 'P', lv, quantity=args.quantity, pop=_pop_desc(row, 'P', atm, lv))
                             if tr is None:
                                 new_exp = nearest_valid_expiration(ib, symbol, 'P', float(atm), expiration)
                                 if new_exp:
                                     live = live_debit_limit(ib, symbol, new_exp, 'P', float(atm), float(k_put), timeout=3.0)
                                     lv2 = enforce_min_limit(live)
                                     if lv2 is not None:
-                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', lv2, quantity=args.quantity)
+                                        tr = place_debit_spread(ib, symbol, new_exp, float(atm), float(k_put), 'P', lv2, quantity=args.quantity, pop=_pop_desc(row, 'P', atm, lv2))
                             if tr:
                                 OPEN_SEEN_KEYS.add(keyP)
                                 placed += 1

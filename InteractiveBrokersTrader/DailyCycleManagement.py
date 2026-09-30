@@ -170,6 +170,10 @@ class _AttemptLogger:
             "oi_otm":       kw.get("oi_otm", ""),        # Fix EZ
             "threshold":    kw.get("threshold", ""),     # Fix EZ
             "close_reason": kw.get("close_reason", ""),
+            # POP Gate (Sep 2026): present so the canonical attempts schema stays a
+            # superset shared with PlaceAnOrder.ATTEMPT_FIELDS (Fix EZ-1). DCM never
+            # computes POP itself, so it writes blank.
+            "pop":          kw.get("pop", ""),
             "source":       kw.get("source", "dcm"),
             "uid":          kw.get("uid", str(uuid.uuid4())[:8]),
         }

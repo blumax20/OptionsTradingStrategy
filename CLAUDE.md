@@ -3755,7 +3755,7 @@ ClientId 42 (listener) is excluded — the OptionsListener service reconnects au
 ### Fix DI: Fix Hardcoded Port 7497 in Bin Scripts + switch_trading_mode.py (Mar 21)
 **Status:** ✓ IMPLEMENTED
 
-**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 10-11); `C:\OptionsHistory\bin\DailyHealthCheck.ps1` (new `$IB_PORT` var); `switch_trading_mode.py` (new `update_daily_health()` function); `C:\OptionsHistory\bin\EmailDailyBundle.ps1` (DELETED)
+**Location:** `C:\OptionsHistory\bin\BounceServices.cmd` (lines 10-11); `C:\OptionsHistory\bin\DailyHealthCheck.ps1` (new `$IB_PORT` var); `switch_trading_mode.py` (new `update_daily_health()` function); `C:\OptionsHistory\bin\EmailDailyBundle.ps1` (deleted at the time -- **but it was RESTORED on 2026-08-25 and is live again**; see the correction under Fix DI's Impact)
 
 **Issue:** Three bin scripts hardcoded port 7497 (paper trading) and were missed by `switch_trading_mode.py` (PushButtonMenu option 7). After switching to live (7496): `BounceServices.cmd` force-killed wrong port; `DailyHealthCheck.ps1` checked wrong port and connected to wrong IB account; `EmailDailyBundle.ps1` connected to wrong port.
 
@@ -3763,9 +3763,23 @@ ClientId 42 (listener) is excluded — the OptionsListener service reconnects au
 1. **`BounceServices.cmd`**: Kill BOTH 7497 and 7496 holders (belt-and-suspenders; one will always be empty regardless of trading mode)
 2. **`DailyHealthCheck.ps1`**: Added `$IB_PORT = 7496` variable (line 2); replaced hardcoded `7497` in port check (line 21) and Python block IB connect (line 43); removed "(paper)" label
 3. **`switch_trading_mode.py`**: Added `DAILY_HEALTH_PS1` constant and `update_daily_health()` function; added to update loop after Health.ps1 repo entry. Now updates 7 files total on mode switch.
-4. **`EmailDailyBundle.ps1`**: Deleted (obsolete)
+4. **`EmailDailyBundle.ps1`**: Deleted (obsolete) -- **superseded, see below**
 
 **Impact:** `python switch_trading_mode.py live` (PushButtonMenu option 7) now correctly updates DailyHealthCheck.ps1. BounceServices correctly kills processes on whichever port is in use.
+
+**CORRECTION (2026-09-29):** item 4 above is **stale and was actively misleading**.
+`EmailDailyBundle.ps1` was **restored on 2026-08-25** and has been sending daily ever since
+(task `IB_Email_Daily_Bundle`, 17:15 ET, `LastTaskResult=0`). Its own header records why: deleting
+it left the scheduled task firing at a path that no longer existed, returning **4294770688** every
+day. Two consequences of the stale record, both now fixed:
+- Because Fix DI recorded the file as deleted, it was **dropped from `switch_trading_mode.py`'s
+  update loop** (which covers 7 other files). The restored copy hardcoded port 7496, so a switch
+  back to paper would have left the email connecting to a dead port -- the exact bug class Fix DI
+  was written to fix, reintroduced in reverse. The embedded Python now reads `IB_PORT` from
+  `ib_config.py` instead.
+- The file was **deployed-only, with no copy in the repo**, so the `.bak-*` files were its only
+  version control. It is now committed at `bin/EmailDailyBundle.ps1`, matching the
+  `IB_Watchdog.ps1` deployed+repo convention.
 
 ---
 
@@ -6350,3 +6364,142 @@ Token-absent check fires correctly. The real test is the next 06:00: expect eith
 now reaches `Second Factor Authentication initiated` and sends a push; if it still fails,
 `watchdog.log` shows `FLAP:` and `C:\IBC\logs\sessions\` holds the per-cycle IBC logs that finally
 show what blocks the dialog.
+
+
+---
+
+### Q3 Performance Review: POP Gate (block <40%), Email P&L (Sep 29)
+**Status:** IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/theo_pricing.py` (new `spread_pop()`);
+`InteractiveBrokersTrader/PlaceAnOrder.py` (`_pop_at_entry`/`_pop_ok`/`_pop_desc`, `--pop-check`/
+`--pop-min`, 4 gate sites, `ATTEMPT_FIELDS` += `pop`, `place_debit_spread(pop=)`);
+`InteractiveBrokersTrader/DailyCycleManagement.py` (`_AttemptLogger` row += `pop`);
+`MonthlyReview.py`
+(new `section_geometry`); `bin/EmailDailyBundle.ps1` (+ deployed copy at
+`C:\OptionsHistory\bin\`).
+
+**Why:** the account was down **-31.5% since 2026-07-27** ($2,226.45 -> ~$1,525). Asked to
+evaluate the book, dig into the losers, and test whether **guarding tickers by past performance**
+has merit.
+
+**Per-ticker guarding has no statistical basis and was rejected:** 46 distinct symbols across 64
+fill-confirmed closed spreads, **33 with exactly one trade**, only PBR/SCHW/TJX with >=3. Scoring
+*signals* instead widens it to 490 across 169 symbols but only 19 reach >=6, and an unfilled signal
+has no outcome. The instinct was right, the grouping was wrong.
+
+**The finding that replaced it -- model POP at entry is the sharpest predictor in the sample, and
+the system had been systematically buying spreads more likely to lose than win (mean POP 40%):**
+
+| POP at entry | n | net | actual win rate |
+|---|--:|--:|--:|
+| **<30%** | 15 | **-1457.29** | **7%** (1 of 15) |
+| 30-40% | 7 | -404.80 | 14% |
+| 40-50% | 12 | +46.26 | 42% |
+| **>=50%** | 19 | **+388.31** | **89%** |
+
+It replicates **per month**, not only pooled: the `<30%` bucket won **0 of 8 in September** and
+**0 of 4 in August**. Counterfactual (gate failing open on an uncomputable POP): actual
+**-1228.37**; 50%-of-debit stop alone **-413.68**; **POP gate at 40% alone +633.72** (42 kept,
+22 blocked); both **+780.23**. The two overlap heavily -- **after the gate the stop is worth only
++146.51**, and the gate already blocks 3 of the 6 worst losers (HQY 38.6%, SON 33%, JD 10.2%) --
+which is why the gate shipped and the stop stayed off.
+
+**Supporting geometry:** mean entry debit **0.44 x width**. With `gain_frac=0.5` a win is
+0.5(W-E) and a loss is E, so break-even needs a **~61% win rate**; actual was **48%**. By side,
+CALL n=52 net **-1299.92** PF **0.44** vs PUT n=12 +71.55 PF 1.25 -- but signals are 78% calls
+(383 CALL_OPEN vs 107 PUT_OPEN), so the skew is upstream in the TradingView strategy, not the
+gates. By DTE at entry: `<30d` PF **0.95** (the only near-breakeven bucket), 30-45d 0.36,
+46-60d 0.55, `>60d` 0.30.
+
+**Change 1 -- POP gate (`theo_pricing.py` + `PlaceAnOrder.py`).** New `spread_pop(S, long_strike,
+debit, T, sigma, right)`: breakeven `K+D` (call) / `K-D` (put), then
+`z = (ln(S/B) - 0.5*sigma^2*T)/(sigma*sqrt(T))`, `POP = N(z)` / `N(-z)`. Returns `None` on any
+unusable input rather than raising -- it sits on the order path and must never fail a placement.
+`--pop-check {off,on}` (default `on`) and `--pop-min` (default `0.40`) mirror `--oi-check` /
+`--ba-check`; the flag is the instant off-switch. Skip reason `pop_below_min:pop=0.33` follows the
+Fix FF / Fix EK-a "stable prefix + number" convention.
+
+Gated at **all four OPEN sites** (CALL/PUT primary and CALL/PUT `debit_limit` fallback), and
+deliberately **after the limit resolves** rather than beside the early OI/ba gate -- POP depends on
+the debit, so gating before the price is known would gate on a number that is not what gets sent.
+The fallback loop re-evaluates per candidate column since each is a different debit.
+
+**Fails OPEN when POP is uncomputable** (missing `current_price`/`days_to_exp`/IV): 11 of the 64
+closed trades had no computable POP, so failing closed would have silently suppressed ~17% of
+trading on a data gap. Same reasoning as `_ba_ok`'s after-hours fail-open.
+
+Two bugs were caught and fixed while wiring the telemetry: `_pop_s` was referenced outside its
+`args.pop_check == "on"` guard (a **NameError on every open** whenever the off-switch was used),
+and the expiration-retry / `lv2` paths reused a POP computed for a **different limit**. All 14
+out-of-guard sites now call `_pop_desc(row, right, atm, <that path's own limit>)`.
+
+**Change 2 -- attempts CSV `pop` column (24 -> 25 cols).** Added to **both** writers per the
+Fix EZ-1 rule (`PlaceAnOrder.ATTEMPT_FIELDS` and DCM `_AttemptLogger.write`, identical key order);
+a one-sided change would be silently dropped by whichever writer created the file first.
+`place_debit_spread()` gained an optional `pop=` kwarg so real (non-dry-run) placements record it
+too -- preferred over a `_CLOSE_REASON`-style module global, which would have leaked a stale POP
+onto later close rows.
+
+**Change 3 -- DTE: proposed, implemented, then REVERTED the same session; `listener.py` is
+unchanged at `TARGET_DTE=60` / `MIN_DTE=42`.** The data argues for 30/21 (`<30d` was the only
+near-breakeven DTE bucket at PF 0.95, while the live 42-60 window sits at PF 0.36-0.55), and Fix FC's
+Change E recorded no rationale for the original widening. But the **live TradingView signal set was
+fitted for 60/42**, so moving the listener's DTE without re-fitting the signals would mismatch the
+two. Held until the `EXIT_BARS` 10/15/21 historical analysis completes; only then is the window
+decided. The 30/21 edit never went live -- the running listener had loaded 60/42 half an hour before
+the edit and the file was restored before any restart. If it is revisited: all six usage sites read
+the constants, at dte<30 Fix CA's DTE age *fallback* heuristic becomes active again (pre-FC
+behaviour; Fix DD/DD-2's attempts-CSV timestamp stays authoritative), and Fix CX's width preference
+plus the `dte <= TARGET_DTE` pool cap would then apply over [21,30].
+
+**Change 4 -- `MonthlyReview.py` `section_geometry`** so this is one command monthly instead of an
+ad-hoc reconstruction: POP buckets, side, entry/width, loss severity, a break-even table, a
+repeat-ticker census, and live-gate telemetry (gate skips, POP-carrying attempts, blank-POP
+fail-open count). It imports the same `spread_pop()` the gate uses, so report and gate cannot
+disagree. Still read-only; reuses `load_health`/`build_ledger`/`match_close_limit`/`entry_dte` and
+`section_ledger`'s expired-worthless rule (close day >= expiry => exit 0.0), without which the 5
+full losses vanish and every aggregate is flattered.
+
+**Change 5 -- daily 17:15 email.** `_fmtpl` hoisted to script scope (it was defined *inside* the
+`if ($pl.ok)` branch); **YTD** read from the same `C:\OptionsHistory\ytd_baseline.json` Health.ps1
+uses -- **read-only, never created or rewritten**, since creating it would silently rebase YTD for
+Health.ps1 and MonthlyReview too -- and labelled "since 2026-07-27" because that is what the
+baseline actually is, not calendar YTD; **MTD** from `MonthlyReview.load_health()` reused inside the
+existing heredoc (0.09 s), summing realized **strictly before today** and adding today's live
+`reqPnL` figure, because `IB_EndOfDay_Health_1715` fires at the same 17:15 and its report may not
+exist yet; **a per-spread positions table** grouped exactly as Health.ps1:626-649 does, with
+unrealized from `PortfolioItem.unrealizedPNL` (populated -- only `realizedPNL` is structurally 0.00
+on an open leg) and a **TOTAL entry debit** line. Unpaired legs are shown rather than dropped
+(Health.ps1 hides them), since a naked leg from a half-filled close is exactly what the table is for.
+
+Also fixed a latent PS 5.1 bug there: `& $py $tmp 2>$null` under `$ErrorActionPreference='Stop'`
+raises `NativeCommandError` whenever the exe writes **any** stderr, so on an IB outage `$pl` was
+lost entirely even though the probe had already printed valid JSON. The call now drops to
+`Continue` for its duration and restores in `finally`, and `$raw` takes the last line matching
+`^\s*\{` rather than simply the last line.
+
+**Verified:** `spread_pop` reproduces the ad-hoc analysis on **all 64 closed trades, zero
+mismatches**, and all four POP buckets to the cent. Gate replayed against **all 292 real OPEN
+placements**: 202 kept, 90 blocked (31%), 36 blank **all correctly failing open**; worst blocked are
+VIV POP 0.00 on a $3.45 debit, IONS 0.01, TJX 0.01. Attempts schema written in **both creation
+orders** -> 25 aligned columns, `pop` populated from PlaceAnOrder and blank from DCM, Fix EZ
+`oi_atm`/`oi_otm`/`threshold` intact. `MonthlyReview --month 26_09/26_08/26_07` all run (July has a
+single health report, exercising the thin-data path). Email: PS 5.1 `PARSE OK`, UTF-8 no BOM / LF
+preserved, **zero new non-ASCII bytes** (the 3 pre-existing comment ones untouched), embedded
+Python `ast.parse` OK with the last-line-JSON contract intact, `-WhatIfNoSend` dry run reconciles
+**TOTAL unreal (561.00) against ACCOUNT Unrealized (561.01)** and the position set **identical to
+the health report's 14**, and the simulated outage exits 0 with MTD's file-derived half surviving.
+
+**Deferred:** the DTE window (see Change 3 -- awaiting the `EXIT_BARS` analysis). Stop-loss stays
+off (`RISK_EXIT_STOP_LOSS_ENABLED = False`) -- only +146.51 after the gate; judge it later on the 13 losers that survive the gate (-666.28, or -519.78 with a 50% stop).
+The entry-debit-vs-width ceiling was **dropped**, not deferred: a POP floor implies a debit ceiling.
+Revisit `--pop-min` after a month of recorded data (the counterfactual mildly favours 40% over 50%
+because the 40-50% band was slightly profitable).
+
+**Not fixed, found on the way:** the open book carries **$1,834 of entry debit against ~$1,525 of
+NetLiq** -- for debit spreads the entry debit *is* max loss, so the worst case exceeds equity,
+consistent with September's **32 `bs_rejected_bag_e201`** margin rejections. And
+`IB_EndOfDay_Health_1715` / `IB_Midday_Health_1200` return **267014** (`SCHED_S_TASK_TERMINATED`)
+because `Health.ps1` ends in a `Read-Host` that blocks forever under SYSTEM until the PT15M limit
+kills it; the report is written first so nothing is lost, but the tasks can never report success.

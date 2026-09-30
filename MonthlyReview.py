@@ -33,6 +33,15 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 
+# POP Gate (Sep 2026): the same function the live gate uses, so the report and
+# the gate cannot disagree. Optional import so the report still runs without it.
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "InteractiveBrokersTrader"))
+    from theo_pricing import spread_pop
+except Exception:
+    spread_pop = None
+
 OH = r"C:\OptionsHistory"
 LOGS = os.path.join(OH, "logs")
 
@@ -415,6 +424,187 @@ def section_ledger(out, ledger, snapshots, attempts, month_start_ts, attempts_hi
     return opened, closed
 
 
+def _spread_pop_for(sig_index, key, entry_cost):
+    """Model POP at entry for a closed spread, or None when inputs are missing.
+
+    Mirrors the live gate (PlaceAnOrder._pop_at_entry / theo_pricing.spread_pop):
+    S / days_to_exp / iv from the signal row keyed (symbol, expiration), sigma
+    preferring iv_atm then iv_otm, debit = entry cost in dollars / 100.
+    """
+    if spread_pop is None:
+        return None
+    sym, right, exp, lk, _sk = key
+    row = sig_index.get((sym, exp))
+    if row is None:
+        return None
+    S = money(row.get("current_price"))
+    dte = money(row.get("days_to_exp"))
+    iv = money(row.get("iv_atm"))
+    if iv is None or iv <= 0:
+        iv = money(row.get("iv_otm"))
+    if S is None or dte is None or iv is None:
+        return None
+    return spread_pop(S, lk, entry_cost / 100.0, dte / 365.0, iv, right)
+
+
+def _stat_line(label, pls):
+    """n / net / win% / avg win / avg loss / PF for one bucket of P/Ls."""
+    w = [x for x in pls if x > 0]
+    l = [x for x in pls if x <= 0]
+    gp, gl = sum(w), -sum(l)
+    if gl > 0:
+        pf = "{:.2f}".format(gp / gl)
+    elif gp > 0:
+        pf = "inf"
+    else:
+        pf = "-"
+    return "  {:10s} n={:2d} net={} win={:2d}({:3.0f}%) avgW={} avgL={} PF={:>5s}".format(
+        label, len(pls), fmt(sum(pls)), len(w),
+        (100.0 * len(w) / len(pls)) if pls else 0.0,
+        fmt(sum(w) / len(w) if w else None, 8),
+        fmt(sum(l) / len(l) if l else None, 8), pf)
+
+
+def section_geometry(out, ledger, snapshots, attempts, attempts_hist, sig_index,
+                     gain_frac=0.5):
+    """Q3 review (Sep 2026): why the closed trades did what they did.
+
+    Four lenses the plain ledger does not expose: model POP at entry (the strongest
+    predictor found in the Jul-Sep review), side, entry debit as a fraction of
+    width, and how much of the entry debit the losers gave back. Estimated from
+    avgCost and submitted close limits exactly like section_ledger - the same
+    caveat applies to every number here.
+    """
+    out.append("=== B2. ENTRY GEOMETRY & POP (estimated, same basis as the ledger) ===")
+    out.append("")
+
+    rows = []
+    for key, e in ledger.items():
+        if e["closed_after"] is None:
+            continue
+        cost = e["costs"][0] - e["costs"][1]
+        if cost <= 0.01:
+            continue
+        close_day = e["closed_after"].split("_")[0]
+        if close_day >= key[2]:
+            exit_lim = 0.0          # expired worthless - same rule as section_ledger
+        else:
+            exit_lim = match_close_limit(attempts, key, e["closed_after"])
+        if exit_lim is None:
+            continue
+        width = abs(key[3] - key[4]) * 100.0
+        if width <= 0:
+            continue
+        rows.append({
+            "sym": key[0], "right": key[1], "cost": cost,
+            "pl": exit_lim * 100.0 - cost, "width": width,
+            "ratio": cost / width,
+            "pop": _spread_pop_for(sig_index, key, cost),
+        })
+    if not rows:
+        out.append("  No closed spreads with a usable entry and exit this month.")
+        out.append("")
+        return
+
+    n_pop = sum(1 for r in rows if r["pop"] is not None)
+    out.append("closed spreads: {}   with computable POP: {}   blank: {}".format(
+        len(rows), n_pop, len(rows) - n_pop))
+    out.append("")
+
+    out.append("-- By model POP at entry --")
+    for lo, hi, lab in ((0.0, .30, "<30%"), (.30, .40, "30-40%"),
+                        (.40, .50, "40-50%"), (.50, 1.01, ">=50%")):
+        sub = [r["pl"] for r in rows if r["pop"] is not None and lo <= r["pop"] < hi]
+        if sub:
+            out.append(_stat_line(lab, sub))
+    blanks = [r["pl"] for r in rows if r["pop"] is None]
+    if blanks:
+        out.append(_stat_line("blank", blanks))
+    out.append("  (POP = P(underlying beyond breakeven at expiry), lognormal zero-drift,")
+    out.append("   from the signal row price/DTE/IV and the entry debit. The live gate in")
+    out.append("   PlaceAnOrder calls the same function on the limit it submits.)")
+    out.append("")
+
+    out.append("-- By side --")
+    for r_ in ("C", "P"):
+        sub = [r["pl"] for r in rows if r["right"] == r_]
+        if sub:
+            out.append(_stat_line("side " + r_, sub))
+    out.append("")
+
+    out.append("-- By entry debit as a fraction of width --")
+    for lo, hi, lab in ((0.0, .30, "<30%"), (.30, .38, "30-38%"),
+                        (.38, .45, "38-45%"), (.45, 9.0, ">=45%")):
+        sub = [r["pl"] for r in rows if lo <= r["ratio"] < hi]
+        if sub:
+            out.append(_stat_line(lab, sub))
+    ratios = sorted(r["ratio"] for r in rows)
+    mean_ratio = sum(ratios) / len(ratios)
+    out.append("  mean entry/width {:.3f}   median {:.3f}".format(
+        mean_ratio, ratios[len(ratios) // 2]))
+    out.append("")
+
+    out.append("-- Loss severity (fraction of the entry debit given back) --")
+    losers = [r for r in rows if r["pl"] < 0]
+    if losers:
+        buckets = {}
+        for r in losers:
+            b = min(int(abs(r["pl"]) / r["cost"] * 10) * 10, 100)
+            buckets.setdefault(b, []).append(r["pl"])
+        for b in sorted(buckets):
+            pls = buckets[b]
+            out.append("  gave back {:3d}-{:3d}% : n={:2d}  total={}".format(
+                b, b + 9, len(pls), fmt(sum(pls))))
+        deep = [r["pl"] for r in losers if abs(r["pl"]) / r["cost"] >= 0.90]
+        out.append("  losers giving back >=90% of entry: {} of {}  total={}".format(
+            len(deep), len(losers), fmt(sum(deep) if deep else None)))
+    else:
+        out.append("  no losing spreads this month.")
+    out.append("")
+
+    out.append("-- Break-even geometry at gain_frac={:.2f} --".format(gain_frac))
+    out.append("  Taking {:.0f}% of remaining max profit wins {:.2f}*(W-E) and loses E,".format(
+        gain_frac * 100, gain_frac))
+    out.append("  so break-even requires:")
+    for wr in (0.45, 0.50, 0.55, 0.60, 0.65):
+        need = (gain_frac * wr) / (gain_frac * wr + (1.0 - wr))
+        out.append("     win rate {:3.0f}%  ->  entry/width below {:.3f}".format(wr * 100, need))
+    act_w = sum(1 for r in rows if r["pl"] > 0)
+    out.append("  actual this month: win rate {:.0f}%, mean entry/width {:.3f}".format(
+        100.0 * act_w / len(rows), mean_ratio))
+    out.append("")
+
+    out.append("-- Repeat-ticker census (can a ticker be judged on this sample?) --")
+    per = {}
+    for r in rows:
+        per[r["sym"]] = per.get(r["sym"], 0) + 1
+    hist = {}
+    for v in per.values():
+        hist[v] = hist.get(v, 0) + 1
+    for k in sorted(hist):
+        out.append("  {:2d} closed trade(s): {:3d} symbol(s)".format(k, hist[k]))
+    multi = sorted(sym for sym, c in per.items() if c >= 3)
+    out.append("  {} distinct symbols over {} trades; >=3 trades: {}".format(
+        len(per), len(rows), ", ".join(multi) if multi else "(none)"))
+    out.append("")
+
+    gated = [r for r in attempts
+             if (r.get("action") or "") in OPEN_ACTIONS
+             and (r.get("reason") or "").startswith("pop_below_min")]
+    have_col = [r for r in attempts
+                if (r.get("action") or "") in OPEN_ACTIONS and (r.get("pop") or "").strip()]
+    if gated or have_col:
+        out.append("-- Live POP gate telemetry (this month's attempts) --")
+        out.append("  OPEN attempts skipped by the gate : {}".format(len(gated)))
+        out.append("  OPEN attempts carrying a POP value: {}".format(len(have_col)))
+        blank_open = [r for r in attempts
+                      if (r.get("action") or "") in OPEN_ACTIONS
+                      and "success" in (r.get("reason") or "")
+                      and not (r.get("pop") or "").strip()]
+        out.append("  placed with blank POP (fail-open)  : {}".format(len(blank_open)))
+        out.append("")
+
+
 def section_funnel(out, signals, attempts, ledger, month_prefix):
     out.append("=== C. EXECUTION FUNNEL & EFFICIENCY ===")
     out.append("")
@@ -748,6 +938,16 @@ def main():
     month_start_ts = month_yyyymm + "01_000000"
     if snapshots:
         section_ledger(out, ledger, snapshots, attempts, month_start_ts, attempts_hist)
+        # A spread closed this month may have opened in a prior month, so index the
+        # same 3-month window attempts_hist covers.
+        sig_index = {}
+        for _m in (prev_month(prev_month(month)), prev_month(month), month):
+            for _r in load_signals(_m):
+                _s = (_r.get("symbol") or "").strip()
+                _e = (_r.get("expiration") or "").strip()
+                if _s and _e:
+                    sig_index[(_s, _e)] = _r
+        section_geometry(out, ledger, snapshots, attempts, attempts_hist, sig_index)
     else:
         out.append("No usable position snapshots found - skipping trade ledger.")
         out.append("")
