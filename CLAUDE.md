@@ -6503,3 +6503,46 @@ consistent with September's **32 `bs_rejected_bag_e201`** margin rejections. And
 `IB_EndOfDay_Health_1715` / `IB_Midday_Health_1200` return **267014** (`SCHED_S_TASK_TERMINATED`)
 because `Health.ps1` ends in a `Read-Host` that blocks forever under SYSTEM until the PT15M limit
 kills it; the report is written first so nothing is lost, but the tasks can never report success.
+
+
+---
+
+### Menu: Monthly Review moved to 1-2, plus an option-8 fallthrough bug (Sep 29)
+**Status:** IMPLEMENTED
+
+**Location:** `PushButtonMenu.ps1` (option 1 handler, option 8 flow switch).
+
+**Change:** the monthly performance review moved from **8-9** to **1-2**. Option 1 became a submenu
+(**1-1** System Health Check, **1-2** Monthly performance review) and its top-level label is now
+"Reports (health check / monthly performance review)". Option 8's flow prompt is back to
+`Select [1-8]`. Rationale: option 8 is the order-placing menu and the review only reads CSVs and
+health reports, so it did not belong there. The handler also now resolves the script via
+`Join-Path $Root "MonthlyReview.py"` instead of the hardcoded absolute path the 8-9 copy used.
+
+**Bug found while testing the move -- an invalid option-8 flow silently ran a full trading cycle.**
+The flow switch's `Default` printed "Invalid selection." and called `Pause-Enter; break`, but in
+PowerShell `break` inside a `switch` only leaves the switch: execution continued to the generic
+`DailyCycleManagement` launch, and `$skipGenericLaunch` was still `$false`. So **any** typo at that
+prompt (`x`, `99`, and `9` once the review moved away) fired a bare `daily_trading_cycle()`.
+Pre-existing, but removing the `'9'` case made a previously-valid key hit it.
+
+Observed live at 21:29 on 2026-09-29 while verifying the move: DCM ran for 44 s, reconciled 14 held
+symbols (all `hold,skipped`), correctly skipped the two working 5 PM closes, and **attempted two
+OPEN orders (BA $2.11, EMR $0.25) -- both rejected by IB with Error 201** (the negative
+Equity-with-Loan-Value margin wall). Net effect was zero orders placed, confirmed against
+`reqAllOpenOrders` (only the two 5 PM closes, permIds 1992042212/1992042213, were live) and zero
+new attempts rows. On a funded account it would have placed real after-hours orders. Incidentally it
+was also the POP gate's first production firing: `EMR open_call skipped pop_below_min:pop=0.38`.
+
+**Fix -- two parts:** the `Default` case now sets `$skipGenericLaunch = $true` as well as breaking;
+and the `if ($skipGenericLaunch) { break }` guard moved **above** the logging banner. It previously
+sat after it, so a skip still printed `--- DailyCycleManagement ... ---` and `Logging to: ...`,
+which reads exactly like a launch that happened -- and was why the first fix attempt looked like it
+had failed. Options 8-6 and 8-7 also set that flag and run their own script inside the case, so the
+earlier guard only suppresses the misleading banner for them.
+
+**Verified:** `Parser::ParseFile` OK; BOM, CRLF and the 27 pre-existing non-ASCII bytes all
+preserved with none added. Driven non-interactively: `8` then `9` prints only "Invalid selection."
+with no banner, **no session log created and no new attempts rows**; `1` then `2` runs
+MonthlyReview and writes `monthly_review_<YY_MM>.txt`; an invalid sub-choice under option 1 is
+handled cleanly.

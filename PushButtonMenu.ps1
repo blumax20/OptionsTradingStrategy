@@ -125,7 +125,7 @@ function Show-Menu {
     Write-Host "============================="
     Write-Host "   OPTIONS TRADING MENU"
     Write-Host "============================="
-    Write-Host "1)  System Health Check (write report)"
+    Write-Host "1)  Reports (health check / monthly performance review)"
     Write-Host "2)  Start trading system"
     Write-Host "3)  Stop trading system"
     Write-Host "4)  Restart trading system"
@@ -153,12 +153,44 @@ while ($true) {
     switch ($choice) {
 
         1 {
-            if (Test-Path $HealthScript) {
-                Run-With-RealTime -Title "Health" -ScriptPath $HealthScript
-                $last = Get-LatestHealthReport
-                if ($last) { Write-Host "`nLatest report:`n$last" }
-            } else {
-                Write-Host ("Health script not found: {0}" -f $HealthScript)
+            Write-Host ""
+            Write-Host "  1) System Health Check (write report)"
+            Write-Host "  2) Monthly performance review (read-only report; MonthlyReview.py)"
+            $sub = Read-Host "  Choose (1 or 2)"
+            switch ($sub.Trim()) {
+                '1' {
+                    if (Test-Path $HealthScript) {
+                        # No Pause-Enter here: Health.ps1 ends with its own prompt (Fix AX1).
+                        Run-With-RealTime -Title "Health" -ScriptPath $HealthScript
+                        $last = Get-LatestHealthReport
+                        if ($last) { Write-Host "`nLatest report:`n$last" }
+                    } else {
+                        Write-Host ("Health script not found: {0}" -f $HealthScript)
+                        Pause-Enter
+                    }
+                }
+                '2' {
+                    # Monthly performance and efficiency review (read-only; places no orders).
+                    # Moved here from 8-9: option 8 is the order-placing menu, and this only
+                    # ever reads CSVs and health reports.
+                    $Review = Join-Path $Root "MonthlyReview.py"
+                    if (-not (Test-Path $Review)) {
+                        Write-Host ("MonthlyReview.py not found: {0}" -f $Review) -ForegroundColor Yellow
+                        Pause-Enter; break
+                    }
+                    $mon = Read-Host "Month as YY_MM (blank = current month)"
+                    $liveAns = Read-Host "Include opportunity-cost section (needs IBGateway up)? (y/N)"
+                    $rvArgs = @($Review, "--out")
+                    if (-not [string]::IsNullOrWhiteSpace($mon)) { $rvArgs += @("--month", $mon) }
+                    if ($liveAns -and $liveAns.ToLower().StartsWith('y')) { $rvArgs += "--live" }
+                    Write-Host ("Running MonthlyReview {0} ..." -f ($rvArgs -join ' ')) -ForegroundColor Cyan
+                    & $PyExe $rvArgs
+                    Pause-Enter
+                }
+                Default {
+                    Write-Host "Invalid selection." -ForegroundColor Yellow
+                    Pause-Enter
+                }
             }
         }
 
@@ -378,8 +410,7 @@ while ($true) {
             Write-Host "  6) OI cleanup + risk exits retry (Fix CN/CO) -- cancel low-OI orders, then run risk exits"
             Write-Host "  7) Place skipped OPEN orders from prior day (10 AM retry -- Fix CP/CQ)"
             Write-Host "  8) FORCE-EXECUTE pending BAG orders with JOIN pricing (RTH only -- Fix EN)"
-            Write-Host "  9) Monthly performance review (read-only report; MonthlyReview.py)"
-            $flow = Read-Host "Select [1-9]"
+            $flow = Read-Host "Select [1-8]"
 
             $argList = @("`"$DCMSrc`"")
             $skipGenericLaunch = $false
@@ -423,28 +454,20 @@ while ($true) {
                     }
                     $argList += @("--force-execute-pending", $sideArg)
                 }
-                '9' {
-                    # Monthly performance & efficiency review (read-only; no orders).
-                    $skipGenericLaunch = $true
-                    $Review = "C:\Users\Administrator\code\OptionsTradingStrategy\MonthlyReview.py"
-                    if (-not (Test-Path $Review)) {
-                        Write-Host ("MonthlyReview.py not found: {0}" -f $Review) -ForegroundColor Yellow
-                        Pause-Enter; break
-                    }
-                    $mon = Read-Host "Month as YY_MM (blank = current month)"
-                    $liveAns = Read-Host "Include opportunity-cost section (needs IBGateway up)? (y/N)"
-                    $rvArgs = @($Review, "--out")
-                    if (-not [string]::IsNullOrWhiteSpace($mon)) { $rvArgs += @("--month", $mon) }
-                    if ($liveAns -and $liveAns.ToLower().StartsWith('y')) { $rvArgs += "--live" }
-                    Write-Host ("Running MonthlyReview {0} ..." -f ($rvArgs -join ' ')) -ForegroundColor Cyan
-                    & $PyExe $rvArgs
-                    Pause-Enter
-                }
                 Default {
+                    # Must set the flag, not just break: `break` leaves the switch but
+                    # execution still reaches the generic DCM launch below, so a typo
+                    # here used to fire a full daily_trading_cycle().
+                    $skipGenericLaunch = $true
                     Write-Host "Invalid selection." -ForegroundColor Yellow
                     Pause-Enter; break
                 }
             }
+
+            # Skip before the banner: options 6/7 and an invalid flow are already
+            # handled above, and printing the launch banner first made a skip look
+            # like a run.
+            if ($skipGenericLaunch) { break }
 
             # --- logging setup ---
             $logDir = "C:\OptionsHistory\logs"
@@ -520,7 +543,6 @@ while ($true) {
             # } catch {
             #     Write-Host ("Attempts summary (post-OPEN) error: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
             # }
-            if ($skipGenericLaunch) { break }  # option 6 already handled above; skip generic launch
             # Fix AA8: Redirect stdout/stderr to session log for post-mortem analysis
             $logErr = $log -replace '\.log$', '.err.log'
             try {
