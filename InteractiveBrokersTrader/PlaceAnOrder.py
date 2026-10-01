@@ -1509,6 +1509,7 @@ def place_debit_spread(
                             epsilon=float(RISKLESS_EPSILON),
                             qty=int(quantity),
                             order_action=action.upper(),
+                            pop=(pop if pop is not None else ""),  # POP Gate: forward on every order-outcome row
                         )
                     except Exception:
                         pass
@@ -1576,6 +1577,7 @@ def place_debit_spread(
                     limit=actual_limit,
                     qty=int(quantity),
                     order_action=action.upper(),
+                    pop=(pop if pop is not None else ""),  # POP Gate: forward on every order-outcome row
                 )
             except Exception:
                 pass
@@ -1641,6 +1643,7 @@ def place_debit_spread(
                             epsilon=float(RISKLESS_EPSILON),
                             qty=int(quantity),
                             order_action=action.upper(),
+                            pop=(pop if pop is not None else ""),  # POP Gate: forward on every order-outcome row
                         )
                     except Exception:
                         pass
@@ -1670,6 +1673,7 @@ def place_debit_spread(
                 shortK=short_strike,
                 limit=limit_price,
                 err=str(e),
+                pop=(pop if pop is not None else ""),  # POP Gate: forward on every order-outcome row
             )
         except Exception:
             pass
@@ -4219,13 +4223,18 @@ def run_from_csv():
                 # POP Gate (Sep 2026): evaluated here because it needs the ACTUAL
                 # limit about to be submitted, not the CSV theo. Fails OPEN when POP
                 # is uncomputable (missing price/DTE/IV) so a data gap never mass-skips.
+                _pop_blocked_rounded = None  # POP Gate: debit the primary gate already logged (dedupe)
                 if chosen_open_limit is not None and args.pop_check == "on":
                     _pop_s = _pop_desc(row, 'C', atm, chosen_open_limit)
                     if not _pop_ok(row, 'C', atm, chosen_open_limit, args.pop_min, fail_open=True):
-                        logger.info(f"[{symbol}] CALL_OPEN skipped: POP {_pop_s} < {args.pop_min}")
+                        logger.warning(f"[{symbol}] CALL_OPEN skipped: POP {_pop_s} < {args.pop_min} (limit {chosen_open_limit})")
                         record_attempt(symbol, "open_call", "skipped", f"pop_below_min:pop={_pop_s}",
                                        exp=expiration, right='C', atm=float(atm), oth=float(k_call),
                                        limit=chosen_open_limit, pop=_pop_s)
+                        try:
+                            _pop_blocked_rounded = round(float(chosen_open_limit), 2)
+                        except Exception:
+                            _pop_blocked_rounded = None
                         chosen_open_limit = None
                     else:
                         vprint(args.verbose, f"[{symbol}] CALL_OPEN POP {_pop_s} >= {args.pop_min}; placing")
@@ -4309,7 +4318,15 @@ def run_from_csv():
                             if args.pop_check == "on":
                                 _pop_s = _pop_desc(row, 'C', atm, lv)
                                 if not _pop_ok(row, 'C', atm, lv, args.pop_min, fail_open=True):
-                                    logger.info(f"[{symbol}] CALL_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
+                                    try:
+                                        _lv_rounded = round(float(lv), 2)
+                                    except Exception:
+                                        _lv_rounded = None
+                                    if _lv_rounded is not None and _lv_rounded == _pop_blocked_rounded:
+                                        # Same debit the primary gate already recorded (rounded vs raw):
+                                        # still skip the candidate, but do not write a duplicate row.
+                                        continue
+                                    logger.warning(f"[{symbol}] CALL_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
                                     record_attempt(symbol, "open_call", "skipped", f"pop_below_min:pop={_pop_s}",
                                                    exp=expiration, right='C', atm=float(atm), oth=float(k_call),
                                                    limit=lv, pop=_pop_s)
@@ -4415,13 +4432,18 @@ def run_from_csv():
                 # POP Gate (Sep 2026): evaluated here because it needs the ACTUAL
                 # limit about to be submitted, not the CSV theo. Fails OPEN when POP
                 # is uncomputable (missing price/DTE/IV) so a data gap never mass-skips.
+                _pop_blocked_rounded = None  # POP Gate: debit the primary gate already logged (dedupe)
                 if chosen_open_limit is not None and args.pop_check == "on":
                     _pop_s = _pop_desc(row, 'P', atm, chosen_open_limit)
                     if not _pop_ok(row, 'P', atm, chosen_open_limit, args.pop_min, fail_open=True):
-                        logger.info(f"[{symbol}] PUT_OPEN skipped: POP {_pop_s} < {args.pop_min}")
+                        logger.warning(f"[{symbol}] PUT_OPEN skipped: POP {_pop_s} < {args.pop_min} (limit {chosen_open_limit})")
                         record_attempt(symbol, "open_put", "skipped", f"pop_below_min:pop={_pop_s}",
                                        exp=expiration, right='P', atm=float(atm), oth=float(k_put),
                                        limit=chosen_open_limit, pop=_pop_s)
+                        try:
+                            _pop_blocked_rounded = round(float(chosen_open_limit), 2)
+                        except Exception:
+                            _pop_blocked_rounded = None
                         chosen_open_limit = None
                     else:
                         vprint(args.verbose, f"[{symbol}] PUT_OPEN POP {_pop_s} >= {args.pop_min}; placing")
@@ -4506,7 +4528,15 @@ def run_from_csv():
                             if args.pop_check == "on":
                                 _pop_s = _pop_desc(row, 'P', atm, lv)
                                 if not _pop_ok(row, 'P', atm, lv, args.pop_min, fail_open=True):
-                                    logger.info(f"[{symbol}] PUT_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
+                                    try:
+                                        _lv_rounded = round(float(lv), 2)
+                                    except Exception:
+                                        _lv_rounded = None
+                                    if _lv_rounded is not None and _lv_rounded == _pop_blocked_rounded:
+                                        # Same debit the primary gate already recorded (rounded vs raw):
+                                        # still skip the candidate, but do not write a duplicate row.
+                                        continue
+                                    logger.warning(f"[{symbol}] PUT_OPEN {kk}={lv} skipped: POP {_pop_s} < {args.pop_min}")
                                     record_attempt(symbol, "open_put", "skipped", f"pop_below_min:pop={_pop_s}",
                                                    exp=expiration, right='P', atm=float(atm), oth=float(k_put),
                                                    limit=lv, pop=_pop_s)

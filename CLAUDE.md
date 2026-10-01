@@ -6546,3 +6546,95 @@ preserved with none added. Driven non-interactively: `8` then `9` prints only "I
 with no banner, **no session log created and no new attempts rows**; `1` then `2` runs
 MonthlyReview and writes `monthly_review_<YY_MM>.txt`; an invalid sub-choice under option 1 is
 handled cleanly.
+
+---
+
+### Fix FP: POP Gate Telemetry — `pop` Dropped on Every PLACED Row, Double-Logged Blocks, Invisible Under `--quiet` (Sep 30)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `InteractiveBrokersTrader/PlaceAnOrder.py` — four order-outcome `record_attempt` calls
+inside `place_debit_spread()` (primary-LMT ~1578, riskless-retry-A ~1510, riskless-retry-B ~1644,
+`place_failed` ~1674); the four POP gate sites in `run_from_csv()` (CALL primary ~4224 / fallback
+~4319, PUT primary ~4433 / fallback ~4529).
+
+**Context.** The POP gate (Q3 review, Sep 29) went live at 21:21 on Sep 29 — 21 minutes *after* that
+evening's 17:00 batch — so 2026-09-30 was its first scheduled exercise. It works: recomputing every
+decision with the real `spread_pop` reproduces the logged value and verdict exactly (EMR 1.97 ->
+0.3806 blocked; BA 2.11 -> 0.4067 passed; T 0.36 -> 0.35 blocked). Three telemetry defects surfaced
+in the first two runs. None affected a place/skip decision; all three degraded the ability to
+*measure* the gate, which is what the observation window depends on.
+
+**FP-1 (the one that mattered): `pop` was dropped on every PLACED row.** `place_debit_spread()` has
+**seven** `record_attempt` calls across its 1191-1676 span, and only **one** (~1440) forwarded the
+`pop` kwarg it accepts at line 1204. The other four order-outcome rows — the second primary-submission
+path, both riskless-retry paths, and the outer `place_failed` handler — accepted `pop` and discarded
+it. (The two close-guard skips at ~1242/~1261 are left alone: POP is an entry concept and is
+genuinely N/A there.) BA, EQNR and GLNG on Sep 30 all landed `pop=''` while their POP was perfectly
+computable — verified EQNR **0.4175** and GLNG **0.4232** from their own CSV rows — so POP was
+recorded only when the gate *blocked*, never when it *passed*.
+
+Why that is worse than it looks: `_pop_desc()` returns the literal string `"blank"` when POP cannot
+be computed, so `''` vs `'blank'` is exactly the diagnostic that separates "never delivered" from
+"no data". With every placed row empty, both the fail-open rate (~12% on the 292-order replay) and
+the POP distribution of what was actually *bought* were unmeasurable — and the latter is the only
+way to tell whether the gate is raising the book's realized POP. `MonthlyReview.section_geometry`
+could only ever see blocks.
+
+Fix: forward `pop=(pop if pop is not None else "")` on all four, matching the existing ~1440 line.
+
+**FP-2: one blocked decision wrote two attempts rows.** The primary gate sets
+`chosen_open_limit = None` and *falls through* rather than `continue`-ing, so the fallback candidate
+loop re-gates the same debit and logs it again — T on Sep 30 produced `0.36` (primary, rounded) and
+`0.3598335987461887` (first fallback, raw) 14ms apart, same POP 0.35. Fix: the primary gate records
+the blocked debit rounded to 2dp in `_pop_blocked_rounded`; the fallback loop skips the *row* (not
+the candidate — the skip decision is unchanged) when a candidate rounds to the same value. Replayed
+against T's five real candidates: 6 rows -> 5, and only the true duplicate is removed
+(`theo_0_5` 0.20 / `theo_2_5` 0.66 / `theo_5` 0.82 / `theo_10` 0.86 all still log).
+
+The remaining five rows are **not** noise worth suppressing — they are one POP evaluation per
+candidate price column, which is the documented per-candidate design. Worth noting what they reveal:
+T's spread is **$1 wide** (25/26) but the loop also prices it off the `2_5`/`5`/`10` theo columns
+($0.66/$0.82/$0.86), which are the debits for 25/27.5, 25/30 and 25/35 — the pre-existing cross-width
+fallback (Fix D, extended by CX/FN). The POP gate incidentally shields it: overpaying pushes breakeven
+further out, so POP falls 0.35 -> 0.31 -> 0.28 and the gate blocks harder the more it would overpay.
+
+**FP-3: gate decisions were invisible in `ib_cycle.log`.** Both block lines were `logger.info`, and
+`_delegate_open_from_recent_csvs` passes `--quiet` (root logger WARNING) — grepping the log for the
+EMR/T gate lines returns nothing. Same blind spot Fix CF fixed for the pricing chain. Fix: promoted
+the four block lines to `logger.warning`, and added the limit to the primary message so the two
+formerly-indistinguishable rows are now readable. The pass line stays `vprint`/verbose — with FP-1
+in place, a pass is recorded in the CSV's `pop` column, so a WARNING per placed order would be noise.
+
+**What this does NOT change:** the gate's arithmetic, threshold (`--pop-min 0.40`), fail-open
+semantics, the four gate sites' place/skip decisions, candidate ordering, the cross-width fallback,
+or the 25-column attempts schema. `--pop-check off` still disables the gate entirely.
+
+**Also confirmed by the Sep 30 runs (no code change needed):**
+- The attempts CSV is now **25 columns with `pop` at index 22**. The Sep 29 blank-`pop` column was
+  the Fix EZ-1 header-adoption rule working as designed — that day's file was created at 15:00 with
+  the old 24-column header and `_attempts_append` adopts the existing header with
+  `extrasaction="ignore"`, so the new field fell off for the rest of the day. Self-resolved on the
+  next day's fresh file.
+- **No symbol was both blocked and placed.** T was refused on all five candidates and never reached
+  IB. EMR's blocked-at-1.97-then-placed-at-0.25 on Sep 29 was an artifact of the 21:29 after-hours
+  menu run (frozen quotes), not a systematic hole. Note it was also not arbitrary: EMR's gate ceiling
+  at that moneyness is **$0.97** against a $1.85 fair theo, so *no* fair price could have passed —
+  only a stale cheap quote could, and such an order does not fill.
+- A both-legs-OTM **call** can never reach 50% POP: `B = K_long + D > K_long > S` forces `z < 0`, so
+  POP is strictly below 0.50 and practically capped 0.474-0.484 (dte 60-21, sig 0.32). Puts run a few
+  points higher at identical moneyness because the zero-drift lognormal sets the median below the
+  forward. **Consequence:** the Q3 `POP >= 50%` bucket (19 trades, +$388, 89% win rate) is
+  unreachable with both legs OTM, so the 40% floor accepts the best available *OTM* structures rather
+  than being a route into the winning bucket. Reaching that bucket requires an ITM long leg, which
+  the current `_closest_existing(strikes_all, current_price)` rule produces only by coin flip
+  (long leg lands ITM 47% of the time on calls).
+
+**Verification:** `py_compile` clean; LF endings and the 180 pre-existing non-ASCII bytes unchanged
+(zero added). AST re-check: 5 of 7 `record_attempt` calls in `place_debit_spread` now carry `pop`,
+and the 2 that do not are the close-guard skips. `_pop_blocked_rounded` is assigned at indent 16 as a
+sequential sibling of the fallback's enclosing `if not attempted:` — confirmed by AST (writes 4226/
+4435 precede reads 4325/4535) and by scanning for branch boundaries, so it is always bound before it
+is read. Dedupe replayed on T's real candidate set: 6 rows -> 5. End-to-end confirmation comes on the
+next 10:00 / 17:00 run: placed rows should carry a numeric `pop`, `'blank'` should appear only where
+POP is genuinely uncomputable, a blocked spread should write one row per *distinct* candidate debit,
+and `ib_cycle.log` should show the `POP ... < 0.4` WARNING lines.
