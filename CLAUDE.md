@@ -6638,3 +6638,91 @@ is read. Dedupe replayed on T's real candidate set: 6 rows -> 5. End-to-end conf
 next 10:00 / 17:00 run: placed rows should carry a numeric `pop`, `'blank'` should appear only where
 POP is genuinely uncomputable, a blocked spread should write one row per *distinct* candidate debit,
 and `ib_cycle.log` should show the `POP ... < 0.4` WARNING lines.
+
+---
+
+### Fix FQ: Deposit Ledger — a $700 Deposit Was Being Reported as Performance (Oct 1)
+**Status:** ✓ IMPLEMENTED
+
+**Location:** `C:\OptionsHistory\deposits.json` (NEW, the ledger); `MonthlyReview.py`
+(`pl_from` + new module-level `_cash_flows`/`_cumdep`, `section_alpha_beta`);
+`bin/EmailDailyBundle.ps1` (+ mirrored to `C:\OptionsHistory\bin\`); `Health.ps1` and
+`C:\OptionsHistory\bin\Health.ps1` (both **deploy-only**, see the note at the end).
+
+**Incident.** The user deposited **$700** on 2026-10-01. Health reports that afternoon showed
+`YTD change NetLiq: (50.47)`, which reads as "roughly flat since July" -- while actual trading was
+about **(750)** since the 2026-07-27 baseline. The gap was funded, not earned.
+
+| | NetLiq | realized | unrealized |
+|---|---|---|---|
+| Sep 30 17:15 | 1,490.81 | (159.50) | (439.50) |
+| Oct 1 12:00 | 2,001.29 | 0.00 | (426.00) |
+| Oct 1 17:15 | 2,175.98 | 0.00 | (451.69) |
+
+NetLiq rose **+$685** in a day while P&L contributed about **-$12**, which is how the deposit was
+spotted before it compounded.
+
+**Root cause.** `ytd_baseline.json` stores a **fixed NetLiq snapshot**
+(`{"netliq": 2226.45, "ts": "2026-07-27T16:54:56-04:00"}`) and every consumer computes
+`netliq - base.netliq`. That is a pure balance delta, so any external cash flow lands in it as
+performance. Three consumers were affected, and the worst was not the headline:
+`MonthlyReview.section_alpha_beta` builds a NetLiq series and takes **daily returns** off it, so a
+$700 deposit into a $1,490 account is a fake **+47% day** -- which corrupts beta, correlation and
+alpha, not just one number. It also broke the guidance in the `MonthlyReview` tool entry above,
+which calls the month NetLiq delta "THE performance number"; that immunity ends at the first
+deposit.
+
+**Fix -- a cash-flow ledger, not a rebase.** Rebasing `ytd_baseline.json` to the post-deposit
+NetLiq was the other option but throws away the July-onward history. The ledger keeps it:
+
+```json
+{"flows": [{"date": "2026-10-01", "amount": 700.00, "note": "user deposit"}]}
+```
+
+`date` is `YYYY-MM-DD` (America/New_York) and is compared against `ytd_baseline.json`'s `ts[:10]`
+-- a date compare, deliberately, so EDT/EST offset differences cannot make an ISO string compare
+go wrong. Negative amounts are withdrawals. **Every future deposit or withdrawal needs a row here,
+otherwise the performance figures silently count it as a gain again.**
+
+**What each consumer does now:**
+
+- **`Health.ps1` (both copies):** `YTD change NetLiq` keeps its existing raw meaning -- historical
+  report series depend on it -- and two new lines sit beside it:
+  `Deposits (since baseline): 700.00` and `Performance ex-deposits  : (750.47)`. The helper returns
+  `0.0` when the ledger is absent or unreadable, which reproduces the old behaviour exactly.
+- **`EmailDailyBundle.ps1`:** same two lines under the account block in the 17:15 email.
+- **`MonthlyReview.py`:** reads the **ledger directly** rather than trusting the report format.
+  `pl_from(txt, day8)` prefers a report's own `Performance ex-deposits` line when present, and
+  otherwise subtracts `_cumdep(day8)` from the parsed raw figure. That matters: the two reports
+  written on Oct 1 **predate** the Health.ps1 change and carry no adjusted line, so a
+  format-dependent fix left October reading **+685.17**. Reading the ledger fixes history and the
+  future in one place. `section_alpha_beta` now carries actual capital alongside the deposit-free
+  P&L series and computes each step as `(pnl2 - pnl1) / capital1`, with the period return
+  **compounded** from those steps instead of an endpoint ratio (an endpoint ratio is corrupted by
+  any mid-period cash flow).
+
+**Impact (measured):** October month delta **+685.17 -> (14.83)**, which reconciles with the
+unrealized move of -12.19 plus small cash effects. September **(311.59)** and August **176.45** are
+byte-identical -- the deposit is dated Oct 1, so `_cumdep` contributes zero to those windows.
+
+**Verification:** all four files pass `Parser::ParseFile` / `py_compile`; BOM, CRLF-vs-LF and the
+pre-existing non-ASCII counts (45 / 27 / 9 / 0) are unchanged, with zero non-ASCII added; the four
+embedded-Python here-strings in each `Health.ps1` parse identically **before and after** (checked
+against the backups, with `$PSVar` tokens substituted -- the raw blocks never parse as Python
+because PowerShell expands them at runtime); the ledger arithmetic reproduces
+`(50.47) - 700.00 = (750.47)`; and the parser was exercised against both a post-fix report (uses
+the adjusted line, keeps the raw in `ytd_raw`) and a pre-fix one (falls back to the ledger).
+`MonthlyReview` runs clean for 26_08 / 26_09 / 26_10.
+
+**Deploy note.** `MonthlyReview.py` and `bin/EmailDailyBundle.ps1` are committed; the email script
+is mirrored to `C:\OptionsHistory\bin\`. **Both `Health.ps1` copies carry this fix deployed but
+uncommitted**, per the standing convention that they hold the live-port `$IB_PORT = 7496` override.
+That is the same version-control gap the Fix DI correction called out for `EmailDailyBundle.ps1`,
+and it now applies to the deposit logic in both Health copies -- worth resolving by moving the port
+out of those files (e.g. reading it the way the restored email script reads `ib_config.py`) so they
+can be committed like everything else.
+
+**Not touched:** `bin/Health.ps1` in the repo (36,694 bytes) is a **stale third copy** -- it matches
+neither the repo root (53,004) nor the deployed `C:\OptionsHistory\bin` copy (46,178) and is
+referenced by no task or `.cmd`. Left alone deliberately rather than patched, since patching it
+would imply it is live.

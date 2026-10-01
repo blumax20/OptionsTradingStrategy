@@ -121,6 +121,28 @@ def FIN(x):
     except Exception:
         return None
 
+def _deposits_since(base_ts):
+    """Sum external cash flows dated on/after the baseline date.
+
+    A deposit raises NetLiq without being performance, so the raw
+    "NetLiq - baseline" delta counts it as a gain. Returns 0.0 when the ledger
+    is absent or unreadable, which reproduces the old behaviour exactly.
+    """
+    try:
+        import json as _json
+        with open(r"C:\OptionsHistory\deposits.json") as _fh:
+            _d = _json.load(_fh)
+        _rows = _d.get("flows", []) if isinstance(_d, dict) else _d
+        _cut = str(base_ts or "")[:10]
+        _tot = 0.0
+        for _it in _rows or []:
+            if str(_it.get("date", ""))[:10] >= _cut:
+                _tot += float(_it.get("amount") or 0.0)
+        return round(_tot, 2)
+    except Exception:
+        return 0.0
+
+
 def read_ytd_baseline():
     # Same file Health.ps1 derives "YTD change NetLiq" from (Health.ps1 lines 415-429),
     # so the 17:15 email and the 17:15 health report cannot disagree.
@@ -300,6 +322,10 @@ try:
         ytd_chg = round(netliq - float(out["ytd_base_netliq"]), 2)
     out["ytd_change"] = ytd_chg
     out["ytd_note"] = ytd_note
+    # Deposits inflate NetLiq without being performance (see deposits.json).
+    _dep = _deposits_since(out.get("ytd_base_ts"))
+    out["deposits_since_base"] = _dep
+    out["perf_ex_deposits"] = None if ytd_chg is None else round(ytd_chg - _dep, 2)
 
     # MTD: MonthlyReview section A's authoritative number - the current change minus
     # the last change strictly before the month started.
@@ -374,6 +400,10 @@ print(json.dumps(out))
       $since = ''
       if ($pl.ytd_base_ts) { $since = ' (since ' + $pl.ytd_base_ts + ')' }
       $b.Add(("  YTD change NetLiq: {0}{1}" -f (_fmtpl $pl.ytd_change), $since))
+      if ($null -ne $pl.perf_ex_deposits) {
+        $b.Add(("  Deposits (since baseline): {0}" -f (_fmtpl $pl.deposits_since_base)))
+        $b.Add(("  Performance ex-deposits  : {0}" -f (_fmtpl $pl.perf_ex_deposits)))
+      }
     } else {
       $note = 'unavailable'
       if ($pl.ytd_note) { $note = $pl.ytd_note }

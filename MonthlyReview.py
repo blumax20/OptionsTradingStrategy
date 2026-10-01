@@ -157,14 +157,29 @@ def load_health(month_yyyymm, prev_lookback=12):
             prior_files.append((day, m.group(2), p))
     prior_files = prior_files[-prev_lookback:]
 
-    def pl_from(txt):
+    def pl_from(txt, day8):
         g = {}
         for label, key in (("Realized \\(day\\)", "realized"),
                            ("Unrealized \\(open\\)", "unrealized"),
                            ("Day Total", "day_total"),
-                           ("YTD change NetLiq", "ytd")):
+                           ("YTD change NetLiq", "ytd"),
+                           ("Deposits \\(since baseline\\)", "deposits"),
+                           ("Performance ex-deposits", "perf")):
             m = re.search(label + r"\s*:\s*([^\r\n]+)", txt)
             g[key] = money(m.group(1)) if m else None
+        # "YTD change NetLiq" is a fixed-baseline NetLiq delta, so a deposit
+        # lands in it as a gain. Prefer the report's own adjusted line when it
+        # has one; otherwise subtract the ledger here, so reports written before
+        # the Health.ps1 change (and every historical one) are corrected too.
+        if g.get("perf") is not None:
+            g["ytd_raw"] = g["ytd"]
+            g["ytd"] = g["perf"]
+        elif g.get("ytd") is not None:
+            _dep = _cumdep(day8)
+            if _dep:
+                g["ytd_raw"] = g["ytd"]
+                g["ytd"] = round(g["ytd"] - _dep, 2)
+                g["deposits"] = _dep
         return g
 
     daily = {}
@@ -174,7 +189,7 @@ def load_health(month_yyyymm, prev_lookback=12):
 
     for day, t, p in prior_files:
         txt = read_txt(p)
-        g = pl_from(txt)
+        g = pl_from(txt, day)
         if g["ytd"] is not None:
             baseline_pl = (day, g["ytd"])
         pos = parse_positions(txt)
@@ -183,7 +198,7 @@ def load_health(month_yyyymm, prev_lookback=12):
 
     for day, t, p in month_files:
         txt = read_txt(p)
-        g = pl_from(txt)
+        g = pl_from(txt, day)
         if g["ytd"] is not None:
             daily[day] = (day, g["realized"], g["unrealized"], g["day_total"], g["ytd"])
         pos = parse_positions(txt)
@@ -248,8 +263,10 @@ def section_performance(out, daily, baseline_pl, month_label):
             fmt(peak, 0).strip(), fmt(trough, 0).strip()))
     out.append("Sum of IB daily Realized           : {}".format(fmt(realized_sum, 0).strip()))
     out.append("")
-    out.append("NOTE: NetLiq delta is the performance number. Per-trade P/L below is")
-    out.append("estimated from submitted limits/avgCost; unfilled attempts are excluded.")
+    out.append("NOTE: NetLiq delta is the performance number, net of deposits "
+               "(deposits.json).")
+    out.append("Per-trade P/L below is estimated from submitted limits/avgCost;")
+    out.append("unfilled attempts are excluded.")
     out.append("")
 
 
@@ -829,6 +846,35 @@ def section_opportunity(out, signals, attempts, unfilled, ledger, ib):
     out.append("")
 
 
+_FLOWS_CACHE = None
+
+
+def _cash_flows():
+    """[(YYYY-MM-DD, amount)] from deposits.json; [] when absent. Cached."""
+    global _FLOWS_CACHE
+    if _FLOWS_CACHE is not None:
+        return _FLOWS_CACHE
+    import json as _json
+    try:
+        with open(os.path.join(OH, "deposits.json")) as fh:
+            d = _json.load(fh)
+        rows = d.get("flows", []) if isinstance(d, dict) else d
+        _FLOWS_CACHE = sorted((str(r.get("date", ""))[:10], float(r.get("amount") or 0.0))
+                              for r in rows or [])
+    except Exception:
+        _FLOWS_CACHE = []
+    return _FLOWS_CACHE
+
+
+def _cumdep(day8):
+    """Cumulative external cash in, from the baseline through day8 (YYYYMMDD)."""
+    if not day8 or len(str(day8)) < 8:
+        return 0.0
+    day8 = str(day8)
+    iso = day8[:4] + "-" + day8[4:6] + "-" + day8[6:8]
+    return round(sum(a for dt, a in _cash_flows() if dt <= iso), 2)
+
+
 def section_alpha_beta(out, daily, baseline_pl, ib):
     out.append("=== E. ALPHA / BETA vs SPY ===")
     out.append("")
@@ -845,23 +891,30 @@ def section_alpha_beta(out, daily, baseline_pl, ib):
         out.append("")
         return
 
+    # `ytd` here is already deposit-free (see pl_from). Carry the actual capital
+    # alongside it so a daily return divides pure P&L change by real capital --
+    # a $700 deposit into a $1,490 account is otherwise a fake +47% day.
     series = []
     if baseline_pl:
-        series.append((baseline_pl[0], base + baseline_pl[1]))
+        _pnl = base + baseline_pl[1]
+        series.append((baseline_pl[0], _pnl, _pnl + _cumdep(baseline_pl[0])))
     for day, _r, _u, _d, ytd in daily:
         if ytd is not None:
-            series.append((day, base + ytd))
+            _pnl = base + ytd
+            series.append((day, _pnl, _pnl + _cumdep(day)))
 
     spy = daily_close(ib, "SPY", "90 D")
-    pts = [(d, nl) for d, nl in series if d in spy and nl]
+    pts = [(d, pnl, cap) for d, pnl, cap in series if d in spy and pnl]
     if len(pts) < 6:
         out.append("SKIPPED: not enough overlapping account/SPY days ({}).".format(len(pts)))
         out.append("")
         return
 
     ra, rm = [], []
-    for (d1, n1), (d2, n2) in zip(pts, pts[1:]):
-        ra.append(n2 / n1 - 1.0)
+    for (d1, p1, c1), (d2, p2, c2) in zip(pts, pts[1:]):
+        if not c1:
+            continue
+        ra.append((p2 - p1) / c1)
         rm.append(spy[d2] / spy[d1] - 1.0)
     n = len(ra)
     mean_a, mean_m = sum(ra) / n, sum(rm) / n
@@ -871,7 +924,12 @@ def section_alpha_beta(out, daily, baseline_pl, ib):
     sd_m = var_m ** 0.5
     beta = cov / var_m if var_m > 0 else None
     corr = cov / (sd_a * sd_m) if sd_a > 0 and sd_m > 0 else None
-    r_acct = pts[-1][1] / pts[0][1] - 1.0
+    # Time-weighted: compound the per-period returns rather than taking an
+    # endpoint ratio, which a mid-period cash flow would corrupt.
+    _acc = 1.0
+    for _a in ra:
+        _acc *= (1.0 + _a)
+    r_acct = _acc - 1.0
     r_spy = spy[pts[-1][0]] / spy[pts[0][0]] - 1.0
 
     out.append("period                 : {} -> {} ({} daily returns)".format(
