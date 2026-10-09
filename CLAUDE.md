@@ -6705,9 +6705,10 @@ otherwise the performance figures silently count it as a gain again.**
 unrealized move of -12.19 plus small cash effects. September **(311.59)** and August **176.45** are
 byte-identical -- the deposit is dated Oct 1, so `_cumdep` contributes zero to those windows.
 
-**Verification:** all four files pass `Parser::ParseFile` / `py_compile`; BOM, CRLF-vs-LF and the
-pre-existing non-ASCII counts (45 / 27 / 9 / 0) are unchanged, with zero non-ASCII added; the four
-embedded-Python here-strings in each `Health.ps1` parse identically **before and after** (checked
+**Verification (INSUFFICIENT -- see Fix FR):** all four files pass `Parser::ParseFile` / `py_compile`;
+BOM, CRLF-vs-LF and the pre-existing non-ASCII counts (45 / 27 / 9 / 0) are unchanged, with zero
+non-ASCII added; the four embedded-Python here-strings in each `Health.ps1` parse identically
+**before and after** (checked
 against the backups, with `$PSVar` tokens substituted -- the raw blocks never parse as Python
 because PowerShell expands them at runtime); the ledger arithmetic reproduces
 `(50.47) - 700.00 = (750.47)`; and the parser was exercised against both a post-fix report (uses
@@ -6726,3 +6727,64 @@ can be committed like everything else.
 neither the repo root (53,004) nor the deployed `C:\OptionsHistory\bin` copy (46,178) and is
 referenced by no task or `.cmd`. Left alone deliberately rather than patched, since patching it
 would imply it is live.
+---
+
+### Fix FR: Fix FQ Regression — `_deposits_since` Defined Inside `main()` Killed the Health P&L Probe for 8 Days (Oct 9)
+**Status:** ✓ IMPLEMENTED (both `Health.ps1` copies; deploy-only, they carry the live-port `$IB_PORT` override)
+
+**Location:** `Health.ps1` (repo root) and `C:\OptionsHistory\bin\Health.ps1` — the first `@" ... "@`
+heredoc (the P&L Summary probe): `def _deposits_since(...)` hoisted from the middle of `main()` to
+module level, immediately above `def main():`.
+
+**Incident.** Fix FQ (2026-10-01 17:57) added a `_deposits_since` helper to the P&L probe and placed
+`def _deposits_since(base_ts):` **at column 0 in the middle of `main()`**. That ended main()'s body.
+Everything after it — the `ytd_baseline.json` block, `out["ok"] = True` and
+`print(json.dumps(out))` — became unreachable statements **inside the helper**, after its
+`try/except` returns. The probe printed nothing, `$plJson` came back empty, `ConvertFrom-Json`
+failed, `$obj` was null, and the PowerShell fell to its `else` branch emitting a bare `P/L: `.
+
+Net effect: the **entire "P/L Summary" block is absent from every health report from 2026-10-02
+through 2026-10-09** (confirmed present through `health_20261001_171500`, absent in all 20 reports
+after). Eight trading days of `Realized (day)` / `Unrealized (open)` / `YTD change NetLiq` were
+never captured and are **not recoverable** from local data. The tell, missed for 8 days: the
+`Deposits (since baseline)` line the fix existed to add **never appeared even once**.
+
+**Downstream damage.** `MonthlyReview --month 26_10` section A sees only Oct 1 and prints
+`Month NetLiq delta (authoritative): (14.83)` when the true Oct-to-date performance is
+**(242.76)**. That particular number self-heals once a post-fix report lands, because the delta is
+endpoint-based (`last ytd in month − last ytd before month`), not a sum; the Oct 2-9 **daily
+trajectory** is permanently lost. It also briefly corrupted a live analysis: a Sep 8 - Oct 9
+"authoritative realized" figure of (254.48) was quoted from the truncated series when the real
+deposit-adjusted window performance is **(567.03)**.
+
+**Why the Fix FQ verification missed it.** The check confirmed the embedded Python **parsed** — and
+dead code after a `return` is perfectly legal Python, so this bug passes a parse check trivially. A
+naive `ast.walk(main)` also passes, because `main()` still contains an error-path
+`print(json.dumps({...}))` inside a nested `try`. Both were tried and both reported OK.
+
+**The assertion that actually catches it** is structural, not syntactic:
+1. `main()`'s **last top-level statement** must be `print(json.dumps(out))`.
+2. The helper must have **nothing after** its `try/except` (dead-statement count 0).
+Both copies were fixed under that assertion (`before: main_last_prints=False dead_in_helper=6`;
+`after: True / 0`), then verified **end-to-end** by extracting the heredoc, substituting
+`$IB_PORT`, and running it:
+`{"ok": true, "day_realized": 8.07, "day_unrealized": -312.0, "ytd_change": -278.4,
+"deposits_since_base": 700.0, "perf_ex_deposits": -978.4}`.
+Both files `Parser::ParseFile` clean; BOM/CRLF and the pre-existing non-ASCII counts (45 / 27)
+unchanged; the diff is exactly the hoist (block moved from line ~414 to ~361, nothing else).
+
+**Not affected:** `bin/EmailDailyBundle.ps1` (+ its deployed copy) got the same helper but correctly
+placed at module level between `FIN` and `read_ytd_baseline` — verified, no orphaned code.
+`MonthlyReview.py` is plain Python and reads the ledger directly, so it was never broken, only
+starved of input.
+
+**Standing lesson, worth more than the fix:** for generated or embedded code, **"it compiles" is not
+evidence it runs.** When a patch moves a `def` in a heredoc, assert reachability of the function's
+observable effect (here: the single `print` that is the probe's entire contract), not just that the
+file parses.
+
+**Also reinforces the open item from Fix DI/FQ:** both `Health.ps1` copies remain **uncommitted**
+because they carry the live-port `$IB_PORT = 7496` override, so this regression sat in a file no
+diff ever reviewed. Moving the port out (reading `ib_config.py` the way the restored
+`EmailDailyBundle.ps1` does) would put both copies under version control — the concrete reason to
+do it is now on the record.
