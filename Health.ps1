@@ -8,11 +8,19 @@
  ======================================================================= #>
 
 # ---------- Settings ----------
-# To switch between paper and live trading, update $IB_PORT below
-# (must match IB_PORT in InteractiveBrokersTrader\ib_config.py):
-#   Paper trading : $IB_PORT = 7497
-#   Live trading  : $IB_PORT = 7496
+# IB API port. The single source of truth is IB_PORT in
+# InteractiveBrokersTrader\ib_config.py, which this script reads below, so a
+# paper/live switch cannot leave the health report probing a dead port.
+#   Paper trading : 7497        Live trading : 7496
+# The literal is only the fallback for when that file cannot be read. It is
+# also what switch_trading_mode.py rewrites, so that tool still works as-is.
 $IB_PORT = 7497
+try {
+  $_ibCfg = "C:\Users\Administrator\code\OptionsTradingStrategy\InteractiveBrokersTrader\ib_config.py"
+  $_ibM = Select-String -Path $_ibCfg -Pattern '^\s*IB_PORT\s*:\s*int\s*=\s*(\d{4,5})' -ErrorAction Stop |
+          Select-Object -First 1
+  if ($_ibM) { $IB_PORT = [int]$_ibM.Matches[0].Groups[1].Value }
+} catch { }
 
 $PublicHost = $env:CF_PUBLIC_HOST
 if (-not $PublicHost -or -not $PublicHost.Trim()) { $PublicHost = 'signals.hyperbukit.com' }
@@ -227,6 +235,78 @@ try {
     "cloudflared: NOT running (service may manage it under a different name)" | Tee-Object -FilePath $Report -Append
   }
 } catch { "cloudflared: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append }
+
+$WebhookSecret = ""
+try { $WebhookSecret = (Get-Content "C:\Users\Administrator\.secrets\webhook.key" -Raw -ErrorAction Stop).Trim() } catch {}
+
+function Hide-Secret([string]$t) {
+  # Exception messages echo the request URI; keep the secret out of the report
+  # file and the menu's Start-Transcript log.
+  if ($null -eq $t) { return "" }
+  return ($t -replace '/s/[^/\s"]+', '/s/***')
+}
+
+function Get-HttpStatus {
+  # Windows PowerShell 5.1's Invoke-WebRequest -MaximumRedirection 0 throws a
+  # bare InvalidOperationException on a redirect and exposes no Response object,
+  # so the status code is unrecoverable -- it surfaces only as "Operation is not
+  # valid due to the current state of the object". Use HttpWebRequest directly.
+  param([string]$Uri, [int]$TimeoutSec = 8)
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+  $req = [Net.HttpWebRequest]::Create($Uri)
+  $req.AllowAutoRedirect = $false
+  $req.Timeout           = $TimeoutSec * 1000
+  $req.UserAgent         = "HyperOS-Health"
+  $resp = $null
+  try { $resp = $req.GetResponse() }
+  catch [Net.WebException] { $resp = $_.Exception.Response; if (-not $resp) { throw } }
+  $code = 0; $loc = ""; $body = ""
+  try { $code = [int]$resp.StatusCode } catch {}
+  try { $loc  = "$($resp.Headers['Location'])" } catch {}
+  try {
+    $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+    $body = $sr.ReadToEnd(); $sr.Close()
+  } catch {}
+  try { $resp.Close() } catch {}
+  return [pscustomobject]@{ Code = $code; Location = $loc; Body = $body }
+}
+
+function Test-PublicEndpoint {
+  # Two probes, because they prove different things:
+  #   authed   /s/<secret>/... exercises the whole machine plane end to end:
+  #            DNS -> Cloudflare -> Access bypass -> tunnel -> origin -> app.
+  #            This is the probe that says the tunnel is actually carrying
+  #            traffic; a redirect off the bare path says only that Cloudflare
+  #            answered, which stays true even when the origin is down.
+  #   unauth   the bare path must NOT return 200. A 302 to cloudflareaccess.com
+  #            confirms SSO is still enforcing on the human plane.
+  param([string]$Route, [string]$Label)
+  if ($WebhookSecret) {
+    try {
+      $a = Get-HttpStatus -Uri ("https://{0}/s/{1}{2}" -f $PublicHost, $WebhookSecret, $Route)
+      if ($a.Code -eq 200) {
+        $c = "$($a.Body)"
+        if ($c.Length -gt 200) { $c = $c.Substring(0,200) + "..." }
+        ("{0}: 200 {1}" -f $Label, (Hide-Secret $c))
+      } else {
+        ("{0}: UNHEALTHY HTTP {1} on authenticated path {2}" -f $Label, $a.Code, $a.Location)
+      }
+    } catch { ("{0}: ERROR {1}" -f $Label, (Hide-Secret $_.Exception.Message)) }
+  } else {
+    ("{0}: SKIPPED (webhook.key unreadable)" -f $Label)
+  }
+  try {
+    $b = Get-HttpStatus -Uri ("https://{0}{1}" -f $PublicHost, $Route)
+    if ((@(301,302,303,307,308) -contains $b.Code) -and ($b.Location -match 'cloudflareaccess\.com')) {
+      ("{0} [unauth]: OK {1} -> Cloudflare Access login (SSO enforcing)" -f $Label, $b.Code)
+    } elseif ($b.Code -eq 200) {
+      ("{0} [unauth]: WARNING 200 without SSO - Access is NOT enforcing" -f $Label)
+    } else {
+      ("{0} [unauth]: HTTP {1} {2}" -f $Label, $b.Code, $b.Location)
+    }
+  } catch { ("{0} [unauth]: ERROR {1}" -f $Label, (Hide-Secret $_.Exception.Message)) }
+}
+
 try {
   $dns = Resolve-DnsName -Name $PublicHost -ErrorAction Stop
   $ip  = ($dns | Where-Object { $_.QueryType -in 'A','AAAA' } | Select-Object -First 1).IPAddress
@@ -237,15 +317,10 @@ try {
   ("tcp443: Ping={0} Tcp={1} Remote={2}" -f $tcp.PingSucceeded, $tcp.TcpTestSucceeded, $tcp.RemoteAddress) |
     Tee-Object -FilePath $Report -Append | Out-Null
 } catch { "tcp443: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append }
-try {
-  $ph = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Uri ("https://{0}/health" -f $PublicHost)
-  $hc = $ph.Content; if ($hc.Length -gt 240) { $hc = $hc.Substring(0,240) + "..." }
-  "public health: $($ph.StatusCode) $hc"   | Tee-Object -FilePath $Report -Append
-} catch { "public health: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append }
-try {
-  $pm = Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 -Uri ("https://{0}/mdtest?symbol=SPY&mdtype=4&timeout_ms=1200" -f $PublicHost)
-  "public mdtest: $($pm.StatusCode) $($pm.Content)" | Tee-Object -FilePath $Report -Append
-} catch { "public mdtest: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append }
+Test-PublicEndpoint -Route "/health" -Label "public health" |
+  Tee-Object -FilePath $Report -Append
+Test-PublicEndpoint -Route "/mdtest?symbol=SPY&mdtype=4&timeout_ms=1200" -Label "public mdtest" |
+  Tee-Object -FilePath $Report -Append
 " "                                        | Tee-Object -FilePath $Report -Append
 
 # ---------- Daily CSV presence ----------
@@ -291,6 +366,27 @@ def f(x):
     try: return float(x)
     except: return None
 
+def _deposits_since(base_ts):
+    """Sum external cash flows dated on/after the baseline date.
+
+    A deposit raises NetLiq without being performance, so the raw
+    "NetLiq - baseline" delta counts it as a gain. Returns 0.0 when the ledger
+    is absent or unreadable, which reproduces the old behaviour exactly.
+    """
+    try:
+        import json as _json
+        with open(r"C:\OptionsHistory\deposits.json") as _fh:
+            _d = _json.load(_fh)
+        _rows = _d.get("flows", []) if isinstance(_d, dict) else _d
+        _cut = str(base_ts or "")[:10]
+        _tot = 0.0
+        for _it in _rows or []:
+            if str(_it.get("date", ""))[:10] >= _cut:
+                _tot += float(_it.get("amount") or 0.0)
+        return round(_tot, 2)
+    except Exception:
+        return 0.0
+
 def main():
     out = {"ok": False}
     ib = IB()
@@ -315,13 +411,35 @@ def main():
                     vals[av.tag] = av.value
     except Exception: pass
 
-    day_real = f(vals.get("RealizedPnL"))
-    day_unrl = f(vals.get("UnrealizedPnL"))
+    # Fix FD (H4): realized/unrealized via reqPnL (cleaner than accountValues tags), falling
+    # back to the RealizedPnL/UnrealizedPnL tags if the stream does not populate. Day Total is
+    # realized + unrealized (so it always adds up); all values rounded to 2dp.
+    day_real = None; day_unrl = None
+    try:
+        if acct:
+            _pnl = ib.reqPnL(acct)
+            ib.sleep(2.5)
+            def _fin(x):
+                try:
+                    xv = float(x)
+                    return xv if xv == xv else None   # drop nan
+                except Exception:
+                    return None
+            day_unrl = _fin(getattr(_pnl, "unrealizedPnL", None))
+            day_real = _fin(getattr(_pnl, "realizedPnL", None))
+            try: ib.cancelPnL(acct)
+            except Exception: pass
+    except Exception: pass
+
+    if day_real is None: day_real = f(vals.get("RealizedPnL"))
+    if day_unrl is None: day_unrl = f(vals.get("UnrealizedPnL"))
     netliq   = f(vals.get("NetLiquidation"))
 
+    day_real = round(day_real, 2) if day_real is not None else None
+    day_unrl = round(day_unrl, 2) if day_unrl is not None else None
     out["day_realized"]   = day_real
     out["day_unrealized"] = day_unrl
-    out["day_total"]      = (day_real or 0) + (day_unrl or 0)
+    out["day_total"]      = round((day_real or 0) + (day_unrl or 0), 2)
 
     basef = r"C:\OptionsHistory\ytd_baseline.json"
     now   = datetime.now(ZoneInfo("America/New_York"))
@@ -338,6 +456,11 @@ def main():
 
     if netliq is not None:
         out["ytd_change"] = round(netliq - float(base.get("netliq", 0.0)), 2)
+        # Deposits inflate NetLiq without being performance. Keep ytd_change raw
+        # (historical series depend on it) and report the adjusted figure beside it.
+        _dep = _deposits_since(base.get("ts"))
+        out["deposits_since_base"] = _dep
+        out["perf_ex_deposits"] = round(out["ytd_change"] - _dep, 2)
     out["ok"] = True
     print(json.dumps(out))
 if __name__ == "__main__":
@@ -354,12 +477,24 @@ try {
     if ($v -is [string] -and $v.Trim() -eq '') { return $fallback }
     return $v
   }
+  # Fix FD (H4): P/L formatter — 2dp, negatives shown in parentheses e.g. (645.88)
+  function _fmtpl($v) {
+    if ($null -eq $v) { return '-' }
+    $d = 0.0
+    if (-not [double]::TryParse([string]$v, [ref]$d)) { return "$v" }
+    $s = ('{0:N2}' -f [math]::Abs($d))
+    if ($d -lt 0) { return "($s)" } else { return $s }
+  }
   if ($obj -and $obj.ok) {
-    ("Day Realized   : {0}" -f (_co $obj.day_realized   '-')) | Tee-Object -FilePath $Report -Append
-    ("Day Unrealized : {0}" -f (_co $obj.day_unrealized '-')) | Tee-Object -FilePath $Report -Append
-    ("Day Total      : {0}" -f (_co $obj.day_total      '-')) | Tee-Object -FilePath $Report -Append
+    ("Realized (day)   : {0}" -f (_fmtpl $obj.day_realized))   | Tee-Object -FilePath $Report -Append
+    ("Unrealized (open): {0}" -f (_fmtpl $obj.day_unrealized)) | Tee-Object -FilePath $Report -Append
+    ("Day Total        : {0}" -f (_fmtpl $obj.day_total))      | Tee-Object -FilePath $Report -Append
     if ($obj.PSObject.Properties.Name -contains 'ytd_change') {
-      ("YTD Δ NetLiq  : {0}" -f (_co $obj.ytd_change '-'))    | Tee-Object -FilePath $Report -Append
+      ("YTD change NetLiq: {0}" -f (_fmtpl $obj.ytd_change))   | Tee-Object -FilePath $Report -Append
+    }
+    if ($obj.PSObject.Properties.Name -contains 'deposits_since_base') {
+      ("Deposits (since baseline): {0}" -f (_fmtpl $obj.deposits_since_base)) | Tee-Object -FilePath $Report -Append
+      ("Performance ex-deposits  : {0}" -f (_fmtpl $obj.perf_ex_deposits))    | Tee-Object -FilePath $Report -Append
     }
   } else {
     "P/L: $plJson" | Tee-Object -FilePath $Report -Append
@@ -371,94 +506,88 @@ try {
 }
 " " | Tee-Object -FilePath $Report -Append
 
-# ---------- Last 20 Orders Submitted (open) ----------
-"--- Last 20 Orders Submitted (open) ---" | Tee-Object -FilePath $Report -Append
+# ---------- Last 20 Orders Submitted (from attempts CSV; survives IBGateway restarts) ----------
+"--- Last 20 Orders Submitted (attempts CSV; [working]=live open order) ---" | Tee-Object -FilePath $Report -Append
 $tmpPlacedPy = Join-Path $env:TEMP ("placed_" + [guid]::NewGuid().ToString('N') + ".py")
 @"
-from ib_insync import IB, util, ExecutionFilter
+from ib_insync import IB
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import csv, os
 
-NY, UTC = ZoneInfo("America/New_York"), ZoneInfo("UTC")
-
-def parse_ib_time(s):
-    try:
-        dt = util.parseIBDatetime(s)
-        if dt.tzinfo is None: return dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
-    except: return None
+NY = ZoneInfo("America/New_York")
+OPEN_ACT  = {"open_call", "open_put"}
+CLOSE_ACT = {"close", "force_close", "close_call", "close_put", "close_individual_leg"}
+OK_STATUS = {"placed", "submitted", "success"}
+WORKING   = {"presubmitted", "submitted", "pendingsubmit", "inactive"}
 
 def main():
+    # Live annotation: symbols with a currently-working order. Fix FD (H1): reqAllOpenOrders +
+    # reqOpenOrders (Fix CZ/DA reclaim) so prior-session clientId=101 orders are visible.
+    working = {}
     ib = IB()
     try:
         ib.connect('127.0.0.1', $IB_PORT, clientId=900, timeout=6)
-    except Exception as e:
-        print(f"(submitted) error: connect: {e}")
-        return
-
-    try:
-        rows = []  # list of (t_utc, display_line)
-
-        # Part 1: Currently open/pending orders (requires sleep for cross-clientId propagation)
         try:
-            ib.reqAllOpenOrders()
-            ib.sleep(2.0)
+            ib.reqAllOpenOrders(); ib.sleep(1.5)
+            ib.reqOpenOrders();    ib.sleep(0.5)
         except Exception:
             pass
         for tr in (ib.openTrades() or []):
-            c, o = tr.contract, tr.order
-            sym = getattr(c, "symbol", "?")
-            act = getattr(o, "action", "?")
-            ot  = (getattr(o, "orderType", "") or "").upper()
-            lmt = getattr(o, "lmtPrice", None)
-            price = f"{lmt:.2f}" if lmt else "MKT"
-            st = getattr(tr.orderStatus, "status", "")
-            t_str = getattr(tr.orderStatus, "lastUpdateTime", "") or ""
-            t_utc = parse_ib_time(t_str) if t_str else None
-            ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M") if t_utc else "?"
-            rows.append((t_utc or datetime.min.replace(tzinfo=UTC),
-                         f"{ts}  {sym:<6}  {act:<4}  {ot:<3}  @`${price}  [{st}]"))
-
-        # Part 2: Recent fills from last 48h (covers filled/cancelled orders no longer in openTrades)
-        since_str = (datetime.now(UTC) - timedelta(hours=48)).strftime("%Y%m%d-%H:%M:%S")
-        fills = ib.reqExecutions(ExecutionFilter(time=since_str)) or []
-        seen_ids = set()
-        for fill in fills:
-            c, e = fill.contract, fill.execution
-            if getattr(c, "secType", "") not in ("OPT", "BAG"):
+            st = (getattr(tr.orderStatus, "status", "") or "")
+            if st.lower() not in WORKING:
                 continue
-            t_utc = parse_ib_time(getattr(e, "time", ""))
-            if not t_utc:
-                continue
-            # Deduplicate: use first 24 chars of execId as key
-            eid = (getattr(e, "execId", "") or "")[:24]
-            if eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-            sym  = getattr(c, "symbol", "?")
-            side = getattr(e, "side", "?")   # "BOT" or "SLD"
-            act  = "BUY " if side == "BOT" else "SELL"
-            px   = float(getattr(e, "price", 0.0) or 0.0)
-            exp  = getattr(c, "lastTradeDateOrContractMonth", "") or ""
-            rt   = getattr(c, "right", "") or ""
-            exp_rt = f" {exp} {rt}" if exp else ""
-            ts = t_utc.astimezone(NY).strftime("%Y-%m-%d %H:%M")
-            rows.append((t_utc, f"{ts}  {sym:<6}{exp_rt:<12}  {act}  fill  @`${px:.2f}"))
-
-        rows.sort(key=lambda r: r[0], reverse=True)
-        rows = rows[:20]
-
-        if not rows:
-            print("(no placed orders in recent 48h window)")
-            return
-        for _, line in rows:
-            print(line)
-
-    except Exception as e:
-        print(f"(submitted) error: {e}")
+            sym = getattr(tr.contract, "symbol", "") or ""
+            if sym:
+                working[sym.upper()] = st
+    except Exception:
+        pass
     finally:
         try: ib.disconnect()
         except: pass
+
+    # Primary source: persistent attempts CSVs (never wiped by the daily IBGateway restart).
+    rows = []
+    today = datetime.now(NY)
+    for back in range(0, 4):
+        folder = (today - timedelta(days=back)).strftime("%y_%m_%d")
+        path = r"C:\OptionsHistory\{0}\attempts_{0}.csv".format(folder)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    act = (r.get("action") or "").strip().lower()
+                    stt = (r.get("status") or "").strip().lower()
+                    if act not in OPEN_ACT and act not in CLOSE_ACT:
+                        continue
+                    if stt not in OK_STATUS:
+                        continue
+                    try:
+                        tdt = datetime.fromisoformat((r.get("ts") or "").strip())
+                    except Exception:
+                        continue
+                    sym = (r.get("symbol") or "").strip().upper()
+                    oa  = (r.get("order_action") or "").strip()
+                    ot  = (r.get("order_type") or "").strip()
+                    lim = (r.get("limit") or "").strip()
+                    rsn = (r.get("reason") or "").strip()
+                    oatype = (oa + "/" + ot).strip("/") or "-"
+                    lims = ("limit=" + lim) if lim else "MKT"
+                    wk = "  [working]" if sym in working else ""
+                    line = "{0}  {1:<6} {2:<9} {3:<9} {4:<11}  ({5}){6}".format(
+                        tdt.strftime("%Y-%m-%d %H:%M"), sym, act, oatype, lims, rsn, wk)
+                    rows.append((tdt, line))
+        except Exception:
+            continue
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    rows = rows[:20]
+    if not rows:
+        print("(no placements in recent attempts CSVs)")
+        return
+    for _, line in rows:
+        print(line)
 
 if __name__ == '__main__':
     main()
@@ -476,6 +605,38 @@ try {
   "placed-orders: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
 } finally {
   Remove-Item -Force -ErrorAction SilentlyContinue $tmpPlacedPy
+}
+" " | Tee-Object -FilePath $Report -Append
+
+# ---------- Rejected / Errored Orders (today) ----------
+# Fix FD (H2): surface IB async rejections (bs_rejected_bag_e201 = margin/PDT/permission) and
+# hard-failure skips from today's attempts CSV. Read-only; no IB connection.
+"--- Rejected / Errored Orders (today) ---" | Tee-Object -FilePath $Report -Append
+try {
+  $errFile = Get-ChildItem -Path ("C:\OptionsHistory\{0}" -f $dated) -Filter 'attempts_*.csv' -File -EA SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if (-not $errFile) {
+    "  (no attempts CSV today)" | Tee-Object -FilePath $Report -Append
+  } else {
+    $erows = @(); try { $erows = Import-Csv $errFile.FullName -EA Stop } catch { $erows = @() }
+    $bad = $erows | Where-Object {
+      $_.status -eq 'error' -or
+      ($_.status -eq 'skipped' -and $_.reason -match 'bs_rejected|no_viable_limit|opposite_unwind_failed|place_failed|qualify_failed')
+    }
+    if (-not $bad -or @($bad).Count -eq 0) {
+      "  (no rejected/errored orders today)" | Tee-Object -FilePath $Report -Append
+    } else {
+      @($bad) | Sort-Object { $_.ts } | Select-Object -Last 20 | ForEach-Object {
+        $t = "$($_.ts)"; try { $t = ([datetime]$_.ts).ToString('yyyy-MM-dd HH:mm') } catch {}
+        $rs = "$($_.reason)"; if ($rs.Length -gt 70) { $rs = $rs.Substring(0,70) }
+        $lm = if ("$($_.limit)".Trim() -ne '') { "limit=$("$($_.limit)".Trim())" } else { "" }
+        ("  {0}  {1,-6} {2,-10} {3,-8} {4}  {5}" -f $t, $_.symbol, $_.action, $_.status, $rs, $lm) |
+          Tee-Object -FilePath $Report -Append
+      }
+    }
+  }
+} catch {
+  ("  Rejected/Errored section error: {0}" -f $_.Exception.Message) | Tee-Object -FilePath $Report -Append
 }
 " " | Tee-Object -FilePath $Report -Append
 
@@ -548,8 +709,81 @@ try {
 }
 " " | Tee-Object -FilePath $Report -Append
 
+# ---------- Closes Attempted But Still Open (unfilled) ----------
+# Flags symbols that had a close attempt in today's attempts CSV but are STILL held
+# (close placed but never filled -- e.g. low demand). Read-only; may need manual intervention.
+"--- Closes Attempted But Still Open (today; likely unfilled) ---" | Tee-Object -FilePath $Report -Append
+$tmpUnfilledPy = Join-Path $env:TEMP ("unfilledclose_" + [guid]::NewGuid().ToString('N') + ".py")
+@"
+import csv, os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from ib_insync import IB
+
+NY = ZoneInfo("America/New_York")
+
+def main():
+    folder = datetime.now(NY).strftime("%y_%m_%d")
+    path = r"C:\OptionsHistory\{0}\attempts_{0}.csv".format(folder)
+    close_actions = {"close", "force_close", "close_individual_leg"}
+    ok_status = {"placed", "submitted"}
+    attempted = {}
+    if os.path.exists(path):
+        try:
+            with open(path, newline="") as fh:
+                for row in csv.DictReader(fh):
+                    act = (row.get("action") or "").strip().lower()
+                    stt = (row.get("status") or "").strip().lower()
+                    if act in close_actions and stt in ok_status:
+                        sym = (row.get("symbol") or "").strip().upper()
+                        if sym:
+                            attempted[sym] = (row.get("limit") or "", row.get("reason") or "")
+        except Exception as e:
+            print("(unfilled-close) csv error: {0}".format(e)); return
+    if not attempted:
+        print("(no close attempts in today's attempts CSV)"); return
+    ib = IB()
+    held = set()
+    try:
+        ib.connect('127.0.0.1',$IB_PORT,clientId=885,timeout=6)
+        ib.sleep(1.5)
+        for p in ib.positions():
+            c = p.contract
+            if getattr(c,"secType","")=="OPT" and abs(float(p.position or 0.0))>1e-9:
+                held.add((c.symbol or "").upper())
+    except Exception as e:
+        print("(unfilled-close) IB error: {0}".format(e)); return
+    finally:
+        try: ib.disconnect()
+        except: pass
+    flagged = sorted(s for s in attempted if s in held)
+    if not flagged:
+        print("(all of today's close attempts are no longer held -- none stuck)"); return
+    for s in flagged:
+        lim, reason = attempted[s]
+        lim_s = lim if lim else "?"
+        print("{0:<6} close placed limit={1} ({2}) -- STILL OPEN, likely unfilled (low demand); consider manual close".format(s, lim_s, reason))
+
+if __name__=='__main__': main()
+"@ | Set-Content -Encoding ASCII $tmpUnfilledPy
+
+try {
+  $unfilledOut = & $Py $tmpUnfilledPy 2>$null
+  if ($LASTEXITCODE -ne 0) { "unfilled-close: ERROR (exit $LASTEXITCODE)" | Tee-Object -FilePath $Report -Append }
+  if ($unfilledOut) {
+    ($unfilledOut -split "`r?`n") | ForEach-Object { $_ | Tee-Object -FilePath $Report -Append }
+  } else {
+    "(no output from unfilled-close probe)" | Tee-Object -FilePath $Report -Append
+  }
+} catch {
+  "unfilled-close: ERROR $($_.Exception.Message)" | Tee-Object -FilePath $Report -Append
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmpUnfilledPy
+}
+" " | Tee-Object -FilePath $Report -Append
+
 # ---------- Last 20 Orders Closed (with P/L) ----------
-"--- Last 20 Orders Closed (with P/L) ---" | Tee-Object -FilePath $Report -Append
+"--- Last 20 Orders Closed (est. P/L from limits) ---" | Tee-Object -FilePath $Report -Append
 # Attempts-CSV-based closed P/L — no IB connection needed, survives IBGateway restarts.
 # Scans last 30 days of C:\OptionsHistory\YY_MM_DD\attempts_*.csv.
 # OPEN  rows: action=open_call/open_put,  status=placed, reason=success, limit+longK present.
@@ -582,9 +816,13 @@ foreach ($r in $allAttempts) {
 $csvCloses = @()
 foreach ($r in $allAttempts) {
     if ($r.action -notin @('force_close','close_call','close_put','close')) { continue }
-    if ($r.status -ne 'placed' -or $r.order_action -ne 'SELL') { continue }
-    if ($r.limit -eq '' -or $r.longK -eq '') { continue }
-    if ($r.reason -notmatch 'success|worthless') { continue }
+    if ($r.status -ne 'placed') { continue }
+    # Fix FD (H3): reconcile/roll closes leave order_action blank but are always SELL-to-close.
+    $oa = "$($r.order_action)".Trim()
+    if ($oa -ne '' -and $oa -ne 'SELL') { continue }
+    if ($r.limit -eq '') { continue }   # longK may be blank on reconcile rows -> symbol fallback below
+    # Fix FD (H3): include signal-driven / reconcile / roll closes, not just success|worthless.
+    if ($r.reason -notmatch 'success|worthless|close_signal|reconcile_close_signal|roll_mkt_close') { continue }
     $ts = $null; try { $ts = [datetime]$r.ts } catch {}
     if (-not $ts) { continue }
     $r | Add-Member -NotePropertyName PsTs -NotePropertyValue $ts -Force
@@ -594,23 +832,39 @@ foreach ($r in $allAttempts) {
 $closedMatched = @()
 foreach ($cl in $csvCloses) {
     # Trim fields before building key — CSV values may have surrounding spaces
-    $key = "$($cl.symbol.Trim())|$($cl.right.Trim())|$($cl.longK.Trim())"
-    $op = $csvOpens | Where-Object {
-        "$($_.symbol.Trim())|$($_.right.Trim())|$($_.longK.Trim())" -eq $key -and $_.PsTs -lt $cl.PsTs
-    } | Sort-Object PsTs -Descending | Select-Object -First 1
+    $clSym = "$($cl.symbol)".Trim()
+    $clRt  = "$($cl.right)".Trim()
+    $clLk  = "$($cl.longK)".Trim()
+    if ($clRt -ne '' -and $clLk -ne '') {
+        # Precise pairing: symbol|right|longK
+        $op = $csvOpens | Where-Object {
+            "$($_.symbol)".Trim() -eq $clSym -and "$($_.right)".Trim() -eq $clRt -and "$($_.longK)".Trim() -eq $clLk -and $_.PsTs -lt $cl.PsTs
+        } | Sort-Object PsTs -Descending | Select-Object -First 1
+    } else {
+        # Fix FD (H3): reconcile/roll close rows lack right/longK -> symbol-only fallback
+        # to the most recent prior open for that symbol.
+        $op = $csvOpens | Where-Object {
+            "$($_.symbol)".Trim() -eq $clSym -and $_.PsTs -lt $cl.PsTs
+        } | Sort-Object PsTs -Descending | Select-Object -First 1
+    }
     if (-not $op) { continue }
-    $qty = if ($cl.qty.Trim() -match '^\d+$') { [int]$cl.qty } else { 1 }
+    $qty = if ("$($cl.qty)".Trim() -match '^\d+$') { [int]$cl.qty } else { 1 }
     $pnl = ([double]$cl.limit - [double]$op.limit) * 100 * $qty
+    # Fill display fields from the close row, else the matched open row.
+    $dLk  = if ($clLk -ne '') { $clLk } else { "$($op.longK)".Trim() }
+    $dSk  = if ("$($cl.shortK)".Trim() -ne '') { "$($cl.shortK)".Trim() } else { "$($op.shortK)".Trim() }
+    $dRt  = if ($clRt -ne '') { $clRt } else { "$($op.right)".Trim() }
+    $dExp = if ("$($cl.exp)".Trim() -ne '') { "$($cl.exp)".Trim() } else { "$($op.exp)".Trim() }
     $closedMatched += [pscustomobject]@{
         CloseTs     = $cl.PsTs
-        Symbol      = $cl.symbol.Trim()
-        Exp         = $cl.exp.Trim()
-        Right       = $cl.right.Trim()
-        Spread      = "$($cl.longK.Trim())/$($cl.shortK.Trim())"
+        Symbol      = $clSym
+        Exp         = $dExp
+        Right       = $dRt
+        Spread      = "$dLk/$dSk"
         OpenLimit   = [double]$op.limit
         CloseLimit  = [double]$cl.limit
         PnL         = $pnl
-        CloseReason = $cl.close_reason.Trim()
+        CloseReason = "$($cl.close_reason)".Trim()
     }
 }
 
@@ -620,8 +874,8 @@ if (-not $closedMatched) {
     $closedMatched | Sort-Object CloseTs -Descending | Select-Object -First 20 | ForEach-Object {
         $ts   = $_.CloseTs.ToString("yyyy-MM-dd HH:mm")
         $rsn  = if ($_.CloseReason) { "  [$($_.CloseReason)]" } else { "" }
-        $sign = if ($_.PnL -ge 0) { "+" } else { "-" }
-        $pnlStr = "{0}`${1:N2}" -f $sign, [Math]::Abs($_.PnL)
+        # Fix FD: losses shown in parentheses e.g. ($106.00); gains as $14.00
+        $pnlStr = if ($_.PnL -lt 0) { "(`${0:N2})" -f [Math]::Abs($_.PnL) } else { "`${0:N2}" -f $_.PnL }
         ("  {0}  {1,-6} {2} {3}  {4,-11}  open=`${5:N2} -> close=`${6:N2}  P/L={7}{8}" -f `
             $ts, $_.Symbol, $_.Exp, $_.Right, $_.Spread,
             $_.OpenLimit, $_.CloseLimit, $pnlStr, $rsn) | Tee-Object -FilePath $Report -Append
@@ -748,10 +1002,32 @@ $formatOrder = {
   "{0}  {1,-6}  {2,-4}  {3,-3}  @`${4}" -f $ts, $sym, $act, $ot, $lmt
 }
 
-# Top recent examples — $placed already contains all submitted (opens + closes)
-"`nLast 10 submitted orders:" | Tee-Object -FilePath $Report -Append
-$placed | Select-Object -Last 10 | ForEach-Object { & $formatOrder $_ } |
-  Tee-Object -FilePath $Report -Append | Out-Null
+# Fix FD (H5): source the submitted list from the persistent attempts CSV — the ib_cycle.log
+# tail window often does not reach back to the 5 PM batch, leaving $placed empty.
+"`nLast 10 submitted orders (attempts CSV):" | Tee-Object -FilePath $Report -Append
+$subRows = @()
+foreach ($bk in 0..2) {
+  $fld = (Get-Date).AddDays(-$bk).ToString('yy_MM_dd')
+  $ap  = "C:\OptionsHistory\$fld\attempts_$fld.csv"
+  if (Test-Path $ap) {
+    $rws = @(); try { $rws = Import-Csv $ap -EA Stop } catch { $rws = @() }
+    foreach ($r in $rws) {
+      if ($r.action -notin @('open_call','open_put','close','force_close','close_call','close_put','close_individual_leg')) { continue }
+      if ($r.status -notin @('placed','submitted','success')) { continue }
+      $ts = $null; try { $ts = [datetime]$r.ts } catch {}
+      if (-not $ts) { continue }
+      $oatype = (("$($r.order_action)".Trim() + "/" + "$($r.order_type)".Trim()).Trim('/')); if (-not $oatype) { $oatype = '-' }
+      $lm = if ("$($r.limit)".Trim() -ne '') { "limit=$("$($r.limit)".Trim())" } else { "MKT" }
+      $subRows += [pscustomobject]@{ Ts = $ts; Line = ("{0}  {1,-6} {2,-9} {3,-9} {4,-11}  ({5})" -f $ts.ToString('yyyy-MM-dd HH:mm'), "$($r.symbol)".Trim(), "$($r.action)".Trim(), $oatype, $lm, "$($r.reason)".Trim()) }
+    }
+  }
+}
+if (@($subRows).Count -eq 0) {
+  "  (no recent placements in attempts CSVs)" | Tee-Object -FilePath $Report -Append
+} else {
+  $subRows | Sort-Object Ts -Descending | Select-Object -First 10 | ForEach-Object { $_.Line } |
+    Tee-Object -FilePath $Report -Append | Out-Null
+}
 
 "`nLast 10 failures:" | Tee-Object -FilePath $Report -Append
 $failed | Select-Object -Last 10 |
@@ -794,18 +1070,27 @@ $allTagged |
 
 # ---------- Recent Logs ----------
 "--- Recent Logs ---"                      | Tee-Object -FilePath $Report -Append
+# Fix FD (H6): always include ib_cycle.log (the real recent activity), and exclude the Health
+# self-log (Health_*.log — position dumps) which is always the newest file right after this run
+# and otherwise crowds out ib_cycle.log from the top-3-most-recent selection.
+$recentLogFiles = @()
+$iclFile = Get-Item 'C:\OptionsHistory\logs\ib_cycle.log' -ErrorAction SilentlyContinue
+if ($iclFile) { $recentLogFiles += $iclFile }
 Get-ChildItem "$LogDir\*.log" -ErrorAction SilentlyContinue |
-  Sort-Object LastWriteTime -Desc | Select-Object -First 3 |
+  Where-Object { $_.Name -notlike 'Health_*' -and $_.Name -ne 'ib_cycle.log' } |
+  Sort-Object LastWriteTime -Desc | Select-Object -First 2 |
+  ForEach-Object { $recentLogFiles += $_ }
+$recentLogFiles |
   ForEach-Object {
     $logFile = $_
     "`n### $($logFile.FullName) (last 60 lines)" | Tee-Object -FilePath $Report -Append
     $logLines = Get-Content $logFile.FullName -Tail 60
-    # For listener.err.log: suppress verbose ib_insync position/portfolio dumps already shown in Positions section
-    if ($logFile.Name -like 'listener.err*') {
-      $logLines = $logLines | Where-Object {
-        $_ -notmatch 'ib_insync\.wrapper:(position|updatePortfolio|openOrder):' -and
-        $_ -notmatch 'ib_insync\.ib:Synchronization'
-      }
+    # Suppress verbose ib_insync position/portfolio/openOrder dumps (already shown in Positions);
+    # applies to ib_cycle.log and listener.err.log alike.
+    $logLines = $logLines | Where-Object {
+      $_ -notmatch 'ib_insync\.wrapper:(position|updatePortfolio|openOrder):' -and
+      $_ -notmatch 'INFO (position|updatePortfolio|openOrder):' -and
+      $_ -notmatch 'ib_insync\.ib:Synchronization'
     }
     $logLines | Tee-Object -FilePath $Report -Append
   }
@@ -820,8 +1105,14 @@ try {
 } catch {}
 
 try {
-  $lastPL = Select-String -Path $Report -Pattern '^Day Realized|^Day Unrealized|^Day Total|^YTD' -SimpleMatch
-  if ($lastPL) { $lastPL | ForEach-Object { $_.Line | Write-Host } }
+  # Fix FD: echo ONLY the P/L Summary section (not a whole-file grep) so stale P/L lines that
+  # a Recent-Logs tail may surface from a prior run can't leak into this end-of-run summary.
+  $inPL = $false
+  Get-Content $Report | ForEach-Object {
+    if ($_ -match '^--- P/L Summary') { $inPL = $true; return }
+    if ($inPL -and $_ -match '^--- ') { $inPL = $false }
+    if ($inPL -and $_ -match '^(Realized|Unrealized|Day Total|YTD)') { Write-Host $_ }
+  }
 } catch {}
 
 Write-Host ("Report   : {0}" -f $Report)
