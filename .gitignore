@@ -43,3 +43,28 @@ ngrok.zip
 # OS
 Thumbs.db
 Desktop.ini
+
+# Virtualenvs (macOS dev venv was committed by mistake; the VPS uses its own)
+venv/
+
+# Secrets / recovery codes. Never commit (they were in public history; treat as burned)
+ngrok_recovery_codes.txt
+tradingviewRecovery.txt
+*recovery*.txt
+
+# Market data downloads and backtest outputs (regenerable, large)
+dl_*/
+iv_*/
+downloaded_data*/
+regime_splits*/
+spy_full/
+runs/
+*.log
+*.pkl
+
+# Agent worktrees
+.claude/worktrees/
+
+# OS / Office junk
+.DS_Store
+~$*
